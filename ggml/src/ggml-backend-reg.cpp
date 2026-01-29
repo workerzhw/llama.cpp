@@ -72,6 +72,9 @@
 #ifdef GGML_USE_CANN
 #include "ggml-cann.h"
 #endif
+#ifdef GGML_USE_ZLPU
+#include "ggml-zlpu.h"
+#endif
 
 // disable C++17 deprecation warning for std::codecvt_utf8
 #if defined(__clang__)
@@ -217,6 +220,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
+#endif
+#ifdef GGML_USE_ZLPU
+        register_backend(ggml_backend_zlpu_reg());
 #endif
     }
 
@@ -598,6 +604,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
 
     ggml_backend_load_best("blas", silent, dir_path);
     ggml_backend_load_best("cann", silent, dir_path);
+    ggml_backend_load_best("zlpu", silent, dir_path);
     ggml_backend_load_best("cuda", silent, dir_path);
     ggml_backend_load_best("hip", silent, dir_path);
     ggml_backend_load_best("metal", silent, dir_path);

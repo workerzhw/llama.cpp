@@ -71,6 +71,7 @@ endif()
 # debug
 option(LLAMA_ALL_WARNINGS           "llama: enable all compiler warnings"                   ON)
 option(LLAMA_ALL_WARNINGS_3RD_PARTY "llama: enable all compiler warnings in 3rd party libs" OFF)
+option(LLAMA_DBG_LZS_PRINT	    "Enable debug info about llama.cpp                      OFF)
 
 # build
 option(LLAMA_FATAL_WARNINGS "llama: enable -Werror flag" OFF)
@@ -137,6 +138,7 @@ llama_option_depr(WARNING     LLAMA_RPC                 GGML_RPC)
 llama_option_depr(WARNING     LLAMA_SYCL                GGML_SYCL)
 llama_option_depr(WARNING     LLAMA_SYCL_F16            GGML_SYCL_F16)
 llama_option_depr(WARNING     LLAMA_CANN                GGML_CANN)
+llama_option_depr(WARNING     LLAMA_ZLPU                GGML_ZLPU)
 
 if (NOT MSVC)
     if (LLAMA_SANITIZE_THREAD)
@@ -214,6 +216,7 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+    add_subdirectory(aex)
 endif()
 
 #
