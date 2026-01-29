@@ -204,23 +204,6 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     *s = sumf;
 }
 
-void ggml_vec_dot_bf16_trunc4(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc) {
-
-    assert(nrc == 1);
-    GGML_UNUSED(nrc);
-    GGML_UNUSED(bx);
-    GGML_UNUSED(by);
-    GGML_UNUSED(bs);
-
-    ggml_float sumf = 0;
-    for (int i = 0; i < n; ++i) {
-        const ggml_bf16_t xt = ggml_bf16_trunc4(x[i]);
-        const ggml_bf16_t yt = ggml_bf16_trunc4(y[i]);
-        sumf += (ggml_float)(GGML_BF16_TO_FP32(xt) * GGML_BF16_TO_FP32(yt));
-    }
-    *s = (float)sumf;
-}
-
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc) {
     assert(nrc == 1);
     GGML_UNUSED(nrc);

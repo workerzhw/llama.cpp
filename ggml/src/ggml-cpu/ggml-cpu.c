@@ -1134,14 +1134,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    // ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
-    ggml_vec_dot_t vec_dot      = type_traits_cpu[type].vec_dot;
+    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
-
-    // 如果src0/src1都是bf16，模拟低4bit截断
-    if (type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16) {
-        vec_dot = ggml_vec_dot_bf16_trunc4;
-    }
 
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
