@@ -21,6 +21,9 @@ typedef double ggml_float;
 #define GGML_VEC_DOT_UNROLL  2
 #define GGML_VEC_MAD_UNROLL  32
 
+// 低4bit清零：仅影响bf16尾数低4bit
+#define GGML_BF16_TRUNC4_MASK 0xFFF0u
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,9 +41,14 @@ extern ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 //
 // fundamental operations
 //
+static inline ggml_bf16_t ggml_bf16_trunc4(ggml_bf16_t v) {
+    v.bits = (uint16_t)(v.bits & (uint16_t)GGML_BF16_TRUNC4_MASK);
+    return v;
+}
 
 void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc);
 void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc);
+void ggml_vec_dot_bf16_trunc4(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc);
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
 
 void ggml_vec_silu_f32(const int n, float * y, const float * x);
