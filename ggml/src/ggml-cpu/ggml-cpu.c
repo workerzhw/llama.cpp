@@ -1157,16 +1157,29 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         return;
     }
 
+    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+    assert(ne12 % ne02 == 0);
+    assert(ne13 % ne03 == 0);
+
+    // block-tiling attempt
+    const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
+
+    const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+
     #if GGML_MUL_MAT_LOG
     const bool src1_converted_for_dot = (src1->type != vec_dot_type);
     const char * src1_storage = src1_converted_for_dot ? "wdata" : "src1->data";
-    //限制打印次数，防刷屏
+    // 限制打印次数，防刷屏
     static int g_mm_log_budget = 200;
     if (g_mm_log_budget-- > 0) {
         GGML_MMLOG(
             "\n[ggml mul_mat_one_chunk] dst=%p src0=%p src1=%p\n"
             "  types(raw):   src0=%s src1=%s dst=%s | traits_type=%s\n"
             "  dot(plan):    vec_dot_type=%s | src1_storage=%s | src1_converted=%d | trunc4=%d\n"
+            "  ptrs:         src1->data=%p | wdata=%p\n"
             "  shape src0:   ne00=%lld ne01=%lld ne02=%lld ne03=%lld\n"
             "  shape src1:   ne10=%lld ne11=%lld ne12=%lld ne13=%lld\n"
             "  shape dst :   ne0 =%lld ne1 =%lld ne2 =%lld ne3 =%lld\n"
@@ -1180,6 +1193,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
             ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type),
             ggml_type_name(type),
             ggml_type_name(vec_dot_type), src1_storage, (int)src1_converted_for_dot, (int)used_trunc4,
+            (void*)src1->data, (void*)params->wdata,
             (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
             (long long)ne10, (long long)ne11, (long long)ne12, (long long)ne13,
             (long long)ne0,  (long long)ne1,  (long long)ne2,  (long long)ne3,
@@ -1194,20 +1208,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         );
     }
     #endif
-
-
-
-    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-
-    assert(ne12 % ne02 == 0);
-    assert(ne13 % ne03 == 0);
-
-    // block-tiling attempt
-    const int64_t blck_0 = 16;
-    const int64_t blck_1 = 16;
-
-    const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
     // 16 * 2, accounting for mmla kernels
