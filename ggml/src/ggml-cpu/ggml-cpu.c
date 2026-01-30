@@ -1138,9 +1138,12 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     ggml_vec_dot_t vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
+    bool used_trunc4 = false;
+
     // 如果src0/src1都是bf16，模拟低4bit截断
-    if (type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16) {
+    if (type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_BF16) {
         vec_dot = ggml_vec_dot_bf16_trunc4;
+        used_trunc4 = true;
     }
 
     // broadcast factors
@@ -1153,6 +1156,46 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
         return;
     }
+
+    #if GGML_MUL_MAT_LOG
+    const bool src1_converted_for_dot = (src1->type != vec_dot_type);
+    const char * src1_storage = src1_converted_for_dot ? "wdata" : "src1->data";
+    //限制打印次数，防刷屏
+    static int g_mm_log_budget = 200;
+    if (g_mm_log_budget-- > 0) {
+        GGML_MMLOG(
+            "\n[ggml mul_mat_one_chunk] dst=%p src0=%p src1=%p\n"
+            "  types(raw):   src0=%s src1=%s dst=%s | traits_type=%s\n"
+            "  dot(plan):    vec_dot_type=%s | src1_storage=%s | src1_converted=%d | trunc4=%d\n"
+            "  shape src0:   ne00=%lld ne01=%lld ne02=%lld ne03=%lld\n"
+            "  shape src1:   ne10=%lld ne11=%lld ne12=%lld ne13=%lld\n"
+            "  shape dst :   ne0 =%lld ne1 =%lld ne2 =%lld ne3 =%lld\n"
+            "  stride src0:  nb01=%zu nb02=%zu nb03=%zu\n"
+            "  stride src1:  nb11=%zu nb12=%zu nb13=%zu\n"
+            "  stride dst :  nb1 =%zu nb2 =%zu nb3 =%zu\n"
+            "  contiguity:   src1_cont=%d | row_size=%zu | src1_col_stride=%zu\n"
+            "  broadcast:    r2=%lld r3=%lld\n"
+            "  chunk:        ir0=[%lld,%lld) ir1=[%lld,%lld) | num_rows_per_vec_dot=%lld | tile=%lldx%lld\n",
+            (void*)dst, (void*)src0, (void*)src1,
+            ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type),
+            ggml_type_name(type),
+            ggml_type_name(vec_dot_type), src1_storage, (int)src1_converted_for_dot, (int)used_trunc4,
+            (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
+            (long long)ne10, (long long)ne11, (long long)ne12, (long long)ne13,
+            (long long)ne0,  (long long)ne1,  (long long)ne2,  (long long)ne3,
+            (size_t)nb01, (size_t)nb02, (size_t)nb03,
+            (size_t)nb11, (size_t)nb12, (size_t)nb13,
+            (size_t)nb1,  (size_t)nb2,  (size_t)nb3,
+            (int)src1_cont, (size_t)row_size, (size_t)src1_col_stride,
+            (long long)r2, (long long)r3,
+            (long long)ir0_start, (long long)ir0_end,
+            (long long)ir1_start, (long long)ir1_end,
+            (long long)num_rows_per_vec_dot, (long long)blck_0, (long long)blck_1
+        );
+    }
+    #endif
+
+
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -1248,32 +1291,32 @@ void ggml_compute_forward_mul_mat(
     //   compute by src0 rows
 
     // TODO: extract to "extra_op"
-#if GGML_USE_LLAMAFILE
-    // broadcast factors
-    const int64_t r2 = ne12 / ne02;
-    const int64_t r3 = ne13 / ne03;
+// #if GGML_USE_LLAMAFILE
+//     // broadcast factors
+//     const int64_t r2 = ne12 / ne02;
+//     const int64_t r3 = ne13 / ne03;
 
-    const bool src1_cont = ggml_is_contiguous(src1);
+//     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
-        for (int64_t i13 = 0; i13 < ne13; i13++)
-            for (int64_t i12 = 0; i12 < ne12; i12++)
-                if (!llamafile_sgemm(params,
-                                     ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
-                                     (const char *)src1->data + i12*nb12 + i13*nb13,
-                                     nb11/ggml_type_size(src1->type),
-                                     (char *)dst->data + i12*nb2 + i13*nb3,
-                                     nb1/ggml_type_size(dst->type),
-                                     src0->type,
-                                     src1->type,
-                                     dst->type))
-                    goto UseGgmlGemm1;
-        return;
-    }
-UseGgmlGemm1:;
-#endif
+//     if (src1_cont) {
+//         for (int64_t i13 = 0; i13 < ne13; i13++)
+//             for (int64_t i12 = 0; i12 < ne12; i12++)
+//                 if (!llamafile_sgemm(params,
+//                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
+//                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+//                                      nb01/ggml_type_size(src0->type),
+//                                      (const char *)src1->data + i12*nb12 + i13*nb13,
+//                                      nb11/ggml_type_size(src1->type),
+//                                      (char *)dst->data + i12*nb2 + i13*nb3,
+//                                      nb1/ggml_type_size(dst->type),
+//                                      src0->type,
+//                                      src1->type,
+//                                      dst->type))
+//                     goto UseGgmlGemm1;
+//         return;
+//     }
+// UseGgmlGemm1:;
+// #endif
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
@@ -1319,29 +1362,29 @@ UseGgmlGemm1:;
 
     ggml_barrier(params->threadpool);
 
-#if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
-        const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+// #if GGML_USE_LLAMAFILE
+//     if (src1->type != vec_dot_type) {
+//         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+//         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
-        for (int64_t i13 = 0; i13 < ne13; i13++)
-            for (int64_t i12 = 0; i12 < ne12; i12++)
-                if (!llamafile_sgemm(params,
-                                     ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
-                                     (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
-                                     row_size/ggml_type_size(vec_dot_type),
-                                     (char *)dst->data + i12*nb2 + i13*nb3,
-                                     nb1/ggml_type_size(dst->type),
-                                     src0->type,
-                                     vec_dot_type,
-                                     dst->type))
-                    goto UseGgmlGemm2;
-        return;
-    }
-UseGgmlGemm2:;
-#endif
+//         for (int64_t i13 = 0; i13 < ne13; i13++)
+//             for (int64_t i12 = 0; i12 < ne12; i12++)
+//                 if (!llamafile_sgemm(params,
+//                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
+//                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+//                                      nb01/ggml_type_size(src0->type),
+//                                      (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
+//                                      row_size/ggml_type_size(vec_dot_type),
+//                                      (char *)dst->data + i12*nb2 + i13*nb3,
+//                                      nb1/ggml_type_size(dst->type),
+//                                      src0->type,
+//                                      vec_dot_type,
+//                                      dst->type))
+//                     goto UseGgmlGemm2;
+//         return;
+//     }
+// UseGgmlGemm2:;
+// #endif
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;

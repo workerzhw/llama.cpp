@@ -24,6 +24,43 @@ typedef double ggml_float;
 // 低4bit清零：仅影响bf16尾数低4bit
 #define GGML_BF16_TRUNC4_MASK 0xFFF0u
 
+// 0 = 关闭日志；1 = 开启日志
+#ifndef GGML_MUL_MAT_LOG
+#define GGML_MUL_MAT_LOG 0
+#endif
+
+#if GGML_MUL_MAT_LOG
+#include <stdio.h>
+#define GGML_MMLOG(...) do { fprintf(stderr, __VA_ARGS__); } while (0)
+#else
+#define GGML_MMLOG(...) do {} while (0)
+#endif
+
+#if GGML_MUL_MAT_LOG
+static const char * ggml_type_name(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:  return "F32";
+        case GGML_TYPE_F16:  return "F16";
+        case GGML_TYPE_BF16: return "BF16";
+        case GGML_TYPE_Q8_0: return "Q8_0";
+        case GGML_TYPE_Q8_1: return "Q8_1";
+        case GGML_TYPE_Q4_0: return "Q4_0";
+        case GGML_TYPE_Q4_K: return "Q4_K";
+        case GGML_TYPE_Q8_K: return "Q8_K";
+        case GGML_TYPE_Q4_0: return "Q4_0";
+        case GGML_TYPE_Q4_1: return "Q4_1";
+        case GGML_TYPE_Q5_0: return "Q5_0";
+        case GGML_TYPE_Q5_1: return "Q5_1";
+        case GGML_TYPE_Q2_K: return "Q2_K";
+        case GGML_TYPE_Q3_K: return "Q3_K";
+        case GGML_TYPE_Q2_K: return "Q2_K";
+        case GGML_TYPE_Q5_K: return "Q5_K";
+        case GGML_TYPE_Q6_K: return "Q6_K";
+        default: return "OTHER";
+    }
+}
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
