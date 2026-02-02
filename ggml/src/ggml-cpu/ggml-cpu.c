@@ -8,11 +8,6 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
-#if defined(__has_include)
-#  if __has_include("ggml-quants.h")
-#    include "ggml-quants.h"
-#  endif
-#endif
 
 #include "ggml-threading.h"
 #include "unary-ops.h"
