@@ -8,6 +8,12 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#if defined(__has_include)
+#  if __has_include("ggml-quants.h")
+#    include "ggml-quants.h"
+#  endif
+#endif
+
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -1141,7 +1147,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     bool used_trunc4 = false;
 
     // 如果src0/src1都是bf16，模拟低4bit截断
-    if (type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_BF16) {
+    if (type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_BF16) {
         vec_dot = ggml_vec_dot_bf16_trunc4;
         used_trunc4 = true;
     }
@@ -1159,6 +1165,24 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+    // If src1 was converted, it occupies the beginning of params->wdata; src0 BF16 (if needed) is placed right after it.
+    size_t wsize_src1 = 0;
+    if (src1->type != vec_dot_type) {
+        wsize_src1 = ggml_row_size(vec_dot_type, ne10) * (size_t) ne11 * (size_t) ne12 * (size_t) ne13;
+        wsize_src1 = GGML_PAD(wsize_src1, GGML_CACHE_LINE);
+    }
+
+    const bool  src0_casted_for_dot = (src0->type != GGML_TYPE_BF16);
+    const char * src0_base = src0_casted_for_dot ? (const char *) params->wdata + wsize_src1 : (const char *) src0->data;
+    
+    const size_t nb01_bf16 = ggml_row_size(GGML_TYPE_BF16, ne00);
+    const size_t nb02_bf16 = nb01_bf16 * (size_t) ne01;
+    const size_t nb03_bf16 = nb02_bf16 * (size_t) ne02;
+    
+    const size_t src0_nb01 = src0_casted_for_dot ? nb01_bf16 : (size_t) nb01;
+    const size_t src0_nb02 = src0_casted_for_dot ? nb02_bf16 : (size_t) nb02;
+    const size_t src0_nb03 = src0_casted_for_dot ? nb03_bf16 : (size_t) nb03;
+
 
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
@@ -1228,7 +1252,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i2 = i12;
                 const int64_t i3 = i13;
 
-                const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+                const char * src0_row = src0_base + (0 + i02 * (int64_t) src0_nb02 + i03 * (int64_t) src0_nb03);
 
                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
@@ -1241,11 +1265,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
                 //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
+                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*(int64_t) src0_nb01, src1_col);
                 //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * (int64_t) src0_nb01, (num_rows_per_vec_dot > 1 ? src0_nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -1268,9 +1292,12 @@ void ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
-    ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
-    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
+    const enum ggml_type dot_type = GGML_TYPE_BF16;
+
+    enum ggml_type    const vec_dot_type     = type_traits_cpu[dot_type].vec_dot_type;  
+    ggml_from_float_t const from_float       = type_traits_cpu[vec_dot_type].from_float;
+    int64_t           const vec_dot_num_rows = type_traits_cpu[dot_type].nrows;
+
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -1353,6 +1380,71 @@ void ggml_compute_forward_mul_mat(
             }
         }
     #endif
+    }
+
+    
+    // --- NEW: cast src0 to BF16 (contiguous) for dot kernels ---
+    // Workspace layout in params->wdata:
+    //   [optional] src1 converted to vec_dot_type (contiguous)
+    //   [optional] src0 converted to BF16 (contiguous)
+    size_t wsize_src1 = 0;
+    if (src1->type != vec_dot_type) {
+        wsize_src1 = ggml_row_size(vec_dot_type, ne10) * (size_t) ne11 * (size_t) ne12 * (size_t) ne13;
+        wsize_src1 = GGML_PAD(wsize_src1, GGML_CACHE_LINE);
+    }
+    size_t wsize_src0 = 0;
+    if (src0->type != GGML_TYPE_BF16) {
+        wsize_src0 = ggml_row_size(GGML_TYPE_BF16, ne00) * (size_t) ne01 * (size_t) ne02 * (size_t) ne03;
+        wsize_src0 = GGML_PAD(wsize_src0, GGML_CACHE_LINE);
+    }
+    GGML_ASSERT(params->wsize >= wsize_src1 + wsize_src0);
+    
+    if (src0->type != GGML_TYPE_BF16) {
+        char * dst0_bf16 = (char *) params->wdata + wsize_src1;
+    
+        const size_t nb0w1 = ggml_row_size(GGML_TYPE_BF16, ne00);
+        const size_t nb0w2 = nb0w1 * (size_t) ne01;
+        const size_t nb0w3 = nb0w2 * (size_t) ne02;
+    
+        // Convert rows in parallel over (i03, i02, i01)
+        const int64_t nrows_total = ne01 * ne02 * ne03;
+        const int64_t row_start = (ith * nrows_total) / nth;
+        const int64_t row_end   = ((ith + 1) * nrows_total) / nth;
+    
+        float * tmp_f32 = NULL;
+        if (ggml_is_quantized(src0->type)) {
+            // One scratch row per thread, reused for all rows this thread converts
+            tmp_f32 = (float *) alloca((size_t) ne00 * sizeof(float));
+        }
+    
+        for (int64_t rid = row_start; rid < row_end; ++rid) {
+            const int64_t i03 = rid / (ne02 * ne01);
+            const int64_t t   = rid - i03 * (ne02 * ne01);
+            const int64_t i02 = t / ne01;
+            const int64_t i01 = t - i02 * ne01;
+    
+            const char * src0_row_in =
+                (const char *) src0->data + i01 * nb01 + i02 * nb02 + i03 * nb03;
+            char * src0_row_out =
+                (char *) dst0_bf16 + i01 * (int64_t) nb0w1 + i02 * (int64_t) nb0w2 + i03 * (int64_t) nb0w3;
+    
+            if (src0->type == GGML_TYPE_F32) {
+                ggml_cpu_fp32_to_bf16((const float *) src0_row_in, (ggml_bf16_t *) src0_row_out, ne00);
+            } else if (src0->type == GGML_TYPE_F16) {
+                const ggml_fp16_t * in = (const ggml_fp16_t *) src0_row_in;
+                ggml_bf16_t * out = (ggml_bf16_t *) src0_row_out;
+                for (int64_t k = 0; k < ne00; ++k) {
+                    const float f = GGML_FP16_TO_FP32(in[k]);
+                    out[k] = GGML_FP32_TO_BF16(f);
+                }
+            } else if (ggml_is_quantized(src0->type)) {
+                GGML_ASSERT(tmp_f32 != NULL);
+                ggml_dequantize_row_to_f32(src0->type, src0_row_in, tmp_f32, ne00);
+                ggml_cpu_fp32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, ne00);
+            } else {
+                GGML_ABORT("mul_mat: src0 cast-to-bf16: unsupported src0->type=%s", ggml_type_name(src0->type));
+            }
+        }
     }
 
     if (ith == 0) {
@@ -1440,7 +1532,7 @@ void ggml_compute_forward_mul_mat(
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, dot_type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -2780,10 +2872,21 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+                        // This build forces mul_mat to use BF16 dot kernels and may cast src0/src1 into params->wdata.
+                        const enum ggml_type vec_dot_type = GGML_TYPE_BF16;
 
+                        // [optional] src1 conversion buffer (contiguous)
                         if (node->src[1]->type != vec_dot_type) {
-                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            size_t wsize_src1 = ggml_row_size(vec_dot_type, node->src[1]->ne[0]) *
+                                                (size_t) node->src[1]->ne[1] * (size_t) node->src[1]->ne[2] * (size_t) node->src[1]->ne[3];
+                            cur += GGML_PAD(wsize_src1, GGML_CACHE_LINE);
+                        }
+
+                        // [optional] src0 cast-to-bf16 buffer (contiguous)
+                        if (node->src[0]->type != GGML_TYPE_BF16) {
+                            size_t wsize_src0 = ggml_row_size(GGML_TYPE_BF16, node->src[0]->ne[0]) *
+                                                (size_t) node->src[0]->ne[1] * (size_t) node->src[0]->ne[2] * (size_t) node->src[0]->ne[3];
+                            cur += GGML_PAD(wsize_src0, GGML_CACHE_LINE);
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:

@@ -204,7 +204,12 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     *s = sumf;
 }
 
-void ggml_vec_dot_bf16_trunc4(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc) {
+void ggml_vec_dot_bf16_trunc4(
+    int n,
+    float * GGML_RESTRICT s, size_t bs,
+    ggml_bf16_t * GGML_RESTRICT x, size_t bx,
+    ggml_bf16_t * GGML_RESTRICT y, size_t by,
+    int nrc) {
 
     assert(nrc == 1);
     GGML_UNUSED(nrc);
@@ -212,14 +217,149 @@ void ggml_vec_dot_bf16_trunc4(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf
     GGML_UNUSED(by);
     GGML_UNUSED(bs);
 
+    int i = 0;
     ggml_float sumf = 0;
-    for (int i = 0; i < n; ++i) {
-        const ggml_bf16_t xt = ggml_bf16_trunc4(x[i]);
-        const ggml_bf16_t yt = ggml_bf16_trunc4(y[i]);
+
+#if defined(__AVX512BF16__)
+    __m512 c1 = _mm512_setzero_ps();
+    __m512 c2 = _mm512_setzero_ps();
+
+    const __m512i mask = _mm512_set1_epi16((short)GGML_BF16_TRUNC4_MASK);
+    const __m512i bias = _mm512_set1_epi16((short)GGML_BF16_RNA_BIAS);
+
+    for (; i + 64 <= n; i += 64) {
+        __m512i vx0 = _mm512_loadu_si512((const void *)(&x[i].bits));
+        vx0 = _mm512_add_epi16(vx0, bias);
+        vx0 = _mm512_and_si512(vx0, mask);
+
+        __m512i vy0 = _mm512_loadu_si512((const void *)(&y[i].bits));
+#if GGML_MULMAT_TRUNC4_SRC1
+        vy0 = _mm512_add_epi16(vy0, bias);
+        vy0 = _mm512_and_si512(vy0, mask);
+#endif
+        c1 = _mm512_dpbf16_ps(c1, m512bh(vx0), m512bh(vy0));
+
+        __m512i vx1 = _mm512_loadu_si512((const void *)(&x[i + 32].bits));
+        vx1 = _mm512_add_epi16(vx1, bias);
+        vx1 = _mm512_and_si512(vx1, mask);
+
+        __m512i vy1 = _mm512_loadu_si512((const void *)(&y[i + 32].bits));
+#if GGML_MULMAT_TRUNC4_SRC1
+        vy1 = _mm512_add_epi16(vy1, bias);
+        vy1 = _mm512_and_si512(vy1, mask);
+#endif
+        c2 = _mm512_dpbf16_ps(c2, m512bh(vx1), m512bh(vy1));
+    }
+
+    sumf += (ggml_float)_mm512_reduce_add_ps(c1);
+    sumf += (ggml_float)_mm512_reduce_add_ps(c2);
+
+#elif defined(__AVX512F__)
+    __m512 c1 = _mm512_setzero_ps();
+    __m512 c2 = _mm512_setzero_ps();
+
+    const __m256i mask256 = _mm256_set1_epi16((short)GGML_BF16_TRUNC4_MASK);
+    const __m256i bias256 = _mm256_set1_epi16((short)GGML_BF16_RNA_BIAS);
+
+    for (; i + 32 <= n; i += 32) {
+        __m256i x16a = _mm256_loadu_si256((const __m256i *)(&x[i].bits));
+        x16a = _mm256_add_epi16(x16a, bias256);
+        x16a = _mm256_and_si256(x16a, mask256);
+
+        __m256i y16a = _mm256_loadu_si256((const __m256i *)(&y[i].bits));
+#if GGML_MULMAT_TRUNC4_SRC1
+        y16a = _mm256_add_epi16(y16a, bias256);
+        y16a = _mm256_and_si256(y16a, mask256);
+#endif
+
+        __m512 xf_a = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_castsi256_si128(x16a)), 16));
+        __m512 yf_a = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_castsi256_si128(y16a)), 16));
+        c1 = _mm512_add_ps(_mm512_mul_ps(xf_a, yf_a), c1);
+
+        __m256i x16b = _mm256_loadu_si256((const __m256i *)(&x[i + 16].bits));
+        x16b = _mm256_add_epi16(x16b, bias256);
+        x16b = _mm256_and_si256(x16b, mask256);
+
+        __m256i y16b = _mm256_loadu_si256((const __m256i *)(&y[i + 16].bits));
+#if GGML_MULMAT_TRUNC4_SRC1
+        y16b = _mm256_add_epi16(y16b, bias256);
+        y16b = _mm256_and_si256(y16b, mask256);
+#endif
+
+        __m512 xf_b = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_castsi256_si128(x16b)), 16));
+        __m512 yf_b = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_castsi256_si128(y16b)), 16));
+        c2 = _mm512_add_ps(_mm512_mul_ps(xf_b, yf_b), c2);
+    }
+
+    sumf += (ggml_float)_mm512_reduce_add_ps(c1);
+    sumf += (ggml_float)_mm512_reduce_add_ps(c2);
+
+#elif defined(__AVX2__)
+    #define LOAD_TRUNC_RNA_8(p_bits_ptr, do_trunc) \
+        _mm256_castsi256_ps( \
+            _mm256_slli_epi32( \
+                _mm256_cvtepu16_epi32( \
+                    (do_trunc) ? \
+                    _mm_and_si128( \
+                        _mm_add_epi16( \
+                            _mm_loadu_si128((const __m128i *)(p_bits_ptr)), \
+                            _mm_set1_epi16((short)GGML_BF16_RNA_BIAS) \
+                        ), \
+                        _mm_set1_epi16((short)GGML_BF16_TRUNC4_MASK) \
+                    ) : \
+                    _mm_loadu_si128((const __m128i *)(p_bits_ptr)) \
+                ), \
+                16 \
+            ) \
+        )
+
+    __m256 c1 = _mm256_setzero_ps();
+    __m256 c2 = _mm256_setzero_ps();
+    __m256 c3 = _mm256_setzero_ps();
+    __m256 c4 = _mm256_setzero_ps();
+
+    for (; i + 32 <= n; i += 32) {
+        c1 = _mm256_add_ps(_mm256_mul_ps(
+            LOAD_TRUNC_RNA_8(&x[i +  0].bits, 1),
+            LOAD_TRUNC_RNA_8(&y[i +  0].bits, GGML_MULMAT_TRUNC4_SRC1)), c1);
+
+        c2 = _mm256_add_ps(_mm256_mul_ps(
+            LOAD_TRUNC_RNA_8(&x[i +  8].bits, 1),
+            LOAD_TRUNC_RNA_8(&y[i +  8].bits, GGML_MULMAT_TRUNC4_SRC1)), c2);
+
+        c3 = _mm256_add_ps(_mm256_mul_ps(
+            LOAD_TRUNC_RNA_8(&x[i + 16].bits, 1),
+            LOAD_TRUNC_RNA_8(&y[i + 16].bits, GGML_MULMAT_TRUNC4_SRC1)), c3);
+
+        c4 = _mm256_add_ps(_mm256_mul_ps(
+            LOAD_TRUNC_RNA_8(&x[i + 24].bits, 1),
+            LOAD_TRUNC_RNA_8(&y[i + 24].bits, GGML_MULMAT_TRUNC4_SRC1)), c4);
+    }
+
+    __m128 g;
+    __m256 acc = _mm256_add_ps(_mm256_add_ps(c1, c3), _mm256_add_ps(c2, c4));
+    g = _mm_add_ps(_mm256_extractf128_ps(acc, 1), _mm256_castps256_ps128(acc));
+    g = _mm_add_ps(g, _mm_movehl_ps(g, g));
+    g = _mm_add_ss(g, _mm_movehdup_ps(g));
+    sumf += (ggml_float)_mm_cvtss_f32(g);
+
+    #undef LOAD_TRUNC_RNA_8
+#endif
+
+    for (; i < n; ++i) {
+        ggml_bf16_t xt = ggml_bf16_rna_trunc4(x[i]);
+#if GGML_MULMAT_TRUNC4_SRC1
+        ggml_bf16_t yt = ggml_bf16_rna_trunc4(y[i]);
+#else
+        ggml_bf16_t yt = y[i];
+#endif
         sumf += (ggml_float)(GGML_BF16_TO_FP32(xt) * GGML_BF16_TO_FP32(yt));
     }
+
     *s = (float)sumf;
 }
+
+
 
 
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc) {

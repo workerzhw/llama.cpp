@@ -23,6 +23,13 @@ typedef double ggml_float;
 
 // 低4bit清零：仅影响bf16尾数低4bit
 #define GGML_BF16_TRUNC4_MASK 0xFFF0u
+#define GGML_BF16_RNA_BIAS    0x0008u
+
+// 0 = src1 不做RNA截断；1 = src1 也做RNA截断，-DGGML_MULMAT_TRUNC4_SRC1=1
+#ifndef GGML_MULMAT_TRUNC4_SRC1
+#define GGML_MULMAT_TRUNC4_SRC1 0
+#endif
+
 
 // 0 = 关闭日志；1 = 开启日志
 #ifndef GGML_MUL_MAT_LOG
@@ -82,8 +89,40 @@ extern ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
 //
 // fundamental operations
 //
-static inline ggml_bf16_t ggml_bf16_trunc4(ggml_bf16_t v) {
-    v.bits = (uint16_t)(v.bits & (uint16_t)GGML_BF16_TRUNC4_MASK);
+static inline void ggml_dequantize_row_to_f32(enum ggml_type t, const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    // Dequantize one row (k elements) from quantized storage `x` to fp32 `y`.
+    // The `x` pointer must point to the start of the row in the tensor's data layout.
+    switch (t) {
+        case GGML_TYPE_Q4_0:  dequantize_row_q4_0 ((const block_q4_0  *) x, y, k); break;
+        case GGML_TYPE_Q4_1:  dequantize_row_q4_1 ((const block_q4_1  *) x, y, k); break;
+        case GGML_TYPE_Q5_0:  dequantize_row_q5_0 ((const block_q5_0  *) x, y, k); break;
+        case GGML_TYPE_Q5_1:  dequantize_row_q5_1 ((const block_q5_1  *) x, y, k); break;
+        case GGML_TYPE_Q8_0:  dequantize_row_q8_0 ((const block_q8_0  *) x, y, k); break;
+        case GGML_TYPE_Q2_K:  dequantize_row_q2_K ((const block_q2_K  *) x, y, k); break;
+        case GGML_TYPE_Q3_K:  dequantize_row_q3_K ((const block_q3_K  *) x, y, k); break;
+        case GGML_TYPE_Q4_K:  dequantize_row_q4_K ((const block_q4_K  *) x, y, k); break;
+        case GGML_TYPE_Q5_K:  dequantize_row_q5_K ((const block_q5_K  *) x, y, k); break;
+        case GGML_TYPE_Q6_K:  dequantize_row_q6_K ((const block_q6_K  *) x, y, k); break;
+        case GGML_TYPE_Q8_K:  dequantize_row_q8_K ((const block_q8_K  *) x, y, k); break;
+        case GGML_TYPE_TQ1_0: dequantize_row_tq1_0((const block_tq1_0 *) x, y, k); break;
+        case GGML_TYPE_TQ2_0: dequantize_row_tq2_0((const block_tq2_0 *) x, y, k); break;
+        case GGML_TYPE_IQ2_XXS: dequantize_row_iq2_xxs((const block_iq2_xxs *) x, y, k); break;
+        case GGML_TYPE_IQ2_XS:  dequantize_row_iq2_xs ((const block_iq2_xs  *) x, y, k); break;
+        case GGML_TYPE_IQ2_S:   dequantize_row_iq2_s  ((const block_iq2_s   *) x, y, k); break;
+        case GGML_TYPE_IQ3_XXS: dequantize_row_iq3_xxs((const block_iq3_xxs *) x, y, k); break;
+        case GGML_TYPE_IQ3_S:   dequantize_row_iq3_s  ((const block_iq3_s   *) x, y, k); break;
+        case GGML_TYPE_IQ1_S:   dequantize_row_iq1_s  ((const block_iq1_s   *) x, y, k); break;
+        case GGML_TYPE_IQ1_M:   dequantize_row_iq1_m  ((const block_iq1_m   *) x, y, k); break;
+        case GGML_TYPE_IQ4_NL:  dequantize_row_iq4_nl ((const block_iq4_nl  *) x, y, k); break;
+        case GGML_TYPE_IQ4_XS:  dequantize_row_iq4_xs ((const block_iq4_xs  *) x, y, k); break;
+        case GGML_TYPE_MXFP4:   dequantize_row_mxfp4  ((const block_mxfp4   *) x, y, k); break;
+        default:
+            GGML_ABORT("mul_mat: src0 cast-to-bf16: unsupported quant type %s", ggml_type_name(t));
+    }
+}
+
+static inline ggml_bf16_t ggml_bf16_rna_trunc4(ggml_bf16_t v) {
+    v.bits = (uint16_t)((v.bits + (uint16_t)GGML_BF16_RNA_BIAS) & (uint16_t)GGML_BF16_TRUNC4_MASK);
     return v;
 }
 
