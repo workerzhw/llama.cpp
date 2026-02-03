@@ -31,10 +31,80 @@ typedef double ggml_float;
 #define GGML_MULMAT_TRUNC4_SRC1 0
 #endif
 
+// ---------------------------------------------------------------------------
+// FP8(E4M3) block-quant simulation helpers
+//
+// 目标：模拟实际工程的“每16点一个 scale(int8) + FP8(E4M3)”。
+//  - FP8: E4M3, 不考虑 NaN/Inf
+//  - 溢出：饱和到最大有限值（max finite）
+//  - 下溢：低于最小非规格数（min subnormal）才清零；支持非规格数
+//  - 舍入：RNE (round-to-nearest-even)
+//
+// 注意：量化必须作用在“原始高精度数值(逻辑值)”上，而不是已被 BF16 截断后的值。
+//      因此这些接口都以 FP32 输入为主（由上游先把 BF16/F16/量化类型解到 FP32）。
+// ---------------------------------------------------------------------------
 
-// 0 = 关闭日志；1 = 开启日志
+// 0=关闭 1=开启
+#ifndef GGML_SIM_FP8E4M3
+#define GGML_SIM_FP8E4M3 0
+#endif
+
+// block 大小（工程中为16）
+#ifndef GGML_SIM_FP8E4M3_BLOCK
+#define GGML_SIM_FP8E4M3_BLOCK 16
+#endif
+
+// 分别控制 src0/src1 是否做 FP8+scale 回放
+#ifndef GGML_SIM_FP8E4M3_APPLY_SRC0
+#define GGML_SIM_FP8E4M3_APPLY_SRC0 1
+#endif
+
+#ifndef GGML_SIM_FP8E4M3_APPLY_SRC1
+#define GGML_SIM_FP8E4M3_APPLY_SRC1 1
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// 将输入 FP32 做“FP8(E4M3)+scale(int8)”的块量化，再解量化回 FP32。
+// scales_out 可为 NULL；若非空，则写出每块的 k（表示 2^k）。
+void ggml_sim_fp8e4m3_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        int8_t      * scales_out);
+
+// FP32 -> (FP8+scale 回放后) -> BF16
+void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        int8_t          * scales_out);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+// 0=关 1=开
 #ifndef GGML_MUL_MAT_LOG
 #define GGML_MUL_MAT_LOG 0
+#endif
+#ifdef __cplusplus
+}
+#endif
+
+// 0=只打SUMMARY 1=PLAN+SUMMARY 2=PLAN+CHUNK+SUMMARY
+#ifndef GGML_MMLOG_LEVEL
+#define GGML_MMLOG_LEVEL 1
+#endif
+
+// chunk日志预算（只影响CHUNK）
+#ifndef GGML_MMLOG_CHUNK_BUDGET
+#define GGML_MMLOG_CHUNK_BUDGET 50
 #endif
 
 #if GGML_MUL_MAT_LOG
