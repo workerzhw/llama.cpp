@@ -1,185 +1,8 @@
 #include "vec.h"
 
-// ---------------------------------------------------------------------------
-// FP8(E4M3) block-quant simulation implementation
-//
-// 约定：
-//  - FP8: 1 sign, 4 exp (bias=7), 3 mantissa
-//  - 不生成 NaN/Inf（输入若超范围 -> 饱和到 max finite）
-//  - 支持 subnormal；小于最小 subnormal 才刷 0
-//  - 舍入：RNE (round-to-nearest-even)
-//
-// 这里实现的是“量化后立刻解量化”的回放，用于评估数值损失。
-// ---------------------------------------------------------------------------
-
-#if GGML_SIM_FP8E4M3
-
-static inline int ggml_rne_int(float x) {
-    // round-to-nearest-even for non-negative x
-    // x is assumed finite and >=0
-    const float f = floorf(x);
-    const float r = x - f;
-    int i = (int) f;
-    if (r > 0.5f) {
-        return i + 1;
-    } else if (r < 0.5f) {
-        return i;
-    } else {
-        // tie -> even
-        return (i & 1) ? (i + 1) : i;
-    }
-}
-
-static inline float ggml_fp8e4m3_max_finite(void) {
-    // max finite for e4m3: exp=14 (1110), mant=7 => (1 + 7/8)*2^(14-7) = 1.875*128 = 240
-    return 240.0f;
-}
-
-static inline float ggml_fp8e4m3_min_subnormal(void) {
-    // exp=0, mant=1 => 2^(1-bias) * (mant/8) = 2^(-6) * (1/8) = 2^-9
-    return ldexpf(1.0f, -9);
-}
-
-static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
-    // Applies: saturate, subnormal support, RNE. No NaN/Inf handling.
-    if (x == 0.0f) {
-        return 0.0f;
-    }
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
-    float ax = fabsf(x);
-
-    // underflow to 0 below min subnormal
-    const float min_sub = ggml_fp8e4m3_min_subnormal();
-    if (ax < min_sub) {
-        return 0.0f;
-    }
-
-    // saturate overflow
-    const float max_f = ggml_fp8e4m3_max_finite();
-    if (ax > max_f) {
-        return sign * max_f;
-    }
-
-    // normalized threshold: exp==1, mant==0 => 1.0 * 2^(1-bias) = 2^-6
-    const float min_norm = ldexpf(1.0f, -6);
-    if (ax >= min_norm) {
-        int e;
-        float m = frexpf(ax, &e); // ax = m*2^e, m in [0.5,1)
-        // normalize to [1,2)
-        m *= 2.0f;
-        e -= 1;
-        // exp field = e + bias
-        int ef = e + 7;
-        if (ef <= 0) {
-            // should not happen because ax>=min_norm
-            ef = 0;
-        }
-        if (ef >= 15) {
-            return sign * max_f;
-        }
-        // mantissa bits: 3, represent fractional part of m in [1,2): frac=(m-1) in [0,1)
-        float frac = m - 1.0f;
-        int q = ggml_rne_int(frac * 8.0f); // 0..8
-        if (q == 8) {
-            // carry into exponent
-            q = 0;
-            ef += 1;
-            if (ef >= 15) {
-                return sign * max_f;
-            }
-        }
-        const float dq = 1.0f + (float)q / 8.0f;
-        const int de = ef - 7;
-        return sign * ldexpf(dq, de);
-    } else {
-        // subnormal: exp field=0, value = 2^(1-bias) * (mant/8)
-        // so mant = round(ax / 2^(1-bias) * 8)
-        const float scale = ldexpf(1.0f, 6) * 8.0f; // 2^6*8 = 512
-        int mant = ggml_rne_int(ax * scale);
-        if (mant <= 0) {
-            return 0.0f;
-        }
-        if (mant > 7) {
-            // would become normalized; clamp to max subnormal (mant=7)
-            mant = 7;
-        }
-        return sign * ldexpf((float)mant, -9); // mant/512
-    }
-}
-
-static inline int8_t ggml_choose_k_for_block(const float * in, int n) {
-    float amax = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        float ax = fabsf(in[i]);
-        if (ax > amax) amax = ax;
-    }
-    if (amax == 0.0f) {
-        return 0;
-    }
-    // need ax / 2^k <= max_finite (240)
-    const float max_f = ggml_fp8e4m3_max_finite();
-    float ratio = amax / max_f;
-    int k = 0;
-    if (ratio > 1.0f) {
-        // k = ceil(log2(ratio))
-        k = (int)ceilf(log2f(ratio));
-    }
-    if (k < -128) k = -128;
-    if (k > 127)  k = 127;
-    return (int8_t)k;
-}
-
-extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
-        const float * in,
-        float       * out,
-        int           n,
-        int           block,
-        int8_t      * scales_out) {
-    if (block <= 0) {
-        block = 16;
-    }
-    for (int i = 0; i < n; i += block) {
-        const int len = (i + block <= n) ? block : (n - i);
-        const int8_t k = ggml_choose_k_for_block(in + i, len);
-        if (scales_out) {
-            scales_out[i / block] = k;
-        }
-        const float inv = ldexpf(1.0f, -k); // 2^{-k}
-        const float mul = ldexpf(1.0f,  k); // 2^{k}
-        for (int j = 0; j < len; ++j) {
-            const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
-            out[i + j] = q * mul;
-        }
-    }
-}
-
-extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
-        const float     * in,
-        ggml_bf16_t     * out,
-        int               n,
-        int               block,
-        int8_t          * scales_out) {
-    if (block <= 0) {
-        block = 16;
-    }
-    for (int i = 0; i < n; i += block) {
-        const int len = (i + block <= n) ? block : (n - i);
-        const int8_t k = ggml_choose_k_for_block(in + i, len);
-        if (scales_out) {
-            scales_out[i / block] = k;
-        }
-        const float inv = ldexpf(1.0f, -k);
-        const float mul = ldexpf(1.0f,  k);
-        for (int j = 0; j < len; ++j) {
-            const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
-            out[i + j] = GGML_FP32_TO_BF16(q * mul);
-        }
-    }
-}
-
-#endif // GGML_SIM_FP8E4M3
-
 #include <cassert>
+#include <cmath>
+#include <cstdint>
 
 // precomputed gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_f16[1 << 16];
@@ -381,6 +204,157 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
                              GGML_BF16_TO_FP32(y[i]));
     }
     *s = sumf;
+}
+
+// ============================================================================
+// FP8(E4M3) (no NaN/Inf) + int8 pow2 scale simulation
+//
+// Bit layout: [sign:1][exp:4][mant:3]
+// bias=7
+//   exp=0   : subnormal/zero => value = mant * 2^-9
+//   exp=1..15: normal        => value = (1 + mant/8) * 2^(exp-bias)
+// No NaN/Inf: exp=15 is treated as normal exponent (e=8), giving max finite:
+//   exp=15,mant=7 => 1.875 * 2^8 = 480
+
+static inline uint8_t ggml_fp8e4m3_pack_(int sign, int exp, int mant) {
+    return (uint8_t)((sign << 7) | ((exp & 0xF) << 3) | (mant & 0x7));
+}
+
+static inline float ggml_fp8e4m3_to_f32_(uint8_t b) {
+    const int sign = (b >> 7) & 1;
+    const int exp  = (b >> 3) & 0xF;
+    const int mant = (b >> 0) & 0x7;
+    const float s = sign ? -1.0f : 1.0f;
+    if (exp == 0) {
+        // subnormal/zero: mant * 2^-9
+        if (mant == 0) return 0.0f;
+        return s * std::ldexp((float) mant, -9);
+    }
+    // normal
+    const int bias = 7;
+    const int e = exp - bias;
+    const float m = 1.0f + (float) mant / 8.0f;
+    return s * std::ldexp(m, e);
+}
+
+// RNE to integer using nearbyint (ties-to-even under FE_TONEAREST)
+static inline int ggml_rne_i_(float x) {
+    return (int) std::nearbyint(x);
+}
+
+static inline uint8_t ggml_f32_to_fp8e4m3_sat_sub_rne_(float x) {
+    // constants for this custom E4M3
+    const float max_finite = (float) GGML_SIM_FP8E4M3_MAX_FINITE; // 480
+    const float min_norm   = 0.015625f;    // 2^-6
+    const float min_sub    = 0.001953125f; // 2^-9
+
+    if (x == 0.0f) {
+        return 0;
+    }
+
+    const int sign = x < 0.0f;
+    const float ax = std::fabs(x);
+
+    // Saturate
+    if (ax >= max_finite) {
+        // max finite => exp=15 (e=8), mant=7
+        return ggml_fp8e4m3_pack_(sign, 15, 7);
+    }
+
+    // Subnormal / flush-to-zero
+    if (ax < min_norm) {
+        if (ax < min_sub) {
+            return 0;
+        }
+        // subnormal: value = mant * 2^-9, mant in [1..7]
+        const float q = ax / min_sub;
+        int mant = ggml_rne_i_(q);
+        if (mant < 1) mant = 1;
+        if (mant > 7) mant = 7;
+        return ggml_fp8e4m3_pack_(sign, 0, mant);
+    }
+
+    // Normal
+    int e;
+    const float m = std::frexp(ax, &e); // ax = m * 2^e, m in [0.5,1)
+    const float m2 = m * 2.0f;          // in [1,2)
+    int e2 = e - 1;
+
+    // allowed e2 range: [-6, 8]
+    if (e2 > 8) {
+        return ggml_fp8e4m3_pack_(sign, 15, 7);
+    }
+    if (e2 < -6) {
+        // should have been subnormal, but be safe
+        return 0;
+    }
+
+    const float frac = (m2 - 1.0f) * 8.0f; // [0,8)
+    int mant = ggml_rne_i_(frac);
+
+    // Carry
+    if (mant >= 8) {
+        mant = 0;
+        e2 += 1;
+        if (e2 > 8) {
+            return ggml_fp8e4m3_pack_(sign, 15, 7);
+        }
+    }
+
+    const int bias = 7;
+    const int exp = e2 + bias; // 1..15
+    return ggml_fp8e4m3_pack_(sign, exp, mant);
+}
+
+static inline int8_t ggml_choose_k_pow2_block_(const float *v, int bs) {
+    float amax = 0.0f;
+    for (int i = 0; i < bs; ++i) {
+        amax = std::fmax(amax, std::fabs(v[i]));
+    }
+    if (amax == 0.0f) return 0;
+    const float max_finite = (float) GGML_SIM_FP8E4M3_MAX_FINITE; // 480
+    const float t = amax / max_finite;
+    // want: amax / 2^k <= max_finite  => 2^k >= amax/max_finite
+    // k = ceil(log2(amax/max_finite))
+    int k = (int) std::ceil(std::log2(t));
+    if (k < -128) k = -128;
+    if (k >  127) k =  127;
+    return (int8_t) k;
+}
+
+void ggml_sim_fp8e4m3_block_qdq_f32(const float * in, float * out, int n, int8_t * scales_k) {
+    const int bs = GGML_SIM_FP8E4M3_BLOCK;
+    const int nb = (n + bs - 1) / bs;
+    for (int bi = 0; bi < nb; ++bi) {
+        const int off = bi * bs;
+        const int len = (off + bs <= n) ? bs : (n - off);
+        // For tail blocks (<bs), still choose k using available values.
+        int8_t k = ggml_choose_k_pow2_block_(in + off, len);
+        if (scales_k) scales_k[bi] = k;
+        for (int i = 0; i < len; ++i) {
+            const float scaled = std::ldexp(in[off + i], -k);
+            const uint8_t q = ggml_f32_to_fp8e4m3_sat_sub_rne_(scaled);
+            const float deq = std::ldexp(ggml_fp8e4m3_to_f32_(q), k);
+            out[off + i] = deq;
+        }
+    }
+}
+
+void ggml_sim_fp8e4m3_block_qdq_f32_to_bf16(const float * in, ggml_bf16_t * out, int n, int8_t * scales_k) {
+    const int bs = GGML_SIM_FP8E4M3_BLOCK;
+    const int nb = (n + bs - 1) / bs;
+    for (int bi = 0; bi < nb; ++bi) {
+        const int off = bi * bs;
+        const int len = (off + bs <= n) ? bs : (n - off);
+        int8_t k = ggml_choose_k_pow2_block_(in + off, len);
+        if (scales_k) scales_k[bi] = k;
+        for (int i = 0; i < len; ++i) {
+            const float scaled = std::ldexp(in[off + i], -k);
+            const uint8_t q = ggml_f32_to_fp8e4m3_sat_sub_rne_(scaled);
+            const float deq = std::ldexp(ggml_fp8e4m3_to_f32_(q), k);
+            out[off + i] = GGML_FP32_TO_BF16(deq);
+        }
+    }
 }
 
 void ggml_vec_dot_bf16_trunc4(
@@ -890,153 +864,3 @@ ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, fl
     }
     return sum = (ggml_float)logf(sum);
 }
-
-// =============================
-// FP8(E4M3) block-quant simulate
-// =============================
-
-extern "C" {
-
-static inline float ggml__pow2_i8(const int8_t k) {
-    // pow2 by bit manipulation is possible, but this is only used in conversion
-    return ldexpf(1.0f, (int)k);
-}
-
-// E4M3 max finite: (2^7) * (1 + 7/8) = 240
-static constexpr float GGML_FP8_E4M3_MAX_FINITE = 240.0f;
-// min subnormal: 2^(1-bias) * 2^-3 = 2^-9
-static constexpr float GGML_FP8_E4M3_MIN_SUB = 1.0f / 512.0f;
-
-// Choose k so that max(|x|) / 2^k <= 240.
-// k stored as int8, meaning scale = 2^k.
-static inline int8_t ggml__fp8_choose_k_e4m3(const float * in, int len) {
-    float amax = 0.0f;
-    for (int i = 0; i < len; ++i) {
-        float a = fabsf(in[i]);
-        if (a > amax) amax = a;
-    }
-    if (amax == 0.0f) {
-        return (int8_t)0;
-    }
-    // want: amax / 2^k <= 240  -> k >= log2(amax/240)
-    float ratio = amax / GGML_FP8_E4M3_MAX_FINITE;
-    int k = (int)ceilf(log2f(ratio));
-    if (k < -128) k = -128;
-    if (k > 127)  k = 127;
-    return (int8_t)k;
-}
-
-// Quantize a single value (already scaled to fp8 domain) then dequantize back to float.
-// Implements RNE + subnormals + saturate.
-static inline float ggml__fp8_e4m3_quant_dequant_scalar(float v) {
-    // sign
-    float av = fabsf(v);
-    if (av == 0.0f) {
-        return copysignf(0.0f, v);
-    }
-    // saturate
-    if (av >= GGML_FP8_E4M3_MAX_FINITE) {
-        return copysignf(GGML_FP8_E4M3_MAX_FINITE, v);
-    }
-    // flush below min subnormal
-    if (av < GGML_FP8_E4M3_MIN_SUB) {
-        return copysignf(0.0f, v);
-    }
-
-    // Normalize: v = m * 2^e, with m in [1,2)
-    int e;
-    float m = frexpf(av, &e); // av = m * 2^e, m in [0.5,1)
-    // Convert to [1,2):
-    m *= 2.0f;
-    e -= 1;
-
-    // In E4M3: exponent field encodes e with bias=7, normal exponent range: -6..7
-    const int e_min = -6;
-    const int e_max =  7;
-
-    if (e < e_min) {
-        // subnormal: value = (mantissa / 8) * 2^-6, mantissa in [1..7]
-        // So mantissa = round_RNE( av / 2^-6 * 8 ) = round_RNE( av * 512 )
-        float scaled = av * 512.0f;
-        int q = (int)lrintf(scaled); // RNE
-        if (q < 1) q = 1;
-        if (q > 7) q = 7;
-        float out = (float)q / 512.0f;
-        return copysignf(out, v);
-    }
-
-    // normal number
-    if (e > e_max) {
-        return copysignf(GGML_FP8_E4M3_MAX_FINITE, v);
-    }
-
-    // mantissa fractional bits: 3. m is in [1,2)
-    float frac = m - 1.0f; // in [0,1)
-    float scaled = frac * 8.0f;
-    int mant = (int)lrintf(scaled); // RNE
-    // Handle carry: frac rounds to 1.0 -> mant=8 -> increment exponent
-    if (mant == 8) {
-        mant = 0;
-        e += 1;
-        if (e > e_max) {
-            return copysignf(GGML_FP8_E4M3_MAX_FINITE, v);
-        }
-    }
-
-    float out = ldexpf(1.0f + ((float)mant) / 8.0f, e);
-    // clamp again for safety
-    if (out > GGML_FP8_E4M3_MAX_FINITE) out = GGML_FP8_E4M3_MAX_FINITE;
-    return copysignf(out, v);
-}
-
-void ggml_sim_fp8e4m3_block_quant_dequant_f32(
-        const float * in,
-        float       * out,
-        int           n,
-        int           block,
-        int8_t      * scales_out) {
-    if (block <= 0) block = 16;
-    int nb = (n + block - 1) / block;
-    for (int b = 0; b < nb; ++b) {
-        const int off = b * block;
-        const int len = (off + block <= n) ? block : (n - off);
-        int8_t k = ggml__fp8_choose_k_e4m3(in + off, len);
-        if (scales_out) scales_out[b] = k;
-        const float scale = ggml__pow2_i8(k);
-        const float inv   = 1.0f / scale;
-
-        for (int i = 0; i < len; ++i) {
-            float v = in[off + i] * inv;          // map into fp8 domain
-            float q = ggml__fp8_e4m3_quant_dequant_scalar(v);
-            out[off + i] = q * scale;             // dequant back
-        }
-    }
-}
-
-void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
-        const float     * in,
-        ggml_bf16_t     * out,
-        int               n,
-        int               block,
-        int8_t          * scales_out) {
-    // Reuse a small scratch buffer per block to avoid allocating n floats.
-    if (block <= 0) block = 16;
-    int nb = (n + block - 1) / block;
-    for (int b = 0; b < nb; ++b) {
-        const int off = b * block;
-        const int len = (off + block <= n) ? block : (n - off);
-        int8_t k = ggml__fp8_choose_k_e4m3(in + off, len);
-        if (scales_out) scales_out[b] = k;
-        const float scale = ggml__pow2_i8(k);
-        const float inv   = 1.0f / scale;
-        for (int i = 0; i < len; ++i) {
-            float v = in[off + i] * inv;
-            float q = ggml__fp8_e4m3_quant_dequant_scalar(v);
-            float r = q * scale;
-            out[off + i] = GGML_FP32_TO_BF16(r);
-        }
-    }
-}
-
-} // extern "C"
-
