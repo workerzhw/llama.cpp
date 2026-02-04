@@ -36,7 +36,7 @@ typedef double ggml_float;
 //
 // 目标：模拟实际工程的“每16点一个 scale(int8) + FP8(E4M3)”。
 //  - FP8: E4M3, 不考虑 NaN/Inf
-//  - 溢出：饱和到最大有限值（max finite）
+//  - 溢出：饱和到最大有限值（max finite，工程约定为 480）
 //  - 下溢：低于最小非规格数（min subnormal）才清零；支持非规格数
 //  - 舍入：RNE (round-to-nearest-even)
 //
@@ -92,9 +92,6 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
 // 0=关 1=开
 #ifndef GGML_MUL_MAT_LOG
 #define GGML_MUL_MAT_LOG 0
-#endif
-#ifdef __cplusplus
-}
 #endif
 
 // 0=只打SUMMARY 1=PLAN+SUMMARY 2=PLAN+CHUNK+SUMMARY

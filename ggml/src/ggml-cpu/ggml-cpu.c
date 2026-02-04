@@ -2960,11 +2960,50 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+                        // NOTE: mul_mat 在本分支里被改造为“无条件用 BF16 dot kernel”
+                        //       因此需要预留 workspace 用于：
+                        //         1) src1 -> BF16 contiguous（包括：类型转换/非连续拷贝/FP8+scale 回放）
+                        //         2) src0 -> BF16 contiguous（包括：类型转换/量化解码/FP8+scale 回放）
+                        //       workspace layout: [src1_buf (optional, padded)] [src0_buf (optional, padded)]
 
-                        if (node->src[1]->type != vec_dot_type) {
-                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                        const struct ggml_tensor * src0 = node->src[0];
+                        const struct ggml_tensor * src1 = node->src[1];
+
+                        const enum ggml_type vec_dot_type = GGML_TYPE_BF16;
+
+                        // 是否需要把 src1 放到 wdata 里：
+                        //  - src1 不是 BF16
+                        //  - 或 src1 不是 contiguous（vec_dot 期望 contiguous 的列/行布局）
+                        //  - 或开启 FP8(E4M3)+scale 回放且作用于 src1
+                        const bool need_src1_wdata =
+                                (src1->type != vec_dot_type) ||
+                                (!ggml_is_contiguous(src1))  ||
+                                (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+
+                        // 是否需要把 src0 放到 wdata 里：
+                        //  - src0 不是 BF16（包括量化类型/FP16/FP32）
+                        //  - 或开启 FP8(E4M3)+scale 回放且作用于 src0
+                        const bool need_src0_wdata =
+                                (src0->type != GGML_TYPE_BF16) ||
+                                (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0);
+
+                        size_t wsize_src1 = 0;
+                        if (need_src1_wdata) {
+                            // contiguous BF16 buffer for src1
+                            wsize_src1 = ggml_row_size(vec_dot_type, src1->ne[0]) *
+                                         (size_t) src1->ne[1] * (size_t) src1->ne[2] * (size_t) src1->ne[3];
+                            wsize_src1 = GGML_PAD(wsize_src1, GGML_CACHE_LINE);
                         }
+
+                        size_t wsize_src0 = 0;
+                        if (need_src0_wdata) {
+                            // contiguous BF16 buffer for src0
+                            wsize_src0 = ggml_row_size(GGML_TYPE_BF16, src0->ne[0]) *
+                                         (size_t) src0->ne[1] * (size_t) src0->ne[2] * (size_t) src0->ne[3];
+                            wsize_src0 = GGML_PAD(wsize_src0, GGML_CACHE_LINE);
+                        }
+
+                        cur = wsize_src1 + wsize_src0;
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {

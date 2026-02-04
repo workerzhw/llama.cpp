@@ -31,8 +31,10 @@ static inline int ggml_rne_int(float x) {
 }
 
 static inline float ggml_fp8e4m3_max_finite(void) {
-    // max finite for e4m3: exp=14 (1110), mant=7 => (1 + 7/8)*2^(14-7) = 1.875*128 = 240
-    return 240.0f;
+    // NOTE(按工程约定): 你的工程里 FP8(E4M3) 的最大有限值为 480（无 NaN/Inf）。
+    // 这里将“溢出饱和阈值”设为 480。
+    // （常见标准实现里 e4m3 的 max finite 可能是 240，但这里以工程定义为准。）
+    return 480.0f;
 }
 
 static inline float ggml_fp8e4m3_min_subnormal(void) {
@@ -74,7 +76,7 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
             // should not happen because ax>=min_norm
             ef = 0;
         }
-        if (ef >= 15) {
+        if (ef > 15) {
             return sign * max_f;
         }
         // mantissa bits: 3, represent fractional part of m in [1,2): frac=(m-1) in [0,1)
@@ -84,7 +86,7 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
             // carry into exponent
             q = 0;
             ef += 1;
-            if (ef >= 15) {
+            if (ef > 15) {
                 return sign * max_f;
             }
         }
@@ -116,7 +118,7 @@ static inline int8_t ggml_choose_k_for_block(const float * in, int n) {
     if (amax == 0.0f) {
         return 0;
     }
-    // need ax / 2^k <= max_finite (240)
+    // need ax / 2^k <= max_finite (工程约定为 480)
     const float max_f = ggml_fp8e4m3_max_finite();
     float ratio = amax / max_f;
     int k = 0;
@@ -890,153 +892,4 @@ ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, fl
     }
     return sum = (ggml_float)logf(sum);
 }
-
-// =============================
-// FP8(E4M3) block-quant simulate
-// =============================
-
-extern "C" {
-
-static inline float ggml__pow2_i8(const int8_t k) {
-    // pow2 by bit manipulation is possible, but this is only used in conversion
-    return ldexpf(1.0f, (int)k);
-}
-
-// E4M3 max finite: (2^7) * (1 + 7/8) = 240
-static constexpr float GGML_FP8_E4M3_MAX_FINITE = 240.0f;
-// min subnormal: 2^(1-bias) * 2^-3 = 2^-9
-static constexpr float GGML_FP8_E4M3_MIN_SUB = 1.0f / 512.0f;
-
-// Choose k so that max(|x|) / 2^k <= 240.
-// k stored as int8, meaning scale = 2^k.
-static inline int8_t ggml__fp8_choose_k_e4m3(const float * in, int len) {
-    float amax = 0.0f;
-    for (int i = 0; i < len; ++i) {
-        float a = fabsf(in[i]);
-        if (a > amax) amax = a;
-    }
-    if (amax == 0.0f) {
-        return (int8_t)0;
-    }
-    // want: amax / 2^k <= 240  -> k >= log2(amax/240)
-    float ratio = amax / GGML_FP8_E4M3_MAX_FINITE;
-    int k = (int)ceilf(log2f(ratio));
-    if (k < -128) k = -128;
-    if (k > 127)  k = 127;
-    return (int8_t)k;
-}
-
-// Quantize a single value (already scaled to fp8 domain) then dequantize back to float.
-// Implements RNE + subnormals + saturate.
-static inline float ggml__fp8_e4m3_quant_dequant_scalar(float v) {
-    // sign
-    float av = fabsf(v);
-    if (av == 0.0f) {
-        return copysignf(0.0f, v);
-    }
-    // saturate
-    if (av >= GGML_FP8_E4M3_MAX_FINITE) {
-        return copysignf(GGML_FP8_E4M3_MAX_FINITE, v);
-    }
-    // flush below min subnormal
-    if (av < GGML_FP8_E4M3_MIN_SUB) {
-        return copysignf(0.0f, v);
-    }
-
-    // Normalize: v = m * 2^e, with m in [1,2)
-    int e;
-    float m = frexpf(av, &e); // av = m * 2^e, m in [0.5,1)
-    // Convert to [1,2):
-    m *= 2.0f;
-    e -= 1;
-
-    // In E4M3: exponent field encodes e with bias=7, normal exponent range: -6..7
-    const int e_min = -6;
-    const int e_max =  7;
-
-    if (e < e_min) {
-        // subnormal: value = (mantissa / 8) * 2^-6, mantissa in [1..7]
-        // So mantissa = round_RNE( av / 2^-6 * 8 ) = round_RNE( av * 512 )
-        float scaled = av * 512.0f;
-        int q = (int)lrintf(scaled); // RNE
-        if (q < 1) q = 1;
-        if (q > 7) q = 7;
-        float out = (float)q / 512.0f;
-        return copysignf(out, v);
-    }
-
-    // normal number
-    if (e > e_max) {
-        return copysignf(GGML_FP8_E4M3_MAX_FINITE, v);
-    }
-
-    // mantissa fractional bits: 3. m is in [1,2)
-    float frac = m - 1.0f; // in [0,1)
-    float scaled = frac * 8.0f;
-    int mant = (int)lrintf(scaled); // RNE
-    // Handle carry: frac rounds to 1.0 -> mant=8 -> increment exponent
-    if (mant == 8) {
-        mant = 0;
-        e += 1;
-        if (e > e_max) {
-            return copysignf(GGML_FP8_E4M3_MAX_FINITE, v);
-        }
-    }
-
-    float out = ldexpf(1.0f + ((float)mant) / 8.0f, e);
-    // clamp again for safety
-    if (out > GGML_FP8_E4M3_MAX_FINITE) out = GGML_FP8_E4M3_MAX_FINITE;
-    return copysignf(out, v);
-}
-
-void ggml_sim_fp8e4m3_block_quant_dequant_f32(
-        const float * in,
-        float       * out,
-        int           n,
-        int           block,
-        int8_t      * scales_out) {
-    if (block <= 0) block = 16;
-    int nb = (n + block - 1) / block;
-    for (int b = 0; b < nb; ++b) {
-        const int off = b * block;
-        const int len = (off + block <= n) ? block : (n - off);
-        int8_t k = ggml__fp8_choose_k_e4m3(in + off, len);
-        if (scales_out) scales_out[b] = k;
-        const float scale = ggml__pow2_i8(k);
-        const float inv   = 1.0f / scale;
-
-        for (int i = 0; i < len; ++i) {
-            float v = in[off + i] * inv;          // map into fp8 domain
-            float q = ggml__fp8_e4m3_quant_dequant_scalar(v);
-            out[off + i] = q * scale;             // dequant back
-        }
-    }
-}
-
-void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
-        const float     * in,
-        ggml_bf16_t     * out,
-        int               n,
-        int               block,
-        int8_t          * scales_out) {
-    // Reuse a small scratch buffer per block to avoid allocating n floats.
-    if (block <= 0) block = 16;
-    int nb = (n + block - 1) / block;
-    for (int b = 0; b < nb; ++b) {
-        const int off = b * block;
-        const int len = (off + block <= n) ? block : (n - off);
-        int8_t k = ggml__fp8_choose_k_e4m3(in + off, len);
-        if (scales_out) scales_out[b] = k;
-        const float scale = ggml__pow2_i8(k);
-        const float inv   = 1.0f / scale;
-        for (int i = 0; i < len; ++i) {
-            float v = in[off + i] * inv;
-            float q = ggml__fp8_e4m3_quant_dequant_scalar(v);
-            float r = q * scale;
-            out[off + i] = GGML_FP32_TO_BF16(r);
-        }
-    }
-}
-
-} // extern "C"
 
