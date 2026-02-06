@@ -74,7 +74,8 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         float       * out,
         int           n,
         int           block,
-        int8_t      * scales_out);
+        int8_t      * scales_out,
+        int           src_id);
 
 // FP32 -> (FP8+scale 回放后) -> BF16
 void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
@@ -82,7 +83,26 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         ggml_bf16_t     * out,
         int               n,
         int               block,
-        int8_t          * scales_out);
+        int8_t          * scales_out,
+        int               src_id);
+
+// ---------------------------------------------------------------------------
+// FP8 simulation statistics collection & analysis report API
+//
+// Automatically collects per-block/per-element quantization error stats
+// during FP8 simulation, and generates an analysis report at program exit.
+// Report contains: SQNR, MAE, RMSE, overflow/underflow rates, scale
+// distribution, PPL impact estimation, etc.
+//
+// Report is written to both stderr and a disk file (fp8_sim_analysis.log).
+// ---------------------------------------------------------------------------
+
+// Reset all collected statistics
+void ggml_fp8_sim_stats_reset(void);
+
+// Output the analysis report. report_file can be NULL (stderr only),
+// otherwise also writes to the specified file.
+void ggml_fp8_sim_stats_report(const char * report_file);
 
 #ifdef __cplusplus
 }

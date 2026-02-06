@@ -136,31 +136,152 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         float       * out,
         int           n,
         int           block,
-        int8_t      * scales_out) {
-    if (block <= 0) {
-        block = 16;
-    }
-    for (int i = 0; i < n; i += block) {
-        const int len = (i + block <= n) ? block : (n - i);
-        const int8_t k = ggml_choose_k_for_block(in + i, len);
-        if (scales_out) {
-            scales_out[i / block] = k;
-        }
-        const float inv = ldexpf(1.0f, -k); // 2^{-k}
-        const float mul = ldexpf(1.0f,  k); // 2^{k}
-        for (int j = 0; j < len; ++j) {
-            const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
-            out[i + j] = q * mul;
-        }
-    }
-}
+        int8_t      * scales_out,
+        int           src_id);
 
 extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         const float     * in,
         ggml_bf16_t     * out,
         int               n,
         int               block,
-        int8_t          * scales_out) {
+        int8_t          * scales_out,
+        int               src_id);
+
+extern "C" void ggml_fp8_sim_stats_reset(void);
+extern "C" void ggml_fp8_sim_stats_report(const char * report_file);
+
+// ---------------------------------------------------------------------------
+// Stats infrastructure
+// ---------------------------------------------------------------------------
+#include <mutex>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <cinttypes>
+
+struct FP8SimSrcStats {
+    int64_t total_elements;
+    int64_t total_blocks;
+    double  sum_sq_input;       // signal power: sum(x_i^2)
+    double  sum_sq_error;       // noise power:  sum((x_i - q_i)^2)
+    double  sum_abs_error;      // for MAE
+    double  max_abs_error;
+    double  sum_abs_rel_error;  // sum(|err|/|x|) for nonzero x
+    int64_t rel_error_count;    // count of nonzero x (denominator for mean rel err)
+    double  max_rel_error;
+    int64_t overflow_count;     // |scaled value| > max_finite => saturated
+    int64_t underflow_count;    // quantized=0 but original!=0
+    int64_t subnormal_count;    // in subnormal range after quant
+    int64_t zero_count;         // original was exactly 0
+    int64_t normal_count;       // normal FP8 range
+    int64_t scale_hist[256];    // k from -128..127, index = k+128
+};
+
+static FP8SimSrcStats g_fp8_stats[2]; // [0]=src0/weights, [1]=src1/activations
+static std::mutex     g_fp8_stats_mtx;
+static bool           g_fp8_atexit_registered = false;
+
+static void fp8_stats_atexit_handler(void) {
+    ggml_fp8_sim_stats_report("fp8_sim_analysis.log");
+}
+
+// Accumulate per-element stats into thread-local buffer, then merge under lock.
+// This is called from the quant/dequant functions below.
+static void fp8_accumulate_block_stats(
+        const float * original,  // original FP32 values
+        const float * dequant,   // after quant-dequant roundtrip (FP32)
+        int           len,
+        int8_t        k,         // scale exponent
+        int           src_id)
+{
+    // Classify each element and compute errors
+    const float max_f   = ggml_fp8e4m3_max_finite();
+    const float min_sub = ggml_fp8e4m3_min_subnormal();
+    const float min_norm = ldexpf(1.0f, -6);
+
+    FP8SimSrcStats local = {};
+    local.total_elements = len;
+    local.total_blocks   = 1;
+    local.scale_hist[(int)k + 128] = 1;
+
+    const float inv = ldexpf(1.0f, -k);
+
+    for (int j = 0; j < len; ++j) {
+        const float x  = original[j];
+        const float qx = dequant[j];
+        const float err = qx - x;
+
+        local.sum_sq_input += (double)x * (double)x;
+        local.sum_sq_error += (double)err * (double)err;
+
+        const double ae = fabs((double)err);
+        local.sum_abs_error += ae;
+        if (ae > local.max_abs_error) local.max_abs_error = ae;
+
+        if (x != 0.0f) {
+            const double re = ae / fabs((double)x);
+            local.sum_abs_rel_error += re;
+            local.rel_error_count += 1;
+            if (re > local.max_rel_error) local.max_rel_error = re;
+        }
+
+        // Classify
+        if (x == 0.0f) {
+            local.zero_count++;
+        } else {
+            const float ax_scaled = fabsf(x * inv);
+            if (ax_scaled > max_f) {
+                local.overflow_count++;
+            } else if (qx == 0.0f) {
+                local.underflow_count++;
+            } else if (ax_scaled < min_norm && ax_scaled >= min_sub) {
+                local.subnormal_count++;
+            } else {
+                local.normal_count++;
+            }
+        }
+    }
+
+    // Merge into global stats under lock
+    {
+        std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
+        FP8SimSrcStats & g = g_fp8_stats[src_id & 1];
+        g.total_elements    += local.total_elements;
+        g.total_blocks      += local.total_blocks;
+        g.sum_sq_input      += local.sum_sq_input;
+        g.sum_sq_error      += local.sum_sq_error;
+        g.sum_abs_error     += local.sum_abs_error;
+        if (local.max_abs_error > g.max_abs_error) g.max_abs_error = local.max_abs_error;
+        g.sum_abs_rel_error += local.sum_abs_rel_error;
+        g.rel_error_count   += local.rel_error_count;
+        if (local.max_rel_error > g.max_rel_error) g.max_rel_error = local.max_rel_error;
+        g.overflow_count    += local.overflow_count;
+        g.underflow_count   += local.underflow_count;
+        g.subnormal_count   += local.subnormal_count;
+        g.zero_count        += local.zero_count;
+        g.normal_count      += local.normal_count;
+        for (int i = 0; i < 256; ++i) g.scale_hist[i] += local.scale_hist[i];
+
+        // Register atexit handler on first call
+        if (!g_fp8_atexit_registered) {
+            g_fp8_atexit_registered = true;
+            atexit(fp8_stats_atexit_handler);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modified quant/dequant with stats collection
+// ---------------------------------------------------------------------------
+
+extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        int8_t      * scales_out,
+        int           src_id) {
     if (block <= 0) {
         block = 16;
     }
@@ -174,8 +295,315 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         const float mul = ldexpf(1.0f,  k);
         for (int j = 0; j < len; ++j) {
             const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
-            out[i + j] = GGML_FP32_TO_BF16(q * mul);
+            out[i + j] = q * mul;
         }
+        // Collect stats for this block
+        fp8_accumulate_block_stats(in + i, out + i, len, k, src_id);
+    }
+}
+
+extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        int8_t          * scales_out,
+        int               src_id) {
+    if (block <= 0) {
+        block = 16;
+    }
+    // We need a temporary FP32 buffer to compute stats (since output is BF16)
+    float tmp_dq[4096];  // stack buffer for moderate sizes
+    float * dq_buf = (n <= 4096) ? tmp_dq : (float *)malloc((size_t)n * sizeof(float));
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const int8_t k = ggml_choose_k_for_block(in + i, len);
+        if (scales_out) {
+            scales_out[i / block] = k;
+        }
+        const float inv = ldexpf(1.0f, -k);
+        const float mul = ldexpf(1.0f,  k);
+        for (int j = 0; j < len; ++j) {
+            const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
+            const float val = q * mul;
+            dq_buf[i + j] = val;
+            out[i + j] = GGML_FP32_TO_BF16(val);
+        }
+        // Collect stats for this block
+        fp8_accumulate_block_stats(in + i, dq_buf + i, len, k, src_id);
+    }
+
+    if (dq_buf != tmp_dq) {
+        free(dq_buf);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stats API
+// ---------------------------------------------------------------------------
+
+extern "C" void ggml_fp8_sim_stats_reset(void) {
+    std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
+    memset(g_fp8_stats, 0, sizeof(g_fp8_stats));
+}
+
+// Helper: write one src stats section
+static void fp8_write_src_section(FILE * f, const char * name, const FP8SimSrcStats & s) {
+    if (s.total_elements == 0) {
+        fprintf(f, "\n  %s: (no data collected)\n", name);
+        return;
+    }
+
+    const double n_elem = (double)s.total_elements;
+    const double sig_power = s.sum_sq_input / n_elem;
+    const double noise_power = s.sum_sq_error / n_elem;
+    const double sqnr_db = (noise_power > 0.0) ? 10.0 * log10(sig_power / noise_power) : 999.0;
+    const double mae = s.sum_abs_error / n_elem;
+    const double rmse = sqrt(s.sum_sq_error / n_elem);
+    const double mean_rel_err_pct = (s.rel_error_count > 0) ? 100.0 * (s.sum_abs_rel_error / (double)s.rel_error_count) : 0.0;
+    const double max_rel_err_pct = 100.0 * s.max_rel_error;
+
+    const int64_t classified = s.overflow_count + s.underflow_count + s.subnormal_count + s.zero_count + s.normal_count;
+    auto pct = [](int64_t count, int64_t total) -> double {
+        return total > 0 ? 100.0 * (double)count / (double)total : 0.0;
+    };
+
+    fprintf(f, "\n  %s Quantization Error Analysis\n", name);
+    fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+
+    fprintf(f, "    Total elements processed  : %" PRId64 "\n", s.total_elements);
+    fprintf(f, "    Total blocks processed    : %" PRId64 "\n", s.total_blocks);
+    fprintf(f, "\n");
+    fprintf(f, "    Signal power (mean x^2)   : %.6e\n", sig_power);
+    fprintf(f, "    Noise power  (mean err^2) : %.6e\n", noise_power);
+    fprintf(f, "    *** SQNR                  : %.2f dB ***\n", sqnr_db);
+    fprintf(f, "\n");
+    fprintf(f, "    Mean absolute error (MAE) : %.6e\n", mae);
+    fprintf(f, "    RMS error (RMSE)          : %.6e\n", rmse);
+    fprintf(f, "    Max absolute error        : %.6e\n", s.max_abs_error);
+    fprintf(f, "    Mean relative error       : %.4f%%\n", mean_rel_err_pct);
+    fprintf(f, "    Max relative error        : %.4f%%\n", max_rel_err_pct);
+    fprintf(f, "\n");
+
+    fprintf(f, "    Element classification (total classified: %" PRId64 "):\n", classified);
+    fprintf(f, "      Normal FP8 range      : %12" PRId64 " (%.4f%%)\n", s.normal_count,    pct(s.normal_count,    classified));
+    fprintf(f, "      Subnormal (denorm)    : %12" PRId64 " (%.4f%%)\n", s.subnormal_count, pct(s.subnormal_count, classified));
+    fprintf(f, "      Underflow (->0)       : %12" PRId64 " (%.4f%%)\n", s.underflow_count, pct(s.underflow_count, classified));
+    fprintf(f, "      Overflow (saturated)  : %12" PRId64 " (%.4f%%)\n", s.overflow_count,  pct(s.overflow_count,  classified));
+    fprintf(f, "      Zero input            : %12" PRId64 " (%.4f%%)\n", s.zero_count,      pct(s.zero_count,      classified));
+    fprintf(f, "\n");
+
+    // Scale histogram – show nonzero bins grouped
+    fprintf(f, "    Scale exponent (k=log2) distribution:\n");
+    // Find range of nonzero bins
+    int kmin = 255, kmax = 0;
+    int64_t total_blocks = 0;
+    for (int i = 0; i < 256; ++i) {
+        if (s.scale_hist[i] > 0) {
+            if (i < kmin) kmin = i;
+            if (i > kmax) kmax = i;
+            total_blocks += s.scale_hist[i];
+        }
+    }
+    if (total_blocks > 0) {
+        for (int i = kmin; i <= kmax; ++i) {
+            if (s.scale_hist[i] > 0) {
+                int k_val = i - 128;
+                double frac = (double)s.scale_hist[i] / (double)total_blocks;
+                int bar_len = (int)(frac * 50.0);
+                if (bar_len < 1 && s.scale_hist[i] > 0) bar_len = 1;
+                char bar[52];
+                for (int b = 0; b < bar_len && b < 50; ++b) bar[b] = '#';
+                bar[bar_len < 50 ? bar_len : 50] = '\0';
+                fprintf(f, "      k=%4d : %-50s %6.2f%% (%" PRId64 " blocks)\n",
+                        k_val, bar, frac * 100.0, s.scale_hist[i]);
+            }
+        }
+    }
+}
+
+extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
+    std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
+
+    // Skip if no data
+    if (g_fp8_stats[0].total_elements == 0 && g_fp8_stats[1].total_elements == 0) {
+        return;
+    }
+
+    // We write to two outputs: stderr and optionally a file
+    FILE * outputs[2] = { stderr, nullptr };
+    int nout = 1;
+    if (report_file) {
+        FILE * ff = fopen(report_file, "w");
+        if (ff) {
+            outputs[nout++] = ff;
+        } else {
+            fprintf(stderr, "[FP8-SIM] WARNING: cannot open report file '%s'\n", report_file);
+        }
+    }
+
+    for (int oi = 0; oi < nout; ++oi) {
+        FILE * f = outputs[oi];
+
+        fprintf(f, "\n");
+        fprintf(f, "================================================================================\n");
+        fprintf(f, "  FP8(E4M3) + Block Scale Quantization Simulation Analysis Report\n");
+        fprintf(f, "================================================================================\n");
+
+        // Configuration
+        fprintf(f, "\n  Configuration\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        fprintf(f, "    FP8 format           : E4M3 (1 sign, 4 exp, 3 mantissa, bias=7)\n");
+        fprintf(f, "    Max finite value     : 480.0\n");
+        fprintf(f, "    Min subnormal value  : 2^-9 = %.6f\n", ldexpf(1.0f, -9));
+        fprintf(f, "    Block size           : %d\n", GGML_SIM_FP8E4M3_BLOCK);
+        fprintf(f, "    Rounding             : RNE (round to nearest even)\n");
+        fprintf(f, "    Applied to src0 (weights)     : %s\n", GGML_SIM_FP8E4M3_APPLY_SRC0 ? "YES" : "NO");
+        fprintf(f, "    Applied to src1 (activations) : %s\n", GGML_SIM_FP8E4M3_APPLY_SRC1 ? "YES" : "NO");
+
+        // Per-src sections
+        fp8_write_src_section(f, "Weights (src0)", g_fp8_stats[0]);
+        fp8_write_src_section(f, "Activations (src1)", g_fp8_stats[1]);
+
+        // Combined analysis
+        fprintf(f, "\n  Combined Impact Analysis\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+
+        double sqnr_src0 = 999.0, sqnr_src1 = 999.0;
+        if (g_fp8_stats[0].total_elements > 0 && g_fp8_stats[0].sum_sq_error > 0) {
+            double sp0 = g_fp8_stats[0].sum_sq_input / (double)g_fp8_stats[0].total_elements;
+            double np0 = g_fp8_stats[0].sum_sq_error / (double)g_fp8_stats[0].total_elements;
+            sqnr_src0 = 10.0 * log10(sp0 / np0);
+        }
+        if (g_fp8_stats[1].total_elements > 0 && g_fp8_stats[1].sum_sq_error > 0) {
+            double sp1 = g_fp8_stats[1].sum_sq_input / (double)g_fp8_stats[1].total_elements;
+            double np1 = g_fp8_stats[1].sum_sq_error / (double)g_fp8_stats[1].total_elements;
+            sqnr_src1 = 10.0 * log10(sp1 / np1);
+        }
+
+        double sqnr_min = (sqnr_src0 < sqnr_src1) ? sqnr_src0 : sqnr_src1;
+
+        fprintf(f, "    SQNR src0 (weights)     : %.2f dB\n", sqnr_src0);
+        fprintf(f, "    SQNR src1 (activations) : %.2f dB\n", sqnr_src1);
+        fprintf(f, "    Bottleneck SQNR         : %.2f dB (min of above)\n", sqnr_min);
+        fprintf(f, "\n");
+
+        // Error budget
+        int64_t tot_of = g_fp8_stats[0].overflow_count + g_fp8_stats[1].overflow_count;
+        int64_t tot_uf = g_fp8_stats[0].underflow_count + g_fp8_stats[1].underflow_count;
+        int64_t tot_el = g_fp8_stats[0].total_elements + g_fp8_stats[1].total_elements;
+        fprintf(f, "    Total overflow (saturated)  : %" PRId64 " / %" PRId64 " (%.6f%%)\n",
+                tot_of, tot_el, tot_el > 0 ? 100.0 * (double)tot_of / (double)tot_el : 0.0);
+        fprintf(f, "    Total underflow (flushed)   : %" PRId64 " / %" PRId64 " (%.6f%%)\n",
+                tot_uf, tot_el, tot_el > 0 ? 100.0 * (double)tot_uf / (double)tot_el : 0.0);
+        fprintf(f, "\n");
+
+        // PPL impact estimation
+        fprintf(f, "  PPL Impact Estimation\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        fprintf(f, "    The SQNR (Signal-to-Quantization-Noise Ratio) directly\n");
+        fprintf(f, "    predicts the magnitude of PPL degradation:\n\n");
+        fprintf(f, "    SQNR Range       Expected PPL Impact     Severity\n");
+        fprintf(f, "    ──────────       ───────────────────     ────────\n");
+        fprintf(f, "     > 50 dB         < 0.5%% increase         Negligible\n");
+        fprintf(f, "     40-50 dB        0.5-2%% increase         Minor\n");
+        fprintf(f, "     30-40 dB        2-10%% increase          Moderate\n");
+        fprintf(f, "     20-30 dB        10-50%% increase         Significant\n");
+        fprintf(f, "     < 20 dB         > 50%% increase          Severe\n");
+        fprintf(f, "\n");
+
+        // Mark which range we're in
+        const char * severity;
+        const char * ppl_range;
+        if (sqnr_min > 50.0)      { severity = "Negligible";  ppl_range = "< 0.5%"; }
+        else if (sqnr_min > 40.0) { severity = "Minor";       ppl_range = "0.5-2%"; }
+        else if (sqnr_min > 30.0) { severity = "Moderate";    ppl_range = "2-10%"; }
+        else if (sqnr_min > 20.0) { severity = "Significant"; ppl_range = "10-50%"; }
+        else                      { severity = "Severe";       ppl_range = "> 50%"; }
+
+        fprintf(f, "    >>> Your bottleneck SQNR = %.2f dB\n", sqnr_min);
+        fprintf(f, "    >>> Expected PPL increase : %s\n", ppl_range);
+        fprintf(f, "    >>> Severity              : %s\n", severity);
+        fprintf(f, "\n");
+
+        // Layer propagation model
+        fprintf(f, "  Error Propagation Model\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        fprintf(f, "    For a Transformer with L layers, quantization noise compounds\n");
+        fprintf(f, "    roughly as sqrt(2*L) (independent noise per matmul, two per layer).\n\n");
+        fprintf(f, "    Effective output SQNR ~= bottleneck_SQNR - 10*log10(2*L)\n\n");
+
+        int layers[] = {12, 24, 32, 40, 48, 64, 80};
+        fprintf(f, "    Layers (L)   10*log10(2L)   Effective SQNR   Expected PPL impact\n");
+        fprintf(f, "    ──────────   ────────────   ──────────────   ───────────────────\n");
+        for (int li = 0; li < 7; ++li) {
+            int L = layers[li];
+            double penalty = 10.0 * log10(2.0 * L);
+            double eff = sqnr_min - penalty;
+            const char * eimp;
+            if (eff > 50.0)      eimp = "< 0.5%";
+            else if (eff > 40.0) eimp = "0.5-2%";
+            else if (eff > 30.0) eimp = "2-10%";
+            else if (eff > 20.0) eimp = "10-50%";
+            else                 eimp = "> 50%";
+            fprintf(f, "    %5d        %8.2f       %10.2f dB     %s\n", L, penalty, eff, eimp);
+        }
+        fprintf(f, "\n");
+
+        // Dominant error source
+        fprintf(f, "  Dominant Error Source\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        double total_noise = g_fp8_stats[0].sum_sq_error + g_fp8_stats[1].sum_sq_error;
+        if (total_noise > 0) {
+            double src0_frac = 100.0 * g_fp8_stats[0].sum_sq_error / total_noise;
+            double src1_frac = 100.0 * g_fp8_stats[1].sum_sq_error / total_noise;
+            fprintf(f, "    Weight quant noise contribution    : %.1f%%\n", src0_frac);
+            fprintf(f, "    Activation quant noise contribution: %.1f%%\n", src1_frac);
+            if (src0_frac > src1_frac) {
+                fprintf(f, "    --> Weights are the dominant error source.\n");
+                fprintf(f, "        To reduce PPL: increase weight precision or block size.\n");
+            } else {
+                fprintf(f, "    --> Activations are the dominant error source.\n");
+                fprintf(f, "        To reduce PPL: increase activation precision or block size.\n");
+            }
+        }
+        fprintf(f, "\n");
+
+        // Conclusion
+        fprintf(f, "  Conclusion\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        fprintf(f, "    The FP8(E4M3) block quantization (block=%d) introduces:\n", GGML_SIM_FP8E4M3_BLOCK);
+        fprintf(f, "      - %.2f dB SQNR for weights\n", sqnr_src0);
+        fprintf(f, "      - %.2f dB SQNR for activations\n", sqnr_src1);
+        fprintf(f, "      - Overflow is %s: %" PRId64 " elements\n",
+                tot_of == 0 ? "absent" : (100.0 * tot_of / (double)tot_el < 0.01 ? "negligible" : "present"), tot_of);
+        fprintf(f, "      - Underflow is %s: %" PRId64 " elements\n",
+                tot_uf == 0 ? "absent" : (100.0 * tot_uf / (double)tot_el < 0.01 ? "negligible" : "present"), tot_uf);
+        fprintf(f, "\n");
+        fprintf(f, "    If measured PPL increased from A to B, check:\n");
+        fprintf(f, "      Delta(PPL)/A should be consistent with the '%s' severity\n", severity);
+        fprintf(f, "      predicted by SQNR=%.2f dB (expected %s increase).\n", sqnr_min, ppl_range);
+        fprintf(f, "\n");
+        fprintf(f, "    If the observed increase is LARGER than expected:\n");
+        fprintf(f, "      - Check overflow/underflow counts above\n");
+        fprintf(f, "      - Certain sensitive layers (e.g., final LM head, embedding)\n");
+        fprintf(f, "        may disproportionately affect PPL despite low global error\n");
+        fprintf(f, "      - Consider disabling FP8 for src0 or src1 independently\n");
+        fprintf(f, "        (-DGGML_SIM_FP8E4M3_APPLY_SRC0=0 or _SRC1=0)\n");
+        fprintf(f, "\n");
+        fprintf(f, "    If the observed increase is SMALLER than expected:\n");
+        fprintf(f, "      - The model may be robust to this level of quantization noise\n");
+        fprintf(f, "      - FP8 quantization is viable for this model\n");
+        fprintf(f, "\n");
+        fprintf(f, "================================================================================\n");
+        fprintf(f, "\n");
+    }
+
+    // Close file output
+    if (nout > 1 && outputs[1]) {
+        fclose(outputs[1]);
+        fprintf(stderr, "[FP8-SIM] Analysis report written to: %s\n", report_file);
     }
 }
 
