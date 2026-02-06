@@ -137,7 +137,8 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         int           n,
         int           block,
         int8_t      * scales_out,
-        int           src_id);
+        int           src_id,
+        const char  * layer_name);
 
 extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         const float     * in,
@@ -145,7 +146,8 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         int               n,
         int               block,
         int8_t          * scales_out,
-        int               src_id);
+        int               src_id,
+        const char      * layer_name);
 
 extern "C" void ggml_fp8_sim_stats_reset(void);
 extern "C" void ggml_fp8_sim_stats_report(const char * report_file);
@@ -159,6 +161,10 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file);
 #include <cstring>
 #include <cmath>
 #include <cinttypes>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
 
 struct FP8SimSrcStats {
     int64_t total_elements;
@@ -179,6 +185,7 @@ struct FP8SimSrcStats {
 };
 
 static FP8SimSrcStats g_fp8_stats[2]; // [0]=src0/weights, [1]=src1/activations
+static std::unordered_map<std::string, FP8SimSrcStats> g_fp8_layer_stats[2]; // per-layer stats for src0, src1
 static std::mutex     g_fp8_stats_mtx;
 static bool           g_fp8_atexit_registered = false;
 
@@ -193,7 +200,8 @@ static void fp8_accumulate_block_stats(
         const float * dequant,   // after quant-dequant roundtrip (FP32)
         int           len,
         int8_t        k,         // scale exponent
-        int           src_id)
+        int           src_id,
+        const char  * layer_name)
 {
     // Classify each element and compute errors
     const float max_f   = ggml_fp8e4m3_max_finite();
@@ -263,6 +271,28 @@ static void fp8_accumulate_block_stats(
         g.normal_count      += local.normal_count;
         for (int i = 0; i < 256; ++i) g.scale_hist[i] += local.scale_hist[i];
 
+        // Per-layer accumulation
+        if (layer_name && layer_name[0] != '\0') {
+            // Extract layer key: use tensor name directly (e.g. "blk.5.attn_q.weight")
+            std::string lkey(layer_name);
+            FP8SimSrcStats & ls = g_fp8_layer_stats[src_id & 1][lkey];
+            ls.total_elements    += local.total_elements;
+            ls.total_blocks      += local.total_blocks;
+            ls.sum_sq_input      += local.sum_sq_input;
+            ls.sum_sq_error      += local.sum_sq_error;
+            ls.sum_abs_error     += local.sum_abs_error;
+            if (local.max_abs_error > ls.max_abs_error) ls.max_abs_error = local.max_abs_error;
+            ls.sum_abs_rel_error += local.sum_abs_rel_error;
+            ls.rel_error_count   += local.rel_error_count;
+            if (local.max_rel_error > ls.max_rel_error) ls.max_rel_error = local.max_rel_error;
+            ls.overflow_count    += local.overflow_count;
+            ls.underflow_count   += local.underflow_count;
+            ls.subnormal_count   += local.subnormal_count;
+            ls.zero_count        += local.zero_count;
+            ls.normal_count      += local.normal_count;
+            for (int i = 0; i < 256; ++i) ls.scale_hist[i] += local.scale_hist[i];
+        }
+
         // Register atexit handler on first call
         if (!g_fp8_atexit_registered) {
             g_fp8_atexit_registered = true;
@@ -281,7 +311,8 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         int           n,
         int           block,
         int8_t      * scales_out,
-        int           src_id) {
+        int           src_id,
+        const char  * layer_name) {
     if (block <= 0) {
         block = 16;
     }
@@ -298,7 +329,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
             out[i + j] = q * mul;
         }
         // Collect stats for this block
-        fp8_accumulate_block_stats(in + i, out + i, len, k, src_id);
+        fp8_accumulate_block_stats(in + i, out + i, len, k, src_id, layer_name);
     }
 }
 
@@ -308,7 +339,8 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         int               n,
         int               block,
         int8_t          * scales_out,
-        int               src_id) {
+        int               src_id,
+        const char      * layer_name) {
     if (block <= 0) {
         block = 16;
     }
@@ -331,7 +363,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
             out[i + j] = GGML_FP32_TO_BF16(val);
         }
         // Collect stats for this block
-        fp8_accumulate_block_stats(in + i, dq_buf + i, len, k, src_id);
+        fp8_accumulate_block_stats(in + i, dq_buf + i, len, k, src_id, layer_name);
     }
 
     if (dq_buf != tmp_dq) {
@@ -346,6 +378,8 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
 extern "C" void ggml_fp8_sim_stats_reset(void) {
     std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
     memset(g_fp8_stats, 0, sizeof(g_fp8_stats));
+    g_fp8_layer_stats[0].clear();
+    g_fp8_layer_stats[1].clear();
 }
 
 // Helper: write one src stats section
@@ -465,6 +499,87 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         // Per-src sections
         fp8_write_src_section(f, "Weights (src0)", g_fp8_stats[0]);
         fp8_write_src_section(f, "Activations (src1)", g_fp8_stats[1]);
+
+        // =================================================================
+        // Per-Layer Breakdown (sorted by SQNR ascending = worst first)
+        // =================================================================
+        for (int sid = 0; sid < 2; ++sid) {
+            const auto & lmap = g_fp8_layer_stats[sid];
+            if (lmap.empty()) continue;
+
+            const char * src_label = (sid == 0) ? "Weights (src0)" : "Activations (src1)";
+            fprintf(f, "\n  Per-Layer Breakdown: %s  (%d unique tensors)\n", src_label, (int)lmap.size());
+            fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+
+            // Build sorted vector by SQNR (ascending = worst first)
+            struct LayerEntry {
+                std::string name;
+                double sqnr;
+                double rmse;
+                double mae;
+                int64_t overflow;
+                int64_t underflow;
+                int64_t total_elements;
+                double noise_frac; // fraction of total noise from this layer
+            };
+
+            double total_noise_sq = 0.0;
+            for (const auto & kv : lmap) {
+                total_noise_sq += kv.second.sum_sq_error;
+            }
+
+            std::vector<LayerEntry> entries;
+            entries.reserve(lmap.size());
+            for (const auto & kv : lmap) {
+                const FP8SimSrcStats & ls = kv.second;
+                double ne = (double)ls.total_elements;
+                double sp = ls.sum_sq_input / ne;
+                double np = ls.sum_sq_error / ne;
+                double sqnr = (np > 0.0) ? 10.0 * log10(sp / np) : 999.0;
+                double rmse = sqrt(ls.sum_sq_error / ne);
+                double mae  = ls.sum_abs_error / ne;
+                double nfrac = (total_noise_sq > 0.0) ? 100.0 * ls.sum_sq_error / total_noise_sq : 0.0;
+                entries.push_back({kv.first, sqnr, rmse, mae, ls.overflow_count, ls.underflow_count, ls.total_elements, nfrac});
+            }
+
+            std::sort(entries.begin(), entries.end(), [](const LayerEntry & a, const LayerEntry & b) {
+                return a.sqnr < b.sqnr; // worst first
+            });
+
+            // Table header
+            fprintf(f, "    %-45s %8s %10s %10s %8s %8s %8s\n",
+                    "Tensor", "SQNR(dB)", "RMSE", "MAE", "Overflow", "Undflow", "Noise%%");
+            fprintf(f, "    %-45s %8s %10s %10s %8s %8s %8s\n",
+                    "─────────────────────────────────────────────",
+                    "────────", "──────────", "──────────",
+                    "────────", "────────", "────────");
+
+            for (const auto & e : entries) {
+                // Truncate long names
+                std::string dname = e.name;
+                if (dname.size() > 45) {
+                    dname = "..." + dname.substr(dname.size() - 42);
+                }
+                fprintf(f, "    %-45s %8.2f %10.2e %10.2e %8" PRId64 " %8" PRId64 " %7.2f%%\n",
+                        dname.c_str(), e.sqnr, e.rmse, e.mae, e.overflow, e.underflow, e.noise_frac);
+            }
+
+            // Highlight worst 5
+            int nworst = (int)entries.size() < 5 ? (int)entries.size() : 5;
+            fprintf(f, "\n    >>> Top %d WORST layers (lowest SQNR):\n", nworst);
+            for (int wi = 0; wi < nworst; ++wi) {
+                const auto & e = entries[wi];
+                const char * sev;
+                if (e.sqnr > 50.0)      sev = "OK";
+                else if (e.sqnr > 40.0) sev = "Minor";
+                else if (e.sqnr > 30.0) sev = "Moderate";
+                else if (e.sqnr > 20.0) sev = "SIGNIFICANT";
+                else                     sev = "!! SEVERE !!";
+                fprintf(f, "        #%d  %-40s  SQNR=%.2f dB  [%s]  noise_share=%.1f%%\n",
+                        wi + 1, e.name.c_str(), e.sqnr, sev, e.noise_frac);
+            }
+            fprintf(f, "\n");
+        }
 
         // Combined analysis
         fprintf(f, "\n  Combined Impact Analysis\n");
@@ -586,9 +701,10 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "      predicted by SQNR=%.2f dB (expected %s increase).\n", sqnr_min, ppl_range);
         fprintf(f, "\n");
         fprintf(f, "    If the observed increase is LARGER than expected:\n");
+        fprintf(f, "      - Check the Per-Layer Breakdown above for layers with SQNR < 25 dB\n");
         fprintf(f, "      - Check overflow/underflow counts above\n");
-        fprintf(f, "      - Certain sensitive layers (e.g., final LM head, embedding)\n");
-        fprintf(f, "        may disproportionately affect PPL despite low global error\n");
+        fprintf(f, "      - Sensitive layers (LM head, embedding, final norm) may dominate PPL\n");
+        fprintf(f, "        even if their global noise share is small\n");
         fprintf(f, "      - Consider disabling FP8 for src0 or src1 independently\n");
         fprintf(f, "        (-DGGML_SIM_FP8E4M3_APPLY_SRC0=0 or _SRC1=0)\n");
         fprintf(f, "\n");

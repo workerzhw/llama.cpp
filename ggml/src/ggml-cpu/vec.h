@@ -75,7 +75,8 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         int           n,
         int           block,
         int8_t      * scales_out,
-        int           src_id);
+        int           src_id,
+        const char  * layer_name);
 
 // FP32 -> (FP8+scale 回放后) -> BF16
 void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
@@ -84,7 +85,8 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         int               n,
         int               block,
         int8_t          * scales_out,
-        int               src_id);
+        int               src_id,
+        const char      * layer_name);
 
 // ---------------------------------------------------------------------------
 // FP8 simulation statistics collection & analysis report API

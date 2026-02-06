@@ -1411,7 +1411,7 @@ void ggml_compute_forward_mul_mat(
                             for (int64_t b = b_start; b < b_end; ++b) {
                                 const int off = (int) (b * block);
                                 const int len = (off + block <= ne10) ? block : (int) (ne10 - off);
-                                ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1);
+                                ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                             }
                         } else {
                             // plain FP32->BF16
@@ -1447,7 +1447,7 @@ void ggml_compute_forward_mul_mat(
                             // Store -> BF16
                             ggml_bf16_t * out = (ggml_bf16_t *) (src1_row_out);
                             if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1) {
-                                ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1);
+                                ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                             } else {
                                 from_float(tmp_f32, (void *)(out + off), len);
                             }
@@ -1501,7 +1501,7 @@ void ggml_compute_forward_mul_mat(
             if (src0->type == GGML_TYPE_F32) {
                 const float * in = (const float *) src0_row_in;
                 if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) {
-                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0);
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
                     ggml_cpu_fp32_to_bf16(in, (ggml_bf16_t *) src0_row_out, ne00);
                 }
@@ -1510,7 +1510,7 @@ void ggml_compute_forward_mul_mat(
                 const ggml_bf16_t * in = (const ggml_bf16_t *) src0_row_in;
                 for (int64_t k = 0; k < ne00; ++k) tmp_f32[k] = GGML_BF16_TO_FP32(in[k]);
                 if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) {
-                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0);
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
                     ggml_cpu_fp32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, ne00);
                 }
@@ -1518,14 +1518,14 @@ void ggml_compute_forward_mul_mat(
                 const ggml_fp16_t * in = (const ggml_fp16_t *) src0_row_in;
                 for (int64_t k = 0; k < ne00; ++k) tmp_f32[k] = GGML_FP16_TO_FP32(in[k]);
                 if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) {
-                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0);
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
                     ggml_cpu_fp32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, ne00);
                 }
             } else if (ggml_is_quantized(src0->type)) {
                 ggml_dequantize_row_to_f32(src0->type, src0_row_in, tmp_f32, ne00);
                 if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) {
-                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0);
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
                     ggml_cpu_fp32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, ne00);
                 }
