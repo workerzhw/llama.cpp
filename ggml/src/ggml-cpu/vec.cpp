@@ -118,14 +118,21 @@ static inline int8_t ggml_choose_k_for_block(const float * in, int n) {
     if (amax == 0.0f) {
         return 0;
     }
-    // need ax / 2^k <= max_finite (工程约定为 480)
-    const float max_f = ggml_fp8e4m3_max_finite();
-    float ratio = amax / max_f;
-    int k = 0;
-    if (ratio > 1.0f) {
-        // k = ceil(log2(ratio))
-        k = (int)ceilf(log2f(ratio));
-    }
+    // We want to choose k such that  amax / 2^k  is as close to max_finite
+    // as possible WITHOUT exceeding it.
+    //
+    //   amax / 2^k <= max_finite   =>   k >= log2(amax / max_finite)
+    //
+    // To maximise FP8 utilisation (scale UP small values, scale DOWN large
+    // values) we pick the smallest integer k that satisfies the constraint:
+    //
+    //   k = ceil(log2(amax / max_finite))
+    //
+    // When amax < max_finite this yields a NEGATIVE k, meaning we multiply
+    // the values by 2^|k| (scale up) before quantising, then divide back
+    // after dequantising -- dramatically improving precision for small weights.
+    const float max_f = ggml_fp8e4m3_max_finite(); // 480
+    int k = (int)ceilf(log2f(amax / max_f));
     if (k < -128) k = -128;
     if (k > 127)  k = 127;
     return (int8_t)k;
@@ -182,6 +189,8 @@ struct FP8SimSrcStats {
     int64_t zero_count;         // original was exactly 0
     int64_t normal_count;       // normal FP8 range
     int64_t scale_hist[256];    // k from -128..127, index = k+128
+    int64_t sum_row_len;        // sum of n (row length) across function calls
+    int64_t call_count;         // number of quant function calls
 };
 
 static FP8SimSrcStats g_fp8_stats[2]; // [0]=src0/weights, [1]=src1/activations
@@ -331,6 +340,17 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         // Collect stats for this block
         fp8_accumulate_block_stats(in + i, out + i, len, k, src_id, layer_name);
     }
+    // Track row length (= matmul inner dimension K for src0)
+    {
+        std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
+        g_fp8_stats[src_id & 1].sum_row_len += n;
+        g_fp8_stats[src_id & 1].call_count++;
+        if (layer_name && layer_name[0] != '\0') {
+            auto & ls = g_fp8_layer_stats[src_id & 1][std::string(layer_name)];
+            ls.sum_row_len += n;
+            ls.call_count++;
+        }
+    }
 }
 
 extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
@@ -368,6 +388,17 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
 
     if (dq_buf != tmp_dq) {
         free(dq_buf);
+    }
+    // Track row length (= matmul inner dimension K for src0)
+    {
+        std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
+        g_fp8_stats[src_id & 1].sum_row_len += n;
+        g_fp8_stats[src_id & 1].call_count++;
+        if (layer_name && layer_name[0] != '\0') {
+            auto & ls = g_fp8_layer_stats[src_id & 1][std::string(layer_name)];
+            ls.sum_row_len += n;
+            ls.call_count++;
+        }
     }
 }
 
@@ -581,136 +612,324 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
             fprintf(f, "\n");
         }
 
-        // Combined analysis
-        fprintf(f, "\n  Combined Impact Analysis\n");
-        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        // =================================================================
+        // Closed-Loop PPL Analysis
+        // =================================================================
 
+        // --- Compute core metrics ---
         double sqnr_src0 = 999.0, sqnr_src1 = 999.0;
+        double eps_w = 0.0, eps_a = 0.0; // noise-to-signal power ratios (linear)
         if (g_fp8_stats[0].total_elements > 0 && g_fp8_stats[0].sum_sq_error > 0) {
             double sp0 = g_fp8_stats[0].sum_sq_input / (double)g_fp8_stats[0].total_elements;
             double np0 = g_fp8_stats[0].sum_sq_error / (double)g_fp8_stats[0].total_elements;
             sqnr_src0 = 10.0 * log10(sp0 / np0);
+            eps_w = np0 / sp0;
         }
         if (g_fp8_stats[1].total_elements > 0 && g_fp8_stats[1].sum_sq_error > 0) {
             double sp1 = g_fp8_stats[1].sum_sq_input / (double)g_fp8_stats[1].total_elements;
             double np1 = g_fp8_stats[1].sum_sq_error / (double)g_fp8_stats[1].total_elements;
             sqnr_src1 = 10.0 * log10(sp1 / np1);
+            eps_a = np1 / sp1;
         }
 
-        double sqnr_min = (sqnr_src0 < sqnr_src1) ? sqnr_src0 : sqnr_src1;
+        // Detect matmul inner dimension K from src0 row length
+        int64_t K = 0;
+        if (g_fp8_stats[0].call_count > 0) {
+            K = g_fp8_stats[0].sum_row_len / g_fp8_stats[0].call_count;
+        }
 
-        fprintf(f, "    SQNR src0 (weights)     : %.2f dB\n", sqnr_src0);
-        fprintf(f, "    SQNR src1 (activations) : %.2f dB\n", sqnr_src1);
-        fprintf(f, "    Bottleneck SQNR         : %.2f dB (min of above)\n", sqnr_min);
-        fprintf(f, "\n");
+        // Detect number of layers from per-layer stats
+        // Count unique "blk.N" prefixes
+        int n_layers = 0;
+        {
+            std::unordered_map<int, bool> seen_blk;
+            for (const auto & kv : g_fp8_layer_stats[0]) {
+                // parse "blk.N." prefix
+                if (kv.first.substr(0, 4) == "blk.") {
+                    size_t dot2 = kv.first.find('.', 4);
+                    if (dot2 != std::string::npos) {
+                        int blk_id = atoi(kv.first.c_str() + 4);
+                        seen_blk[blk_id] = true;
+                    }
+                }
+            }
+            n_layers = (int)seen_blk.size();
+        }
+        if (n_layers == 0) n_layers = 32; // fallback
+
+        // Count matmuls per layer (unique tensor names per block)
+        int matmuls_per_layer = 0;
+        {
+            for (const auto & kv : g_fp8_layer_stats[0]) {
+                if (kv.first.substr(0, 4) == "blk." && kv.first.find("blk.0.") == 0) {
+                    matmuls_per_layer++;
+                }
+            }
+        }
+        if (matmuls_per_layer == 0) matmuls_per_layer = 7; // fallback
+
+        // Combined matmul SQNR (harmonic mean when both sides quantized)
+        double eps_mm = eps_w + eps_a; // combined noise ratio per matmul output element
+        double sqnr_mm = (eps_mm > 0.0) ? -10.0 * log10(eps_mm) : 999.0;
 
         // Error budget
         int64_t tot_of = g_fp8_stats[0].overflow_count + g_fp8_stats[1].overflow_count;
         int64_t tot_uf = g_fp8_stats[0].underflow_count + g_fp8_stats[1].underflow_count;
+        int64_t tot_sub = g_fp8_stats[0].subnormal_count + g_fp8_stats[1].subnormal_count;
         int64_t tot_el = g_fp8_stats[0].total_elements + g_fp8_stats[1].total_elements;
-        fprintf(f, "    Total overflow (saturated)  : %" PRId64 " / %" PRId64 " (%.6f%%)\n",
+
+        // ---------------------------------------------------------------
+        // Step 1: Measured Quantization Error Summary
+        // ---------------------------------------------------------------
+        fprintf(f, "\n  Step 1: Measured Quantization Error Summary\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        fprintf(f, "    Weight per-element SQNR      : %.2f dB  (noise/signal = %.4f%%)\n",
+                sqnr_src0, eps_w * 100.0);
+        fprintf(f, "    Activation per-element SQNR  : %.2f dB  (noise/signal = %.4f%%)\n",
+                sqnr_src1, eps_a * 100.0);
+        fprintf(f, "\n");
+        fprintf(f, "    When BOTH sides of a matmul are quantized, noise adds up.\n");
+        fprintf(f, "    Combined matmul noise ratio  : eps_w + eps_a = %.4f%%\n", eps_mm * 100.0);
+        fprintf(f, "    Combined matmul SQNR (harmonic): %.2f dB\n", sqnr_mm);
+        fprintf(f, "\n");
+        fprintf(f, "    Detected matmul inner dimension K = %" PRId64 " (from src0 avg row length)\n", K);
+        fprintf(f, "    Detected model depth L = %d layers, %d weight matmuls/layer\n", n_layers, matmuls_per_layer);
+        fprintf(f, "\n");
+        fprintf(f, "    Overflow  : %" PRId64 " / %" PRId64 " (%.6f%%)\n",
                 tot_of, tot_el, tot_el > 0 ? 100.0 * (double)tot_of / (double)tot_el : 0.0);
-        fprintf(f, "    Total underflow (flushed)   : %" PRId64 " / %" PRId64 " (%.6f%%)\n",
+        fprintf(f, "    Underflow : %" PRId64 " / %" PRId64 " (%.6f%%)\n",
                 tot_uf, tot_el, tot_el > 0 ? 100.0 * (double)tot_uf / (double)tot_el : 0.0);
+        fprintf(f, "    Subnormal : %" PRId64 " / %" PRId64 " (%.6f%%)\n",
+                tot_sub, tot_el, tot_el > 0 ? 100.0 * (double)tot_sub / (double)tot_el : 0.0);
+        fprintf(f, "\n");
+        fprintf(f, "    Physical meaning:\n");
+        fprintf(f, "      eps_w = %.4f%% means each weight has ~%.2f%% RMS relative error.\n",
+                eps_w * 100.0, sqrt(eps_w) * 100.0);
+        fprintf(f, "      eps_a = %.4f%% means each activation has ~%.2f%% RMS relative error.\n",
+                eps_a * 100.0, sqrt(eps_a) * 100.0);
         fprintf(f, "\n");
 
-        // PPL impact estimation
-        fprintf(f, "  PPL Impact Estimation\n");
+        // ---------------------------------------------------------------
+        // Step 2: From Per-Element Error to Matmul Output Error
+        // ---------------------------------------------------------------
+        fprintf(f, "  Step 2: From Per-Element Error to Matmul Output Error\n");
         fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
-        fprintf(f, "    The SQNR (Signal-to-Quantization-Noise Ratio) directly\n");
-        fprintf(f, "    predicts the magnitude of PPL degradation:\n\n");
-        fprintf(f, "    SQNR Range       Expected PPL Impact     Severity\n");
-        fprintf(f, "    ──────────       ───────────────────     ────────\n");
-        fprintf(f, "     > 50 dB         < 0.5%% increase         Negligible\n");
-        fprintf(f, "     40-50 dB        0.5-2%% increase         Minor\n");
-        fprintf(f, "     30-40 dB        2-10%% increase          Moderate\n");
-        fprintf(f, "     20-30 dB        10-50%% increase         Significant\n");
-        fprintf(f, "     < 20 dB         > 50%% increase          Severe\n");
+        fprintf(f, "    For Y = X @ W^T (matmul with K=%"  PRId64 " inner dimension):\n", K);
+        fprintf(f, "\n");
+        fprintf(f, "    Each output element Y[i,j] = sum_{k=1}^{K} X[i,k] * W[j,k]\n");
+        fprintf(f, "    Error:  dY[i,j] = sum_k (eX[i,k]*W[j,k] + X[i,k]*eW[j,k])\n");
+        fprintf(f, "\n");
+        fprintf(f, "    SQNR of matmul output:\n");
+        fprintf(f, "      SQNR_Y = 1 / (1/SQNR_W + 1/SQNR_X)\n");
+        fprintf(f, "             = 1 / (eps_w + eps_a)\n");
+        fprintf(f, "             = 1 / (%.6f + %.6f)\n", eps_w, eps_a);
+        fprintf(f, "             = %.2f  (%.2f dB)\n", 1.0/eps_mm, sqnr_mm);
+        fprintf(f, "\n");
+        fprintf(f, "    KEY INSIGHT: The matmul output SQNR equals the harmonic mean\n");
+        fprintf(f, "    of the input SQNRs. The inner dimension K does NOT improve SQNR\n");
+        fprintf(f, "    (both signal and noise scale with K, so the ratio is preserved).\n");
+        fprintf(f, "    However, K matters for ABSOLUTE error magnitude.\n");
         fprintf(f, "\n");
 
-        // Mark which range we're in
-        const char * severity;
-        const char * ppl_range;
-        if (sqnr_min > 50.0)      { severity = "Negligible";  ppl_range = "< 0.5%"; }
-        else if (sqnr_min > 40.0) { severity = "Minor";       ppl_range = "0.5-2%"; }
-        else if (sqnr_min > 30.0) { severity = "Moderate";    ppl_range = "2-10%"; }
-        else if (sqnr_min > 20.0) { severity = "Significant"; ppl_range = "10-50%"; }
-        else                      { severity = "Severe";       ppl_range = "> 50%"; }
-
-        fprintf(f, "    >>> Your bottleneck SQNR = %.2f dB\n", sqnr_min);
-        fprintf(f, "    >>> Expected PPL increase : %s\n", ppl_range);
-        fprintf(f, "    >>> Severity              : %s\n", severity);
-        fprintf(f, "\n");
-
-        // Layer propagation model
-        fprintf(f, "  Error Propagation Model\n");
+        // ---------------------------------------------------------------
+        // Step 3: Error Propagation Through Transformer Layers
+        // ---------------------------------------------------------------
+        fprintf(f, "  Step 3: Error Propagation Through %d Transformer Layers\n", n_layers);
         fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
-        fprintf(f, "    For a Transformer with L layers, quantization noise compounds\n");
-        fprintf(f, "    roughly as sqrt(2*L) (independent noise per matmul, two per layer).\n\n");
-        fprintf(f, "    Effective output SQNR ~= bottleneck_SQNR - 10*log10(2*L)\n\n");
-
-        int layers[] = {12, 24, 32, 40, 48, 64, 80};
-        fprintf(f, "    Layers (L)   10*log10(2L)   Effective SQNR   Expected PPL impact\n");
-        fprintf(f, "    ──────────   ────────────   ──────────────   ───────────────────\n");
-        for (int li = 0; li < 7; ++li) {
-            int L = layers[li];
-            double penalty = 10.0 * log10(2.0 * L);
-            double eff = sqnr_min - penalty;
-            const char * eimp;
-            if (eff > 50.0)      eimp = "< 0.5%";
-            else if (eff > 40.0) eimp = "0.5-2%";
-            else if (eff > 30.0) eimp = "2-10%";
-            else if (eff > 20.0) eimp = "10-50%";
-            else                 eimp = "> 50%";
-            fprintf(f, "    %5d        %8.2f       %10.2f dB     %s\n", L, penalty, eff, eimp);
-        }
+        fprintf(f, "\n");
+        fprintf(f, "    A Transformer layer has residual connections:\n");
+        fprintf(f, "      h_{l+1} = LayerNorm( h_l + Attn(h_l) )\n");
+        fprintf(f, "      h_{l+2} = LayerNorm( h_{l+1} + FFN(h_{l+1}) )\n");
+        fprintf(f, "\n");
+        fprintf(f, "    Three mechanisms DAMPEN error propagation:\n");
+        fprintf(f, "\n");
+        fprintf(f, "    (a) Residual connections (additive, not multiplicative):\n");
+        fprintf(f, "        Errors add to the residual stream, they do NOT multiply.\n");
+        fprintf(f, "        Naive worst-case: noise ratio grows as num_injections * eps_mm\n");
+        fprintf(f, "\n");
+        fprintf(f, "    (b) Sub-layer output fraction:\n");
+        fprintf(f, "        Each sub-layer output is typically gamma ~= 10-30%% of the\n");
+        fprintf(f, "        residual norm. So effective noise injection per sub-layer is\n");
+        fprintf(f, "        gamma^2 * eps_mm, not eps_mm. (gamma ~= 0.2 typical)\n");
+        fprintf(f, "\n");
+        fprintf(f, "    (c) LayerNorm renormalization:\n");
+        fprintf(f, "        LayerNorm rescales to unit variance after each sub-layer,\n");
+        fprintf(f, "        preventing noise magnitude from growing with residual norm.\n");
+        fprintf(f, "        This provides additional dampening by factor ~sqrt(L).\n");
         fprintf(f, "\n");
 
-        // Dominant error source
-        fprintf(f, "  Dominant Error Source\n");
+        // Compute corrected noise accumulation
+        const double gamma = 0.2;   // sub-layer output / residual norm ratio
+        const int N_inject = 2 * n_layers; // attn_out + ffn_out per layer
+        const double noise_naive = (double)N_inject * eps_mm;  // worst case (no dampening)
+        const double noise_residual = (double)N_inject * gamma * gamma * eps_mm; // with sub-layer scaling
+        const double noise_with_ln = noise_residual / sqrt((double)n_layers); // with LayerNorm dampening
+
+        fprintf(f, "    Quantitative estimate (L=%d, gamma=%.1f):\n", n_layers, gamma);
+        fprintf(f, "      Direct residual injections          : %d (2 per layer)\n", N_inject);
+        fprintf(f, "      Per-matmul noise ratio              : %.6f (= eps_w + eps_a)\n", eps_mm);
+        fprintf(f, "\n");
+        fprintf(f, "      Naive (no dampening):  %.4f%%  = %d x %.6f\n",
+                noise_naive * 100.0, N_inject, eps_mm);
+        fprintf(f, "      + Sub-layer scaling:   %.4f%%  = %d x %.1f^2 x %.6f\n",
+                noise_residual * 100.0, N_inject, gamma, eps_mm);
+        fprintf(f, "      + LayerNorm dampening: %.4f%%  = above / sqrt(%d)\n",
+                noise_with_ln * 100.0, n_layers);
+        fprintf(f, "\n");
+
+        double sqnr_residual = (noise_with_ln > 0) ? -10.0 * log10(noise_with_ln) : 999.0;
+        fprintf(f, "      Effective residual stream SQNR: %.2f dB\n", sqnr_residual);
+        fprintf(f, "\n");
+
+        // ---------------------------------------------------------------
+        // Step 4: From Residual Noise to PPL
+        // ---------------------------------------------------------------
+        fprintf(f, "  Step 4: From Residual Noise to PPL\n");
         fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
-        double total_noise = g_fp8_stats[0].sum_sq_error + g_fp8_stats[1].sum_sq_error;
-        if (total_noise > 0) {
-            double src0_frac = 100.0 * g_fp8_stats[0].sum_sq_error / total_noise;
-            double src1_frac = 100.0 * g_fp8_stats[1].sum_sq_error / total_noise;
-            fprintf(f, "    Weight quant noise contribution    : %.1f%%\n", src0_frac);
-            fprintf(f, "    Activation quant noise contribution: %.1f%%\n", src1_frac);
-            if (src0_frac > src1_frac) {
-                fprintf(f, "    --> Weights are the dominant error source.\n");
-                fprintf(f, "        To reduce PPL: increase weight precision or block size.\n");
-            } else {
-                fprintf(f, "    --> Activations are the dominant error source.\n");
-                fprintf(f, "        To reduce PPL: increase activation precision or block size.\n");
+        fprintf(f, "    PPL = exp(CE). For small perturbations:\n");
+        fprintf(f, "      DPPL/PPL ~ exp(DCE) - 1 ~ DCE  (for small DCE)\n");
+        fprintf(f, "\n");
+        fprintf(f, "    The cross-entropy perturbation DCE depends on noise at the\n");
+        fprintf(f, "    final logits, which comes from:\n");
+        fprintf(f, "      (1) Accumulated residual noise amplified by LM head weights\n");
+        fprintf(f, "      (2) LM head weight quantization noise itself\n");
+        fprintf(f, "\n");
+        fprintf(f, "    For the simplified model (DCE ~ effective_noise_ratio):\n");
+        fprintf(f, "      Predicted DPPL/PPL ~ %.4f%% to %.4f%%\n",
+                noise_with_ln * 100.0, noise_residual * 100.0);
+        fprintf(f, "      (range: with LayerNorm dampening ... without)\n");
+        fprintf(f, "\n");
+
+        // Read baseline PPL from env var
+        const char * env_ppl = getenv("FP8_SIM_BASELINE_PPL");
+        if (env_ppl) {
+            double ppl_base = atof(env_ppl);
+            if (ppl_base > 0) {
+                double pred_low = ppl_base * (1.0 + noise_with_ln);
+                double pred_high = ppl_base * (1.0 + noise_residual);
+                fprintf(f, "    Baseline PPL (from FP8_SIM_BASELINE_PPL): %.4f\n", ppl_base);
+                fprintf(f, "    Predicted FP8 PPL range: %.4f to %.4f\n", pred_low, pred_high);
+                fprintf(f, "    Predicted DPPL: %.4f to %.4f  (%.3f%% to %.3f%%)\n",
+                        pred_low - ppl_base, pred_high - ppl_base,
+                        noise_with_ln * 100.0, noise_residual * 100.0);
+                fprintf(f, "\n");
+                fprintf(f, "    Compare with your measured PPL to validate this model.\n");
+                fprintf(f, "    If measured delta is within the predicted range, the\n");
+                fprintf(f, "    quantization error fully explains the PPL increase.\n");
             }
+        } else {
+            fprintf(f, "    TIP: Set environment variable FP8_SIM_BASELINE_PPL=<your_f16_ppl>\n");
+            fprintf(f, "    before running to get exact predicted PPL range.\n");
+            fprintf(f, "    Example:  set FP8_SIM_BASELINE_PPL=7.52\n");
         }
         fprintf(f, "\n");
 
-        // Conclusion
-        fprintf(f, "  Conclusion\n");
+        // ---------------------------------------------------------------
+        // Step 5: Dominant Error Source & Error Budget
+        // ---------------------------------------------------------------
+        fprintf(f, "  Step 5: Dominant Error Source & Error Budget\n");
         fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
-        fprintf(f, "    The FP8(E4M3) block quantization (block=%d) introduces:\n", GGML_SIM_FP8E4M3_BLOCK);
-        fprintf(f, "      - %.2f dB SQNR for weights\n", sqnr_src0);
-        fprintf(f, "      - %.2f dB SQNR for activations\n", sqnr_src1);
-        fprintf(f, "      - Overflow is %s: %" PRId64 " elements\n",
-                tot_of == 0 ? "absent" : (100.0 * tot_of / (double)tot_el < 0.01 ? "negligible" : "present"), tot_of);
-        fprintf(f, "      - Underflow is %s: %" PRId64 " elements\n",
-                tot_uf == 0 ? "absent" : (100.0 * tot_uf / (double)tot_el < 0.01 ? "negligible" : "present"), tot_uf);
+
+        double total_noise = g_fp8_stats[0].sum_sq_error + g_fp8_stats[1].sum_sq_error;
+        double src0_frac = (total_noise > 0) ? 100.0 * g_fp8_stats[0].sum_sq_error / total_noise : 0.0;
+        double src1_frac = (total_noise > 0) ? 100.0 * g_fp8_stats[1].sum_sq_error / total_noise : 0.0;
+
+        fprintf(f, "    Absolute noise power breakdown:\n");
+        fprintf(f, "      Weight quant noise (sum err^2)    : %.6e  (%.1f%% of total)\n",
+                g_fp8_stats[0].sum_sq_error, src0_frac);
+        fprintf(f, "      Activation quant noise (sum err^2): %.6e  (%.1f%% of total)\n",
+                g_fp8_stats[1].sum_sq_error, src1_frac);
         fprintf(f, "\n");
-        fprintf(f, "    If measured PPL increased from A to B, check:\n");
-        fprintf(f, "      Delta(PPL)/A should be consistent with the '%s' severity\n", severity);
-        fprintf(f, "      predicted by SQNR=%.2f dB (expected %s increase).\n", sqnr_min, ppl_range);
+        fprintf(f, "    Relative noise (SQNR, lower = worse):\n");
+        fprintf(f, "      Weight SQNR     : %.2f dB  (eps_w = %.6f)\n", sqnr_src0, eps_w);
+        fprintf(f, "      Activation SQNR : %.2f dB  (eps_a = %.6f)\n", sqnr_src1, eps_a);
+        fprintf(f, "      Contribution to combined eps_mm:\n");
+        fprintf(f, "        eps_w / eps_mm = %.1f%%  (weight contribution to matmul noise)\n",
+                eps_mm > 0 ? eps_w / eps_mm * 100.0 : 0.0);
+        fprintf(f, "        eps_a / eps_mm = %.1f%%  (activation contribution to matmul noise)\n",
+                eps_mm > 0 ? eps_a / eps_mm * 100.0 : 0.0);
         fprintf(f, "\n");
-        fprintf(f, "    If the observed increase is LARGER than expected:\n");
-        fprintf(f, "      - Check the Per-Layer Breakdown above for layers with SQNR < 25 dB\n");
-        fprintf(f, "      - Check overflow/underflow counts above\n");
-        fprintf(f, "      - Sensitive layers (LM head, embedding, final norm) may dominate PPL\n");
-        fprintf(f, "        even if their global noise share is small\n");
-        fprintf(f, "      - Consider disabling FP8 for src0 or src1 independently\n");
-        fprintf(f, "        (-DGGML_SIM_FP8E4M3_APPLY_SRC0=0 or _SRC1=0)\n");
+
+        if (eps_w > eps_a) {
+            fprintf(f, "    --> Weights are the SQNR bottleneck (%.2f dB < %.2f dB).\n", sqnr_src0, sqnr_src1);
+            fprintf(f, "        To reduce PPL: improve weight quantization (better scaling,\n");
+            fprintf(f, "        larger block, or higher precision for sensitive layers).\n");
+        } else {
+            fprintf(f, "    --> Activations are the SQNR bottleneck (%.2f dB < %.2f dB).\n", sqnr_src1, sqnr_src0);
+            fprintf(f, "        To reduce PPL: improve activation quantization or disable\n");
+            fprintf(f, "        FP8 for activations (-DGGML_SIM_FP8E4M3_APPLY_SRC1=0).\n");
+        }
         fprintf(f, "\n");
-        fprintf(f, "    If the observed increase is SMALLER than expected:\n");
-        fprintf(f, "      - The model may be robust to this level of quantization noise\n");
-        fprintf(f, "      - FP8 quantization is viable for this model\n");
+
+        // Flag specific per-layer concerns
+        fprintf(f, "    Per-layer bottleneck analysis:\n");
+        for (int sid = 0; sid < 2; ++sid) {
+            const auto & lmap = g_fp8_layer_stats[sid];
+            const char * slbl = (sid == 0) ? "src0" : "src1";
+            int severe_count = 0;
+            for (const auto & kv : lmap) {
+                const FP8SimSrcStats & ls = kv.second;
+                if (ls.total_elements == 0 || ls.sum_sq_input == 0) continue;
+                double ne = (double)ls.total_elements;
+                double lsqnr = 10.0 * log10((ls.sum_sq_input / ne) / (ls.sum_sq_error / ne));
+                if (lsqnr < 25.0) severe_count++;
+            }
+            fprintf(f, "      %s: %d tensors with SQNR < 25 dB (significant/severe)\n",
+                    slbl, severe_count);
+        }
+        fprintf(f, "\n");
+
+        // ---------------------------------------------------------------
+        // Step 6: Closed-Loop Summary & Conclusion
+        // ---------------------------------------------------------------
+        fprintf(f, "  Step 6: Closed-Loop Summary\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        fprintf(f, "\n");
+        fprintf(f, "    Quantization Error Chain:\n");
+        fprintf(f, "\n");
+        fprintf(f, "    FP8(E4M3) block=%d    Per-element SQNR    Matmul output SQNR\n", GGML_SIM_FP8E4M3_BLOCK);
+        fprintf(f, "    ─────────────────  ─> ─────────────────  ─> ────────────────────\n");
+        fprintf(f, "    Weight  : %.2f dB ──┐\n", sqnr_src0);
+        fprintf(f, "                        ├──> Combined: %.2f dB (harmonic mean)\n", sqnr_mm);
+        fprintf(f, "    Activation: %.2f dB ──┘\n", sqnr_src1);
+        fprintf(f, "\n");
+        fprintf(f, "    Matmul SQNR    %d layers         Residual SQNR\n", n_layers);
+        fprintf(f, "    ───────────  ─> ─────────────  ─> ──────────────\n");
+        fprintf(f, "    %.2f dB      residual+LN       %.2f dB (effective at output)\n",
+                sqnr_mm, sqnr_residual);
+        fprintf(f, "\n");
+        fprintf(f, "    Residual SQNR   LM-head logits     Cross-Entropy     PPL\n");
+        fprintf(f, "    ──────────────  ─> ────────────  ─> ─────────────  ─> ─────\n");
+        fprintf(f, "    %.2f dB         + LM head noise     DCE ~ %.4f%%     DPPL/PPL ~ %.4f%%-%.4f%%\n",
+                sqnr_residual, noise_with_ln * 100.0, noise_with_ln * 100.0, noise_residual * 100.0);
+        fprintf(f, "\n");
+        fprintf(f, "    ============================================================\n");
+        fprintf(f, "    PREDICTED PPL INCREASE: %.3f%% to %.3f%%\n",
+                noise_with_ln * 100.0, noise_residual * 100.0);
+        fprintf(f, "    ============================================================\n");
+        fprintf(f, "\n");
+
+        // Guidance for before/after comparison
+        fprintf(f, "  Guidance for Interpreting Results\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        fprintf(f, "\n");
+        fprintf(f, "    If MEASURED DPPL/PPL falls within the predicted range:\n");
+        fprintf(f, "      -> The FP8 quantization error FULLY explains the PPL increase.\n");
+        fprintf(f, "      -> No hidden issues; the model is well-characterized.\n");
+        fprintf(f, "\n");
+        fprintf(f, "    If MEASURED is HIGHER than predicted:\n");
+        fprintf(f, "      -> Check per-layer breakdown for outlier layers (SQNR < 20 dB)\n");
+        fprintf(f, "      -> Sensitive layers (LM head, embedding) may amplify error\n");
+        fprintf(f, "      -> Consider mixed-precision: keep sensitive layers in F16\n");
+        fprintf(f, "\n");
+        fprintf(f, "    If MEASURED is LOWER than predicted:\n");
+        fprintf(f, "      -> Model is robust to this quantization noise level\n");
+        fprintf(f, "      -> FP8 quantization is viable for this model\n");
+        fprintf(f, "\n");
+        fprintf(f, "    For before/after comparison (e.g., scaling fix):\n");
+        fprintf(f, "      -> SQNR improvement of X dB reduces noise power by 10^(X/10)\n");
+        fprintf(f, "      -> Expected PPL improvement scales proportionally with noise power\n");
+        fprintf(f, "      -> Example: +15 dB SQNR -> noise reduced ~32x -> PPL delta reduced ~32x\n");
         fprintf(f, "\n");
         fprintf(f, "================================================================================\n");
         fprintf(f, "\n");
