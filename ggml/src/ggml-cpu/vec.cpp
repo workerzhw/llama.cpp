@@ -163,6 +163,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file);
 // Stats infrastructure
 // ---------------------------------------------------------------------------
 #include <mutex>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -197,32 +198,40 @@ static FP8SimSrcStats g_fp8_stats[2]; // [0]=src0/weights, [1]=src1/activations
 static std::unordered_map<std::string, FP8SimSrcStats> g_fp8_layer_stats[2]; // per-layer stats for src0, src1
 static std::mutex     g_fp8_stats_mtx;
 static bool           g_fp8_atexit_registered = false;
+static std::atomic<int64_t> g_fp8_call_counter{0}; // global call counter for sampling
+static int g_fp8_sample_rate = -1; // -1 = uninitialized; 0 = disabled; N = collect every Nth call
+
+static int fp8_get_sample_rate(void) {
+    if (g_fp8_sample_rate >= 0) return g_fp8_sample_rate;
+    const char * env = getenv("FP8_SIM_STATS_SAMPLE");
+    if (env) {
+        g_fp8_sample_rate = atoi(env);
+        if (g_fp8_sample_rate < 0) g_fp8_sample_rate = 0;
+    } else {
+        g_fp8_sample_rate = 100; // default: collect 1 in 100
+    }
+    return g_fp8_sample_rate;
+}
 
 static void fp8_stats_atexit_handler(void) {
     ggml_fp8_sim_stats_report("fp8_sim_analysis.log");
 }
 
-// Accumulate per-element stats into thread-local buffer, then merge under lock.
-// This is called from the quant/dequant functions below.
-static void fp8_accumulate_block_stats(
-        const float * original,  // original FP32 values
-        const float * dequant,   // after quant-dequant roundtrip (FP32)
+// Accumulate per-element stats for one block into a LOCAL accumulator (no lock).
+static inline void fp8_accumulate_block_stats_local(
+        FP8SimSrcStats & local,
+        const float * original,
+        const float * dequant,
         int           len,
-        int8_t        k,         // scale exponent
-        int           src_id,
-        const char  * layer_name)
+        int8_t        k)
 {
-    // Classify each element and compute errors
-    const float max_f   = ggml_fp8e4m3_max_finite();
-    const float min_sub = ggml_fp8e4m3_min_subnormal();
+    const float max_f    = ggml_fp8e4m3_max_finite();
+    const float min_sub  = ggml_fp8e4m3_min_subnormal();
     const float min_norm = ldexpf(1.0f, -6);
+    const float inv      = ldexpf(1.0f, -k);
 
-    FP8SimSrcStats local = {};
-    local.total_elements = len;
-    local.total_blocks   = 1;
-    local.scale_hist[(int)k + 128] = 1;
-
-    const float inv = ldexpf(1.0f, -k);
+    local.total_blocks += 1;
+    local.scale_hist[(int)k + 128] += 1;
 
     for (int j = 0; j < len; ++j) {
         const float x  = original[j];
@@ -243,7 +252,6 @@ static void fp8_accumulate_block_stats(
             if (re > local.max_rel_error) local.max_rel_error = re;
         }
 
-        // Classify
         if (x == 0.0f) {
             local.zero_count++;
         } else {
@@ -259,54 +267,60 @@ static void fp8_accumulate_block_stats(
             }
         }
     }
+}
 
-    // Merge into global stats under lock
-    {
-        std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
-        FP8SimSrcStats & g = g_fp8_stats[src_id & 1];
-        g.total_elements    += local.total_elements;
-        g.total_blocks      += local.total_blocks;
-        g.sum_sq_input      += local.sum_sq_input;
-        g.sum_sq_error      += local.sum_sq_error;
-        g.sum_abs_error     += local.sum_abs_error;
-        if (local.max_abs_error > g.max_abs_error) g.max_abs_error = local.max_abs_error;
-        g.sum_abs_rel_error += local.sum_abs_rel_error;
-        g.rel_error_count   += local.rel_error_count;
-        if (local.max_rel_error > g.max_rel_error) g.max_rel_error = local.max_rel_error;
-        g.overflow_count    += local.overflow_count;
-        g.underflow_count   += local.underflow_count;
-        g.subnormal_count   += local.subnormal_count;
-        g.zero_count        += local.zero_count;
-        g.normal_count      += local.normal_count;
-        for (int i = 0; i < 256; ++i) g.scale_hist[i] += local.scale_hist[i];
+// Merge a local accumulator into global + per-layer stats (ONE lock per call).
+static void fp8_merge_stats(
+        const FP8SimSrcStats & local,
+        int           n,
+        int           src_id,
+        const char  * layer_name)
+{
+    std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
+    FP8SimSrcStats & g = g_fp8_stats[src_id & 1];
+    g.total_elements    += local.total_elements;
+    g.total_blocks      += local.total_blocks;
+    g.sum_sq_input      += local.sum_sq_input;
+    g.sum_sq_error      += local.sum_sq_error;
+    g.sum_abs_error     += local.sum_abs_error;
+    if (local.max_abs_error > g.max_abs_error) g.max_abs_error = local.max_abs_error;
+    g.sum_abs_rel_error += local.sum_abs_rel_error;
+    g.rel_error_count   += local.rel_error_count;
+    if (local.max_rel_error > g.max_rel_error) g.max_rel_error = local.max_rel_error;
+    g.overflow_count    += local.overflow_count;
+    g.underflow_count   += local.underflow_count;
+    g.subnormal_count   += local.subnormal_count;
+    g.zero_count        += local.zero_count;
+    g.normal_count      += local.normal_count;
+    for (int i = 0; i < 256; ++i) g.scale_hist[i] += local.scale_hist[i];
+    g.sum_row_len += n;
+    g.call_count++;
 
-        // Per-layer accumulation
-        if (layer_name && layer_name[0] != '\0') {
-            // Extract layer key: use tensor name directly (e.g. "blk.5.attn_q.weight")
-            std::string lkey(layer_name);
-            FP8SimSrcStats & ls = g_fp8_layer_stats[src_id & 1][lkey];
-            ls.total_elements    += local.total_elements;
-            ls.total_blocks      += local.total_blocks;
-            ls.sum_sq_input      += local.sum_sq_input;
-            ls.sum_sq_error      += local.sum_sq_error;
-            ls.sum_abs_error     += local.sum_abs_error;
-            if (local.max_abs_error > ls.max_abs_error) ls.max_abs_error = local.max_abs_error;
-            ls.sum_abs_rel_error += local.sum_abs_rel_error;
-            ls.rel_error_count   += local.rel_error_count;
-            if (local.max_rel_error > ls.max_rel_error) ls.max_rel_error = local.max_rel_error;
-            ls.overflow_count    += local.overflow_count;
-            ls.underflow_count   += local.underflow_count;
-            ls.subnormal_count   += local.subnormal_count;
-            ls.zero_count        += local.zero_count;
-            ls.normal_count      += local.normal_count;
-            for (int i = 0; i < 256; ++i) ls.scale_hist[i] += local.scale_hist[i];
-        }
+    if (layer_name && layer_name[0] != '\0') {
+        std::string lkey(layer_name);
+        FP8SimSrcStats & ls = g_fp8_layer_stats[src_id & 1][lkey];
+        ls.total_elements    += local.total_elements;
+        ls.total_blocks      += local.total_blocks;
+        ls.sum_sq_input      += local.sum_sq_input;
+        ls.sum_sq_error      += local.sum_sq_error;
+        ls.sum_abs_error     += local.sum_abs_error;
+        if (local.max_abs_error > ls.max_abs_error) ls.max_abs_error = local.max_abs_error;
+        ls.sum_abs_rel_error += local.sum_abs_rel_error;
+        ls.rel_error_count   += local.rel_error_count;
+        if (local.max_rel_error > ls.max_rel_error) ls.max_rel_error = local.max_rel_error;
+        ls.overflow_count    += local.overflow_count;
+        ls.underflow_count   += local.underflow_count;
+        ls.subnormal_count   += local.subnormal_count;
+        ls.zero_count        += local.zero_count;
+        ls.normal_count      += local.normal_count;
+        for (int i = 0; i < 256; ++i) ls.scale_hist[i] += local.scale_hist[i];
+        ls.sum_row_len += n;
+        ls.call_count++;
+    }
 
-        // Register atexit handler on first call
-        if (!g_fp8_atexit_registered) {
-            g_fp8_atexit_registered = true;
-            atexit(fp8_stats_atexit_handler);
-        }
+    if (!g_fp8_atexit_registered) {
+        g_fp8_atexit_registered = true;
+        atexit(fp8_stats_atexit_handler);
     }
 }
 
@@ -325,6 +339,15 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
     if (block <= 0) {
         block = 16;
     }
+
+    // Decide whether to collect stats this call (sampling)
+    const int sample_rate = fp8_get_sample_rate();
+    const int64_t call_id = g_fp8_call_counter.fetch_add(1, std::memory_order_relaxed);
+    const bool collect = (sample_rate > 0) && (call_id % sample_rate == 0);
+
+    FP8SimSrcStats local = {};
+    local.total_elements = n;
+
     for (int i = 0; i < n; i += block) {
         const int len = (i + block <= n) ? block : (n - i);
         const int8_t k = ggml_choose_k_for_block(in + i, len);
@@ -337,19 +360,13 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
             const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
             out[i + j] = q * mul;
         }
-        // Collect stats for this block
-        fp8_accumulate_block_stats(in + i, out + i, len, k, src_id, layer_name);
-    }
-    // Track row length (= matmul inner dimension K for src0)
-    {
-        std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
-        g_fp8_stats[src_id & 1].sum_row_len += n;
-        g_fp8_stats[src_id & 1].call_count++;
-        if (layer_name && layer_name[0] != '\0') {
-            auto & ls = g_fp8_layer_stats[src_id & 1][std::string(layer_name)];
-            ls.sum_row_len += n;
-            ls.call_count++;
+        if (collect) {
+            fp8_accumulate_block_stats_local(local, in + i, out + i, len, k);
         }
+    }
+
+    if (collect) {
+        fp8_merge_stats(local, n, src_id, layer_name);
     }
 }
 
@@ -364,9 +381,20 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
     if (block <= 0) {
         block = 16;
     }
-    // We need a temporary FP32 buffer to compute stats (since output is BF16)
-    float tmp_dq[4096];  // stack buffer for moderate sizes
-    float * dq_buf = (n <= 4096) ? tmp_dq : (float *)malloc((size_t)n * sizeof(float));
+
+    const int sample_rate = fp8_get_sample_rate();
+    const int64_t call_id = g_fp8_call_counter.fetch_add(1, std::memory_order_relaxed);
+    const bool collect = (sample_rate > 0) && (call_id % sample_rate == 0);
+
+    // Only allocate temp buffer when collecting stats (need FP32 dequant for error calc)
+    float tmp_dq[4096];
+    float * dq_buf = nullptr;
+    if (collect) {
+        dq_buf = (n <= 4096) ? tmp_dq : (float *)malloc((size_t)n * sizeof(float));
+    }
+
+    FP8SimSrcStats local = {};
+    local.total_elements = n;
 
     for (int i = 0; i < n; i += block) {
         const int len = (i + block <= n) ? block : (n - i);
@@ -379,26 +407,21 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         for (int j = 0; j < len; ++j) {
             const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
             const float val = q * mul;
-            dq_buf[i + j] = val;
             out[i + j] = GGML_FP32_TO_BF16(val);
+            if (collect) {
+                dq_buf[i + j] = val;
+            }
         }
-        // Collect stats for this block
-        fp8_accumulate_block_stats(in + i, dq_buf + i, len, k, src_id, layer_name);
+        if (collect) {
+            fp8_accumulate_block_stats_local(local, in + i, dq_buf + i, len, k);
+        }
     }
 
-    if (dq_buf != tmp_dq) {
-        free(dq_buf);
-    }
-    // Track row length (= matmul inner dimension K for src0)
-    {
-        std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
-        g_fp8_stats[src_id & 1].sum_row_len += n;
-        g_fp8_stats[src_id & 1].call_count++;
-        if (layer_name && layer_name[0] != '\0') {
-            auto & ls = g_fp8_layer_stats[src_id & 1][std::string(layer_name)];
-            ls.sum_row_len += n;
-            ls.call_count++;
+    if (collect) {
+        if (dq_buf && dq_buf != tmp_dq) {
+            free(dq_buf);
         }
+        fp8_merge_stats(local, n, src_id, layer_name);
     }
 }
 
