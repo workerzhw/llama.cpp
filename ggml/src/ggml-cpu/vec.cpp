@@ -1174,9 +1174,12 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
 void ggml_vec_dot_bf16_trunc4(
     int n,
     float * GGML_RESTRICT s, size_t bs,
-    ggml_bf16_t * GGML_RESTRICT x, size_t bx,
-    ggml_bf16_t * GGML_RESTRICT y, size_t by,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by,
     int nrc) {
+
+    const ggml_bf16_t * GGML_RESTRICT x = (const ggml_bf16_t *) vx;
+    const ggml_bf16_t * GGML_RESTRICT y = (const ggml_bf16_t *) vy;
 
     assert(nrc == 1);
     GGML_UNUSED(nrc);
