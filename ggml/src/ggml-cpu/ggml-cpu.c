@@ -3954,16 +3954,38 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
-                        cur = 0;
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
-                        const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+                        const enum ggml_type dot_type = GGML_TYPE_BF16;
+                        const enum ggml_type vec_dot_type = type_traits_cpu[dot_type].vec_dot_type;
                         const int n_as = src0->ne[2];
-                        // src1
-                        if (src1->type != vec_dot_type) {
-                            cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+
+                        cur = 0;
+
+                        const bool need_src1_wdata =
+                                (src1->type != vec_dot_type) ||
+                                (!ggml_is_contiguous(src1))  ||
+                                (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+
+                        if (need_src1_wdata) {
+                            size_t wsize_src1 = ggml_row_size(vec_dot_type, src1->ne[0]) *
+                                                (size_t) src1->ne[1] * (size_t) src1->ne[2] * (size_t) src1->ne[3];
+                            wsize_src1 = GGML_PAD(wsize_src1, GGML_CACHE_LINE);
+                            cur += wsize_src1;
                         }
+
+                        const bool need_src0_wdata =
+                                (src0->type != GGML_TYPE_BF16) ||
+                                (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0);
+
+                        if (need_src0_wdata) {
+                            size_t wsize_src0 = ggml_row_size(GGML_TYPE_BF16, src0->ne[0]) *
+                                                (size_t) src0->ne[1] * (size_t) src0->ne[2] * (size_t) src0->ne[3];
+                            wsize_src0 = GGML_PAD(wsize_src0, GGML_CACHE_LINE);
+                            cur += wsize_src0;
+                        }
+
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows

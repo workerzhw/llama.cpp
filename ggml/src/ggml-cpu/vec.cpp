@@ -37,6 +37,14 @@ static inline float ggml_fp8e4m3_max_finite(void) {
     return 480.0f;
 }
 
+static inline float ggml_fp8e4m3_handle_non_finite(float x) {
+    if (isnan(x)) {
+        return 0.0f;
+    }
+    const float max_f = ggml_fp8e4m3_max_finite();
+    return x > 0.0f ? max_f : -max_f;
+}
+
 static inline float ggml_fp8e4m3_min_subnormal(void) {
     // exp=0, mant=1 => 2^(1-bias) * (mant/8) = 2^(-6) * (1/8) = 2^-9
     return ldexpf(1.0f, -9);
@@ -44,6 +52,10 @@ static inline float ggml_fp8e4m3_min_subnormal(void) {
 
 static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
     // Applies: saturate, subnormal support, RNE. No NaN/Inf handling.
+    if (!isfinite(x)) {
+        return ggml_fp8e4m3_handle_non_finite(x);
+    }
+
     if (x == 0.0f) {
         return 0.0f;
     }
@@ -102,8 +114,9 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
             return 0.0f;
         }
         if (mant > 7) {
-            // would become normalized; clamp to max subnormal (mant=7)
-            mant = 7;
+            // rounding carry from subnormal into normalized range:
+            // exp=1, mant=0 => min normal = 2^-6
+            return sign * min_norm;
         }
         return sign * ldexpf((float)mant, -9); // mant/512
     }
@@ -351,7 +364,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
     // Decide whether to collect stats this call (sampling)
     const int sample_rate = fp8_get_sample_rate();
     const int64_t call_id = g_fp8_call_counter.fetch_add(1, std::memory_order_relaxed);
-    const bool collect = (sample_rate > 0) && (call_id % sample_rate == 0);
+    bool collect = (sample_rate > 0) && (call_id % sample_rate == 0);
 
     FP8SimSrcStats local = {};
     local.total_elements = n;
@@ -399,6 +412,9 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
     float * dq_buf = nullptr;
     if (collect) {
         dq_buf = (n <= 4096) ? tmp_dq : (float *)malloc((size_t)n * sizeof(float));
+        if (dq_buf == nullptr) {
+            collect = false;
+        }
     }
 
     FP8SimSrcStats local = {};

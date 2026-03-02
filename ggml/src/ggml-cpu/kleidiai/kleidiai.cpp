@@ -174,8 +174,8 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         }
 
         const bool is_gemv = src1->ne[1] == 1;
-        const bool use_fp8sim_src0 = is_gemv && (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0);
-        const bool use_fp8sim_src1 = is_gemv && (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+        const bool use_fp8sim_src0 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0);
+        const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
         const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
         kernel_info * kernel = is_gemv ? &kernels->gemv : &kernels->gemm;
         lhs_packing_info * lhs_info = is_gemv ? &kernels->gemv_lhs_info : &kernels->gemm_lhs_info;
@@ -433,7 +433,7 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         }
 
         bool is_gemv = src1->ne[1] == 1;
-        const bool use_fp8sim_src1 = is_gemv && (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+        const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
         const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
         kernel_info * kernel = is_gemv ? &kernels->gemv : &kernels->gemm;
         lhs_packing_info * lhs_info = is_gemv ? &kernels->gemv_lhs_info : &kernels->gemm_lhs_info;

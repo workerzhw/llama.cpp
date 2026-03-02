@@ -6,13 +6,13 @@ DATA="${DATA:-models/hf/wiki.test.raw}"
 OUT_DIR="${OUT_DIR:-kv_dump_logs}"
 PROMPT="${PROMPT:-你好，请简要介绍一下KV cache。}"
 
-CTX="${CTX:-4096}"
+CTX="${CTX:-1024}"
 THREADS="${THREADS:-$(nproc)}"
-N_PREDICT="${N_PREDICT:-64}"
+N_PREDICT="${N_PREDICT:-32}"
 SEQ_ID="${SEQ_ID:-0}"
-BATCH="${BATCH:-2048}"
-UBATCH="${UBATCH:-512}"
-STRIDE="${STRIDE:-512}"
+BATCH="${BATCH:-512}"
+UBATCH="${UBATCH:-256}"
+STRIDE="${STRIDE:-256}"
 
 rm -rf build
 mkdir -p "${OUT_DIR}"
