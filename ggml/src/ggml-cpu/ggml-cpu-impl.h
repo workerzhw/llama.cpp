@@ -26,6 +26,24 @@ struct ggml_compute_params {
     struct ggml_threadpool * threadpool;
 };
 
+void ggml_mm_dist_record_chunk_values(
+        const char * op_kind,
+        const char * dst_name,
+        const char * src0_name,
+        const char * src1_name,
+        const float * vals,
+        int64_t n);
+
+void ggml_mm_dist_record_chunk_values_pair(
+    const char * op_kind_pre,
+    const char * op_kind_post,
+    const char * dst_name,
+    const char * src0_name,
+    const char * src1_name,
+    const float * vals_pre,
+    const float * vals_post,
+    int64_t n);
+
 
 #if defined(_MSC_VER)
 

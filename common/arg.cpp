@@ -403,6 +403,18 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    if (params.seq_state_in_id < 0) {
+        throw std::invalid_argument("error: --seq-state-in-id must be >= 0\n");
+    }
+
+    if (params.seq_state_out_id < 0) {
+        throw std::invalid_argument("error: --seq-state-out-id must be >= 0\n");
+    }
+
+    if (!params.path_prompt_cache.empty() && (!params.path_seq_state_in.empty() || !params.path_seq_state_out.empty())) {
+        throw std::invalid_argument("error: --prompt-cache cannot be combined with --seq-state-in/--seq-state-out\n");
+    }
+
     // handle model and download
     {
         auto res = common_params_handle_model(params.model, params.hf_token, DEFAULT_MODEL_PATH, params.offline);
@@ -1094,6 +1106,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "file to cache prompt state for faster startup (default: none)",
         [](common_params & params, const std::string & value) {
             params.path_prompt_cache = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
+        {"--seq-state-in"}, "FNAME",
+        "load a single-sequence state file into the context (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.path_seq_state_in = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
+        {"--seq-state-in-id"}, "N",
+        "destination sequence ID for --seq-state-in (default: 0)",
+        [](common_params & params, int value) {
+            params.seq_state_in_id = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
+        {"--seq-state-out"}, "FNAME",
+        "save a single-sequence state file from the context before exit (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.path_seq_state_out = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
+        {"--seq-state-out-id"}, "N",
+        "source sequence ID for --seq-state-out (default: 0)",
+        [](common_params & params, int value) {
+            params.seq_state_out_id = value;
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(

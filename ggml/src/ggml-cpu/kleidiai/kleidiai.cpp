@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <string>
+#include <vector>
 #if defined(__linux__)
 #include <asm/hwcap.h>
 #include <sys/auxv.h>
@@ -28,6 +29,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-threading.h"
 #include "traits.h"
+#include "vec.h"
 
 #include "kernels.h"
 
@@ -172,6 +174,9 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         }
 
         const bool is_gemv = src1->ne[1] == 1;
+        const bool use_fp8sim_src0 = is_gemv && (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0);
+        const bool use_fp8sim_src1 = is_gemv && (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+        const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
         kernel_info * kernel = is_gemv ? &kernels->gemv : &kernels->gemm;
         lhs_packing_info * lhs_info = is_gemv ? &kernels->gemv_lhs_info : &kernels->gemm_lhs_info;
         GGML_ASSERT(kernel);
@@ -253,7 +258,23 @@ class tensor_traits : public ggml::cpu::tensor_traits {
                         const size_t dst_off = base_packed_off + (size_t)(cur - m_start) * row_stride_bytes;
                         void * dst_ptr       = lhs_packed + dst_off;
 
-                        lhs_info->pack_func_ex(take, k, 0, mr, kr, sr, 0, src_ptr, lhs_stride, dst_ptr);
+                        if (use_fp8sim_src1) {
+                            std::vector<float> lhs_fp8((size_t) take * (size_t) k);
+                            const float * src_f32 = reinterpret_cast<const float *>(src_ptr);
+                            for (int64_t rr = 0; rr < take; ++rr) {
+                                ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                                    src_f32 + rr * (lhs_stride / sizeof(float)),
+                                    lhs_fp8.data() + rr * k,
+                                    (int) k,
+                                    GGML_SIM_FP8E4M3_BLOCK,
+                                    NULL,
+                                    /*src_id=*/1,
+                                    src1->name);
+                            }
+                            lhs_info->pack_func_ex(take, k, 0, mr, kr, sr, 0, lhs_fp8.data(), k * sizeof(float), dst_ptr);
+                        } else {
+                            lhs_info->pack_func_ex(take, k, 0, mr, kr, sr, 0, src_ptr, lhs_stride, dst_ptr);
+                        }
 
                         cur       += take;
                         remaining -= take;
@@ -268,6 +289,28 @@ class tensor_traits : public ggml::cpu::tensor_traits {
                                         reinterpret_cast<float *>(rhs_kxn),
                                         reinterpret_cast<const uint16_t *>(rhs_batch_base),
                                         rhs_stride);
+
+                if (use_fp8sim_src0) {
+                    float * rhs_f32 = reinterpret_cast<float *>(rhs_kxn);
+                    std::vector<float> col_in((size_t) k);
+                    std::vector<float> col_out((size_t) k);
+                    for (int64_t col = 0; col < n; ++col) {
+                        for (int64_t kk = 0; kk < k; ++kk) {
+                            col_in[kk] = rhs_f32[col + kk * n];
+                        }
+                        ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                            col_in.data(),
+                            col_out.data(),
+                            (int) k,
+                            GGML_SIM_FP8E4M3_BLOCK,
+                            NULL,
+                            /*src_id=*/0,
+                            src0->name);
+                        for (int64_t kk = 0; kk < k; ++kk) {
+                            rhs_f32[col + kk * n] = col_out[kk];
+                        }
+                    }
+                }
 
                 kernels->rhs_info.pack_func_ex(1, n, k, nr, kr, sr, 0, n * sizeof(float),
                              rhs_kxn, bias, nullptr, rhs_packed, 0, nullptr);
@@ -300,6 +343,71 @@ class tensor_traits : public ggml::cpu::tensor_traits {
                     float * dst_ptr      = reinterpret_cast<float *>(dst_batch_base + dst_offset);
 
                     kernel->run_kernel_ex(m, n_to_process, k, 0, lhs_ptr, rhs_ptr, dst_ptr, dst_stride, sizeof(float), -FLT_MAX, FLT_MAX);
+
+                    if (use_fp8sim_out && n_to_process > 0) {
+                        std::vector<float> fp8sim_out((size_t) n_to_process);
+                        std::vector<float> fp8sim_pre((size_t) n_to_process);
+                        for (int64_t rr = 0; rr < m; ++rr) {
+                            float * row_ptr = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dst_ptr) + (size_t) rr * dst_stride);
+                            memcpy(fp8sim_pre.data(), row_ptr, (size_t) n_to_process * sizeof(float));
+                            ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                                row_ptr,
+                                fp8sim_out.data(),
+                                (int) n_to_process,
+                                GGML_SIM_FP8E4M3_BLOCK,
+                                NULL,
+                                /*src_id=*/2,
+                                dst->name);
+                            memcpy(row_ptr, fp8sim_out.data(), (size_t) n_to_process * sizeof(float));
+
+                            if (is_gemv) {
+                                ggml_mm_dist_record_chunk_values_pair(
+                                    "gemv_klei_f16_pre",
+                                    "gemv_klei_f16_post",
+                                    dst->name,
+                                    src0->name,
+                                    src1->name,
+                                    fp8sim_pre.data(),
+                                    row_ptr,
+                                    n_to_process);
+                            } else {
+                                ggml_mm_dist_record_chunk_values_pair(
+                                    "gemm_klei_f16_pre",
+                                    "gemm_klei_f16_post",
+                                    dst->name,
+                                    src0->name,
+                                    src1->name,
+                                    fp8sim_pre.data(),
+                                    row_ptr,
+                                    n_to_process);
+                            }
+                        }
+                    } else if (n_to_process > 0) {
+                        if (is_gemv) {
+                            ggml_mm_dist_record_chunk_values_pair(
+                                "gemv_klei_f16_pre",
+                                "gemv_klei_f16_post",
+                                dst->name,
+                                src0->name,
+                                src1->name,
+                                dst_ptr,
+                                dst_ptr,
+                                n_to_process);
+                        } else {
+                            for (int64_t rr = 0; rr < m; ++rr) {
+                                float * row_ptr = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dst_ptr) + (size_t) rr * dst_stride);
+                                ggml_mm_dist_record_chunk_values_pair(
+                                    "gemm_klei_f16_pre",
+                                    "gemm_klei_f16_post",
+                                    dst->name,
+                                    src0->name,
+                                    src1->name,
+                                    row_ptr,
+                                    row_ptr,
+                                    n_to_process);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -325,6 +433,8 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         }
 
         bool is_gemv = src1->ne[1] == 1;
+        const bool use_fp8sim_src1 = is_gemv && (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+        const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
         kernel_info * kernel = is_gemv ? &kernels->gemv : &kernels->gemm;
         lhs_packing_info * lhs_info = is_gemv ? &kernels->gemv_lhs_info : &kernels->gemm_lhs_info;
 
@@ -378,7 +488,24 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             void * lhs_packed_ptr          = static_cast<void *>(lhs_packed + lhs_packed_offset);
 
             // Pack this thread's chunk with m_idx_start = 0 and per-thread output pointer
-            lhs_info->pack_func_ex(m_to_process, k, QK4_0, mr, kr, sr, 0, src_ptr, src_stride, lhs_packed_ptr);
+            if (use_fp8sim_src1) {
+                std::vector<float> lhs_fp8((size_t) m_to_process * k);
+                for (size_t rr = 0; rr < m_to_process; ++rr) {
+                    const float * row_in = reinterpret_cast<const float *>(
+                        reinterpret_cast<const uint8_t *>(src_ptr) + rr * src_stride);
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                        row_in,
+                        lhs_fp8.data() + rr * k,
+                        (int) k,
+                        GGML_SIM_FP8E4M3_BLOCK,
+                        NULL,
+                        /*src_id=*/1,
+                        src1->name);
+                }
+                lhs_info->pack_func_ex(m_to_process, k, QK4_0, mr, kr, sr, 0, lhs_fp8.data(), k * sizeof(float), lhs_packed_ptr);
+            } else {
+                lhs_info->pack_func_ex(m_to_process, k, QK4_0, mr, kr, sr, 0, src_ptr, src_stride, lhs_packed_ptr);
+            }
         }
 
         ggml_barrier(params->threadpool);
@@ -395,6 +522,72 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         if (n_to_process > 0) {
             kernel->run_kernel_ex(m, n_to_process, k, QK4_0, lhs_ptr, rhs_ptr, dst_ptr, dst_stride,
                                sizeof(float), -FLT_MAX, FLT_MAX);
+
+            std::vector<float> fp8sim_pre;
+            if (use_fp8sim_out) {
+                std::vector<float> fp8sim_out((size_t) n_to_process);
+                fp8sim_pre.resize((size_t) n_to_process);
+                for (size_t rr = 0; rr < m; ++rr) {
+                    float * row_ptr = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dst_ptr) + rr * dst_stride);
+                    memcpy(fp8sim_pre.data(), row_ptr, (size_t) n_to_process * sizeof(float));
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                        row_ptr,
+                        fp8sim_out.data(),
+                        (int) n_to_process,
+                        GGML_SIM_FP8E4M3_BLOCK,
+                        NULL,
+                        /*src_id=*/2,
+                        dst->name);
+                    memcpy(row_ptr, fp8sim_out.data(), (size_t) n_to_process * sizeof(float));
+
+                    if (is_gemv) {
+                        ggml_mm_dist_record_chunk_values_pair(
+                            "gemv_klei_q40_pre",
+                            "gemv_klei_q40_post",
+                            dst->name,
+                            src0->name,
+                            src1->name,
+                            fp8sim_pre.data(),
+                            row_ptr,
+                            n_to_process);
+                    } else {
+                        ggml_mm_dist_record_chunk_values_pair(
+                            "gemm_klei_q40_pre",
+                            "gemm_klei_q40_post",
+                            dst->name,
+                            src0->name,
+                            src1->name,
+                            fp8sim_pre.data(),
+                            row_ptr,
+                            n_to_process);
+                    }
+                }
+            } else {
+                if (is_gemv) {
+                    ggml_mm_dist_record_chunk_values_pair(
+                        "gemv_klei_q40_pre",
+                        "gemv_klei_q40_post",
+                        dst->name,
+                        src0->name,
+                        src1->name,
+                        dst_ptr,
+                        dst_ptr,
+                        n_to_process);
+                } else {
+                    for (size_t rr = 0; rr < m; ++rr) {
+                        float * row_ptr = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dst_ptr) + rr * dst_stride);
+                        ggml_mm_dist_record_chunk_values_pair(
+                            "gemm_klei_q40_pre",
+                            "gemm_klei_q40_post",
+                            dst->name,
+                            src0->name,
+                            src1->name,
+                            row_ptr,
+                            row_ptr,
+                            n_to_process);
+                    }
+                }
+            }
         }
 
         return true;

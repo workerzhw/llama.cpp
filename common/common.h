@@ -328,6 +328,8 @@ struct common_params {
     std::string system_prompt        = "";                                                                  // NOLINT
     std::string prompt_file          = ""; // store the external prompt file name                           // NOLINT
     std::string path_prompt_cache    = ""; // path to file for saving/loading prompt eval state             // NOLINT
+    std::string path_seq_state_in    = ""; // path to file for loading a single sequence state              // NOLINT
+    std::string path_seq_state_out   = ""; // path to file for saving a single sequence state               // NOLINT
     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
     std::string lookup_cache_static  = ""; // path of static ngram cache file for lookup decoding           // NOLINT
@@ -345,6 +347,8 @@ struct common_params {
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
 
     int32_t verbosity                  = 0;
+    int32_t seq_state_in_id            = 0; // destination sequence id for --seq-state-in
+    int32_t seq_state_out_id           = 0; // source sequence id for --seq-state-out
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;

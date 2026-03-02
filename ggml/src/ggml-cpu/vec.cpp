@@ -194,8 +194,8 @@ struct FP8SimSrcStats {
     int64_t call_count;         // number of quant function calls
 };
 
-static FP8SimSrcStats g_fp8_stats[2]; // [0]=src0/weights, [1]=src1/activations
-static std::unordered_map<std::string, FP8SimSrcStats> g_fp8_layer_stats[2]; // per-layer stats for src0, src1
+static FP8SimSrcStats g_fp8_stats[3]; // [0]=src0/weights, [1]=src1/activations, [2]=output QDQ
+static std::unordered_map<std::string, FP8SimSrcStats> g_fp8_layer_stats[3]; // per-layer stats for src0, src1, output
 static std::mutex     g_fp8_stats_mtx;
 static bool           g_fp8_atexit_registered = false;
 static std::atomic<int64_t> g_fp8_call_counter{0}; // global call counter for sampling
@@ -211,6 +211,13 @@ static int fp8_get_sample_rate(void) {
         g_fp8_sample_rate = 100; // default: collect 1 in 100
     }
     return g_fp8_sample_rate;
+}
+
+static inline int fp8_src_slot(int src_id) {
+    if (src_id >= 0 && src_id <= 2) {
+        return src_id;
+    }
+    return src_id & 1;
 }
 
 static void fp8_stats_atexit_handler(void) {
@@ -277,7 +284,8 @@ static void fp8_merge_stats(
         const char  * layer_name)
 {
     std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
-    FP8SimSrcStats & g = g_fp8_stats[src_id & 1];
+    const int sid = fp8_src_slot(src_id);
+    FP8SimSrcStats & g = g_fp8_stats[sid];
     g.total_elements    += local.total_elements;
     g.total_blocks      += local.total_blocks;
     g.sum_sq_input      += local.sum_sq_input;
@@ -298,7 +306,7 @@ static void fp8_merge_stats(
 
     if (layer_name && layer_name[0] != '\0') {
         std::string lkey(layer_name);
-        FP8SimSrcStats & ls = g_fp8_layer_stats[src_id & 1][lkey];
+        FP8SimSrcStats & ls = g_fp8_layer_stats[sid][lkey];
         ls.total_elements    += local.total_elements;
         ls.total_blocks      += local.total_blocks;
         ls.sum_sq_input      += local.sum_sq_input;
@@ -434,6 +442,7 @@ extern "C" void ggml_fp8_sim_stats_reset(void) {
     memset(g_fp8_stats, 0, sizeof(g_fp8_stats));
     g_fp8_layer_stats[0].clear();
     g_fp8_layer_stats[1].clear();
+    g_fp8_layer_stats[2].clear();
 }
 
 // Helper: write one src stats section
@@ -515,7 +524,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
     std::lock_guard<std::mutex> lock(g_fp8_stats_mtx);
 
     // Skip if no data
-    if (g_fp8_stats[0].total_elements == 0 && g_fp8_stats[1].total_elements == 0) {
+    if (g_fp8_stats[0].total_elements == 0 && g_fp8_stats[1].total_elements == 0 && g_fp8_stats[2].total_elements == 0) {
         return;
     }
 
@@ -549,19 +558,21 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "    Rounding             : RNE (round to nearest even)\n");
         fprintf(f, "    Applied to src0 (weights)     : %s\n", GGML_SIM_FP8E4M3_APPLY_SRC0 ? "YES" : "NO");
         fprintf(f, "    Applied to src1 (activations) : %s\n", GGML_SIM_FP8E4M3_APPLY_SRC1 ? "YES" : "NO");
+        fprintf(f, "    Applied to output QDQ         : %s\n", GGML_SIM_FP8E4M3 ? "YES" : "NO");
 
         // Per-src sections
         fp8_write_src_section(f, "Weights (src0)", g_fp8_stats[0]);
         fp8_write_src_section(f, "Activations (src1)", g_fp8_stats[1]);
+        fp8_write_src_section(f, "Matmul output QDQ (src2)", g_fp8_stats[2]);
 
         // =================================================================
         // Per-Layer Breakdown (sorted by SQNR ascending = worst first)
         // =================================================================
-        for (int sid = 0; sid < 2; ++sid) {
+        for (int sid = 0; sid < 3; ++sid) {
             const auto & lmap = g_fp8_layer_stats[sid];
             if (lmap.empty()) continue;
 
-            const char * src_label = (sid == 0) ? "Weights (src0)" : "Activations (src1)";
+            const char * src_label = sid == 0 ? "Weights (src0)" : (sid == 1 ? "Activations (src1)" : "Matmul output QDQ (src2)");
             fprintf(f, "\n  Per-Layer Breakdown: %s  (%d unique tensors)\n", src_label, (int)lmap.size());
             fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
 
@@ -640,8 +651,8 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         // =================================================================
 
         // --- Compute core metrics ---
-        double sqnr_src0 = 999.0, sqnr_src1 = 999.0;
-        double eps_w = 0.0, eps_a = 0.0; // noise-to-signal power ratios (linear)
+        double sqnr_src0 = 999.0, sqnr_src1 = 999.0, sqnr_src2 = 999.0;
+        double eps_w = 0.0, eps_a = 0.0, eps_o = 0.0; // noise-to-signal power ratios (linear)
         if (g_fp8_stats[0].total_elements > 0 && g_fp8_stats[0].sum_sq_error > 0) {
             double sp0 = g_fp8_stats[0].sum_sq_input / (double)g_fp8_stats[0].total_elements;
             double np0 = g_fp8_stats[0].sum_sq_error / (double)g_fp8_stats[0].total_elements;
@@ -653,6 +664,12 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
             double np1 = g_fp8_stats[1].sum_sq_error / (double)g_fp8_stats[1].total_elements;
             sqnr_src1 = 10.0 * log10(sp1 / np1);
             eps_a = np1 / sp1;
+        }
+        if (g_fp8_stats[2].total_elements > 0 && g_fp8_stats[2].sum_sq_error > 0) {
+            double sp2 = g_fp8_stats[2].sum_sq_input / (double)g_fp8_stats[2].total_elements;
+            double np2 = g_fp8_stats[2].sum_sq_error / (double)g_fp8_stats[2].total_elements;
+            sqnr_src2 = 10.0 * log10(sp2 / np2);
+            eps_o = np2 / sp2;
         }
 
         // Detect matmul inner dimension K from src0 row length
@@ -691,15 +708,16 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         }
         if (matmuls_per_layer == 0) matmuls_per_layer = 7; // fallback
 
-        // Combined matmul SQNR (harmonic mean when both sides quantized)
-        double eps_mm = eps_w + eps_a; // combined noise ratio per matmul output element
+        // Combined matmul/output SQNR: input-side quantization + output-side QDQ
+        double eps_mm_in = eps_w + eps_a;           // input-side quantization noise contribution
+        double eps_mm = eps_mm_in + eps_o;          // total observed output-side noise ratio
         double sqnr_mm = (eps_mm > 0.0) ? -10.0 * log10(eps_mm) : 999.0;
 
         // Error budget
-        int64_t tot_of = g_fp8_stats[0].overflow_count + g_fp8_stats[1].overflow_count;
-        int64_t tot_uf = g_fp8_stats[0].underflow_count + g_fp8_stats[1].underflow_count;
-        int64_t tot_sub = g_fp8_stats[0].subnormal_count + g_fp8_stats[1].subnormal_count;
-        int64_t tot_el = g_fp8_stats[0].total_elements + g_fp8_stats[1].total_elements;
+        int64_t tot_of = g_fp8_stats[0].overflow_count + g_fp8_stats[1].overflow_count + g_fp8_stats[2].overflow_count;
+        int64_t tot_uf = g_fp8_stats[0].underflow_count + g_fp8_stats[1].underflow_count + g_fp8_stats[2].underflow_count;
+        int64_t tot_sub = g_fp8_stats[0].subnormal_count + g_fp8_stats[1].subnormal_count + g_fp8_stats[2].subnormal_count;
+        int64_t tot_el = g_fp8_stats[0].total_elements + g_fp8_stats[1].total_elements + g_fp8_stats[2].total_elements;
 
         // ---------------------------------------------------------------
         // Step 1: Measured Quantization Error Summary
@@ -710,10 +728,12 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
                 sqnr_src0, eps_w * 100.0);
         fprintf(f, "    Activation per-element SQNR  : %.2f dB  (noise/signal = %.4f%%)\n",
                 sqnr_src1, eps_a * 100.0);
+        fprintf(f, "    Output QDQ per-element SQNR  : %.2f dB  (noise/signal = %.4f%%)\n",
+            sqnr_src2, eps_o * 100.0);
         fprintf(f, "\n");
-        fprintf(f, "    When BOTH sides of a matmul are quantized, noise adds up.\n");
-        fprintf(f, "    Combined matmul noise ratio  : eps_w + eps_a = %.4f%%\n", eps_mm * 100.0);
-        fprintf(f, "    Combined matmul SQNR (harmonic): %.2f dB\n", sqnr_mm);
+        fprintf(f, "    Input-side matmul noise ratio: eps_w + eps_a = %.4f%%\n", eps_mm_in * 100.0);
+        fprintf(f, "    Total output noise ratio     : eps_w + eps_a + eps_out = %.4f%%\n", eps_mm * 100.0);
+        fprintf(f, "    Combined output SQNR         : %.2f dB\n", sqnr_mm);
         fprintf(f, "\n");
         fprintf(f, "    Detected matmul inner dimension K = %" PRId64 " (from src0 avg row length)\n", K);
         fprintf(f, "    Detected model depth L = %d layers, %d weight matmuls/layer\n", n_layers, matmuls_per_layer);
@@ -730,6 +750,8 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
                 eps_w * 100.0, sqrt(eps_w) * 100.0);
         fprintf(f, "      eps_a = %.4f%% means each activation has ~%.2f%% RMS relative error.\n",
                 eps_a * 100.0, sqrt(eps_a) * 100.0);
+        fprintf(f, "      eps_o = %.4f%% means output QDQ adds ~%.2f%% RMS relative error.\n",
+            eps_o * 100.0, sqrt(eps_o) * 100.0);
         fprintf(f, "\n");
 
         // ---------------------------------------------------------------
@@ -742,14 +764,14 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "    Each output element Y[i,j] = sum_{k=1}^{K} X[i,k] * W[j,k]\n");
         fprintf(f, "    Error:  dY[i,j] = sum_k (eX[i,k]*W[j,k] + X[i,k]*eW[j,k])\n");
         fprintf(f, "\n");
-        fprintf(f, "    SQNR of matmul output:\n");
-        fprintf(f, "      SQNR_Y = 1 / (1/SQNR_W + 1/SQNR_X)\n");
-        fprintf(f, "             = 1 / (eps_w + eps_a)\n");
-        fprintf(f, "             = 1 / (%.6f + %.6f)\n", eps_w, eps_a);
+        fprintf(f, "    SQNR of final stored output (after output QDQ):\n");
+        fprintf(f, "      SQNR_Y ~= 1 / (eps_w + eps_a + eps_out)\n");
+        fprintf(f, "             = 1 / (%.6f + %.6f + %.6f)\n", eps_w, eps_a, eps_o);
         fprintf(f, "             = %.2f  (%.2f dB)\n", 1.0/eps_mm, sqnr_mm);
         fprintf(f, "\n");
-        fprintf(f, "    KEY INSIGHT: The matmul output SQNR equals the harmonic mean\n");
-        fprintf(f, "    of the input SQNRs. The inner dimension K does NOT improve SQNR\n");
+        fprintf(f, "    KEY INSIGHT: input-side quantization sets the base SQNR floor,\n");
+        fprintf(f, "    and output QDQ contributes an additional additive noise term eps_out.\n");
+        fprintf(f, "    The inner dimension K does NOT improve SQNR\n");
         fprintf(f, "    (both signal and noise scale with K, so the ratio is preserved).\n");
         fprintf(f, "    However, K matters for ABSOLUTE error magnitude.\n");
         fprintf(f, "\n");
@@ -790,7 +812,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
 
         fprintf(f, "    Quantitative estimate (L=%d, gamma=%.1f):\n", n_layers, gamma);
         fprintf(f, "      Direct residual injections          : %d (2 per layer)\n", N_inject);
-        fprintf(f, "      Per-matmul noise ratio              : %.6f (= eps_w + eps_a)\n", eps_mm);
+        fprintf(f, "      Per-matmul total noise ratio        : %.6f (= eps_w + eps_a + eps_out)\n", eps_mm);
         fprintf(f, "\n");
         fprintf(f, "      Naive (no dampening):  %.4f%%  = %d x %.6f\n",
                 noise_naive * 100.0, N_inject, eps_mm);
@@ -853,42 +875,52 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "  Step 5: Dominant Error Source & Error Budget\n");
         fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
 
-        double total_noise = g_fp8_stats[0].sum_sq_error + g_fp8_stats[1].sum_sq_error;
+        double total_noise = g_fp8_stats[0].sum_sq_error + g_fp8_stats[1].sum_sq_error + g_fp8_stats[2].sum_sq_error;
         double src0_frac = (total_noise > 0) ? 100.0 * g_fp8_stats[0].sum_sq_error / total_noise : 0.0;
         double src1_frac = (total_noise > 0) ? 100.0 * g_fp8_stats[1].sum_sq_error / total_noise : 0.0;
+        double src2_frac = (total_noise > 0) ? 100.0 * g_fp8_stats[2].sum_sq_error / total_noise : 0.0;
 
         fprintf(f, "    Absolute noise power breakdown:\n");
         fprintf(f, "      Weight quant noise (sum err^2)    : %.6e  (%.1f%% of total)\n",
                 g_fp8_stats[0].sum_sq_error, src0_frac);
         fprintf(f, "      Activation quant noise (sum err^2): %.6e  (%.1f%% of total)\n",
                 g_fp8_stats[1].sum_sq_error, src1_frac);
+        fprintf(f, "      Output QDQ noise (sum err^2)      : %.6e  (%.1f%% of total)\n",
+            g_fp8_stats[2].sum_sq_error, src2_frac);
         fprintf(f, "\n");
         fprintf(f, "    Relative noise (SQNR, lower = worse):\n");
         fprintf(f, "      Weight SQNR     : %.2f dB  (eps_w = %.6f)\n", sqnr_src0, eps_w);
         fprintf(f, "      Activation SQNR : %.2f dB  (eps_a = %.6f)\n", sqnr_src1, eps_a);
+        fprintf(f, "      Output QDQ SQNR : %.2f dB  (eps_o = %.6f)\n", sqnr_src2, eps_o);
         fprintf(f, "      Contribution to combined eps_mm:\n");
         fprintf(f, "        eps_w / eps_mm = %.1f%%  (weight contribution to matmul noise)\n",
                 eps_mm > 0 ? eps_w / eps_mm * 100.0 : 0.0);
         fprintf(f, "        eps_a / eps_mm = %.1f%%  (activation contribution to matmul noise)\n",
                 eps_mm > 0 ? eps_a / eps_mm * 100.0 : 0.0);
+        fprintf(f, "        eps_o / eps_mm = %.1f%%  (output QDQ contribution to final noise)\n",
+            eps_mm > 0 ? eps_o / eps_mm * 100.0 : 0.0);
         fprintf(f, "\n");
 
-        if (eps_w > eps_a) {
-            fprintf(f, "    --> Weights are the SQNR bottleneck (%.2f dB < %.2f dB).\n", sqnr_src0, sqnr_src1);
+        if (eps_w >= eps_a && eps_w >= eps_o) {
+            fprintf(f, "    --> Weights are the SQNR bottleneck (%.2f dB is the lowest source-equivalent SQNR).\n", sqnr_src0);
             fprintf(f, "        To reduce PPL: improve weight quantization (better scaling,\n");
             fprintf(f, "        larger block, or higher precision for sensitive layers).\n");
-        } else {
-            fprintf(f, "    --> Activations are the SQNR bottleneck (%.2f dB < %.2f dB).\n", sqnr_src1, sqnr_src0);
+        } else if (eps_a >= eps_w && eps_a >= eps_o) {
+            fprintf(f, "    --> Activations are the SQNR bottleneck (%.2f dB is the lowest source-equivalent SQNR).\n", sqnr_src1);
             fprintf(f, "        To reduce PPL: improve activation quantization or disable\n");
             fprintf(f, "        FP8 for activations (-DGGML_SIM_FP8E4M3_APPLY_SRC1=0).\n");
+        } else {
+            fprintf(f, "    --> Output QDQ is the bottleneck (%.2f dB).\n", sqnr_src2);
+            fprintf(f, "        To reduce PPL: keep output in higher precision for sensitive\n");
+            fprintf(f, "        ops or tune output scaling/placement of QDQ.\n");
         }
         fprintf(f, "\n");
 
         // Flag specific per-layer concerns
         fprintf(f, "    Per-layer bottleneck analysis:\n");
-        for (int sid = 0; sid < 2; ++sid) {
+        for (int sid = 0; sid < 3; ++sid) {
             const auto & lmap = g_fp8_layer_stats[sid];
-            const char * slbl = (sid == 0) ? "src0" : "src1";
+            const char * slbl = sid == 0 ? "src0" : (sid == 1 ? "src1" : "src2");
             int severe_count = 0;
             for (const auto & kv : lmap) {
                 const FP8SimSrcStats & ls = kv.second;
@@ -913,8 +945,8 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "    FP8(E4M3) block=%d    Per-element SQNR    Matmul output SQNR\n", GGML_SIM_FP8E4M3_BLOCK);
         fprintf(f, "    ─────────────────  ─> ─────────────────  ─> ────────────────────\n");
         fprintf(f, "    Weight  : %.2f dB ──┐\n", sqnr_src0);
-        fprintf(f, "                        ├──> Combined: %.2f dB (harmonic mean)\n", sqnr_mm);
-        fprintf(f, "    Activation: %.2f dB ──┘\n", sqnr_src1);
+        fprintf(f, "    Activation: %.2f dB ─┼──> Input-side: %.2f dB\n", sqnr_src1, (eps_mm_in > 0) ? -10.0 * log10(eps_mm_in) : 999.0);
+        fprintf(f, "    OutputQDQ: %.2f dB ──┘    Final output: %.2f dB\n", sqnr_src2, sqnr_mm);
         fprintf(f, "\n");
         fprintf(f, "    Matmul SQNR    %d layers         Residual SQNR\n", n_layers);
         fprintf(f, "    ───────────  ─> ─────────────  ─> ──────────────\n");

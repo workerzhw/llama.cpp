@@ -15,8 +15,10 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
 
 #include "repack.h"
+#include "vec.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -1609,6 +1611,29 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const void * src1_wdata      = params->wdata;
         const size_t src1_col_stride = ggml_row_size(PARAM_TYPE, ne10);
+        const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
+        const int64_t n_out = src0_end - src0_start;
+        std::vector<float> fp8sim_out;
+        std::vector<float> fp8sim_pre;
+        if (use_fp8sim_out) {
+            fp8sim_out.resize((size_t) n_out);
+            fp8sim_pre.resize((size_t) n_out);
+        }
+
+        auto qdq_row_if_needed = [&](float * row_ptr) {
+            if (!use_fp8sim_out || n_out <= 0) {
+                return;
+            }
+            ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                row_ptr,
+                fp8sim_out.data(),
+                (int) n_out,
+                GGML_SIM_FP8E4M3_BLOCK,
+                NULL,
+                /*src_id=*/2,
+                dst->name);
+            memcpy(row_ptr, fp8sim_out.data(), (size_t) n_out * sizeof(float));
+        };
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (ne11 > 3) {
@@ -1616,13 +1641,50 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     (float *) ((char *) dst->data) + src0_start, ne01,
                     (const char *) src0->data + src0_start * nb01,
                     (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
+
+            for (int iter = 0; iter < ne11 - ne11 % 4; ++iter) {
+                float * dst_row = (float *) ((char *) dst->data + (iter * nb1)) + src0_start;
+                const float * pre_vals = dst_row;
+                const float * post_vals = dst_row;
+                if (use_fp8sim_out && n_out > 0) {
+                    memcpy(fp8sim_pre.data(), dst_row, (size_t) n_out * sizeof(float));
+                    pre_vals = fp8sim_pre.data();
+                }
+                qdq_row_if_needed(dst_row);
+                ggml_mm_dist_record_chunk_values_pair(
+                    "gemm_repack_pre",
+                    "gemm_repack_post",
+                    dst->name,
+                    src0->name,
+                    src1->name,
+                    pre_vals,
+                    post_vals,
+                    n_out);
+            }
         }
         for (int iter = ne11 - ne11 % 4; iter < ne11; iter++) {
+            float * dst_row = (float *) ((char *) dst->data + (iter * nb1)) + src0_start;
             gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
-                    (float *) ((char *) dst->data + (iter * nb1)) + src0_start, ne01,
+                dst_row, ne01,
                     (const char *) src0->data + src0_start * nb01,
                     (const char *) src1_wdata + (src1_col_stride * iter), 1,
                     src0_end - src0_start);
+            const float * pre_vals = dst_row;
+            const float * post_vals = dst_row;
+            if (use_fp8sim_out && n_out > 0) {
+                memcpy(fp8sim_pre.data(), dst_row, (size_t) n_out * sizeof(float));
+                pre_vals = fp8sim_pre.data();
+            }
+            qdq_row_if_needed(dst_row);
+            ggml_mm_dist_record_chunk_values_pair(
+                "gemv_repack_pre",
+                "gemv_repack_post",
+                dst->name,
+                src0->name,
+                src1->name,
+                pre_vals,
+                post_vals,
+                src0_end - src0_start);
         }
     }
 
@@ -1658,15 +1720,48 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         assert(params->wsize >= nbw1 * ne11);
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+        const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+        std::vector<float> fp8sim_tmp_src1;
+        if (use_fp8sim_src1) {
+            fp8sim_tmp_src1.resize((size_t) ne10);
+        }
 
         int64_t i11_processed = 0;
         for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-            ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) ((char *) src1->data + i11 * nb11), (void *) (wdata + i11 * nbw1), 4, ne10);
+            if (use_fp8sim_src1) {
+                for (int64_t r = 0; r < 4; ++r) {
+                    const float * src_row = (float *) ((char *) src1->data + (i11 + r) * nb11);
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                        src_row,
+                        fp8sim_tmp_src1.data(),
+                        (int) ne10,
+                        GGML_SIM_FP8E4M3_BLOCK,
+                        NULL,
+                        /*src_id=*/1,
+                        src1->name);
+                    from_float(fp8sim_tmp_src1.data(), (void *) (wdata + (i11 + r) * nbw1), ne10);
+                }
+            } else {
+                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) ((char *) src1->data + i11 * nb11), (void *) (wdata + i11 * nbw1), 4, ne10);
+            }
         }
 
         i11_processed = ne11 - ne11 % 4;
         for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-            from_float((float *) ((char *) src1->data + i11 * nb11), (void *) (wdata + i11 * nbw1), ne10);
+            const float * src_row = (float *) ((char *) src1->data + i11 * nb11);
+            if (use_fp8sim_src1) {
+                ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                    src_row,
+                    fp8sim_tmp_src1.data(),
+                    (int) ne10,
+                    GGML_SIM_FP8E4M3_BLOCK,
+                    NULL,
+                    /*src_id=*/1,
+                    src1->name);
+                from_float(fp8sim_tmp_src1.data(), (void *) (wdata + i11 * nbw1), ne10);
+            } else {
+                from_float((float *) src_row, (void *) (wdata + i11 * nbw1), ne10);
+            }
         }
 
         // disable for NUMA
@@ -1740,6 +1835,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int nth = params->nth;
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+        const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+        const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
+        std::vector<float> fp8sim_tmp_src1;
+        if (use_fp8sim_src1) {
+            fp8sim_tmp_src1.resize((size_t) ne10);
+        }
 
         // we don't support permuted src0 or src1
         GGML_ASSERT(nb00 == ggml_type_size(src0->type));
@@ -1785,9 +1886,21 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
             for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
-                           (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
-                           ne10);
+                const float * src_row = (float *)((char *) src1->data + i12 * nb12 + i11 * nb11);
+                void * dst_row = (void *) (wdata + i12 * nbw2 + i11 * nbw1);
+                if (use_fp8sim_src1) {
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                        src_row,
+                        fp8sim_tmp_src1.data(),
+                        (int) ne10,
+                        GGML_SIM_FP8E4M3_BLOCK,
+                        NULL,
+                        /*src_id=*/1,
+                        src1->name);
+                    from_float(fp8sim_tmp_src1.data(), dst_row, ne10);
+                } else {
+                    from_float((float *) src_row, dst_row, ne10);
+                }
             }
         }
 
@@ -1840,6 +1953,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 return;
             }
 
+            const int64_t n_out = src0_cur_end - src0_cur_start;
+            std::vector<float> fp8sim_out_id;
+            std::vector<float> fp8sim_pre_id;
+            if (use_fp8sim_out && n_out > 0) {
+                fp8sim_out_id.resize((size_t) n_out);
+                fp8sim_pre_id.resize((size_t) n_out);
+            }
+
             for (int ir1 = 0; ir1 < nr1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
@@ -1857,6 +1978,33 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         (float *)((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                         src0_cur + src0_cur_start * nb01,
                         src1_col, 1, src0_cur_end - src0_cur_start);
+
+                float * dst_row = (float *)((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start;
+                const float * pre_vals = dst_row;
+                const float * post_vals = dst_row;
+                if (use_fp8sim_out && n_out > 0) {
+                    memcpy(fp8sim_pre_id.data(), dst_row, (size_t) n_out * sizeof(float));
+                    pre_vals = fp8sim_pre_id.data();
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                        dst_row,
+                        fp8sim_out_id.data(),
+                        (int) n_out,
+                        GGML_SIM_FP8E4M3_BLOCK,
+                        NULL,
+                        /*src_id=*/2,
+                        dst->name);
+                    memcpy(dst_row, fp8sim_out_id.data(), (size_t) n_out * sizeof(float));
+                }
+
+                ggml_mm_dist_record_chunk_values_pair(
+                    "gemv_id_repack_pre",
+                    "gemv_id_repack_post",
+                    dst->name,
+                    src0->name,
+                    src1->name,
+                    pre_vals,
+                    post_vals,
+                    n_out);
             }
         }
 #undef MMID_MATRIX_ROW

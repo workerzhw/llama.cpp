@@ -235,6 +235,7 @@ int main(int argc, char ** argv) {
 
     std::string path_session = params.path_prompt_cache;
     std::vector<llama_token> session_tokens;
+    const bool track_seq_state_tokens = !params.path_seq_state_out.empty();
 
     if (!path_session.empty()) {
         LOG_INF("%s: attempting to load saved session from '%s'\n", __func__, path_session.c_str());
@@ -253,6 +254,40 @@ int main(int argc, char ** argv) {
             session_tokens.resize(n_token_count_out);
             LOG_INF("%s: loaded a session with prompt size of %d tokens\n", __func__, (int)session_tokens.size());
         }
+    }
+
+    if (!params.path_seq_state_in.empty()) {
+        LOG_INF("%s: attempting to load single-sequence state from '%s' into seq %d\n",
+                __func__, params.path_seq_state_in.c_str(), params.seq_state_in_id);
+
+        if (!file_exists(params.path_seq_state_in)) {
+            LOG_ERR("%s: seq-state file does not exist: '%s'\n", __func__, params.path_seq_state_in.c_str());
+            return 1;
+        }
+
+        if (file_is_empty(params.path_seq_state_in)) {
+            LOG_ERR("%s: seq-state file is empty: '%s'\n", __func__, params.path_seq_state_in.c_str());
+            return 1;
+        }
+
+        session_tokens.resize(n_ctx);
+        size_t n_token_count_out = 0;
+        const size_t nread = llama_state_seq_load_file(
+            ctx,
+            params.path_seq_state_in.c_str(),
+            params.seq_state_in_id,
+            session_tokens.data(),
+            session_tokens.size(),
+            &n_token_count_out);
+
+        if (nread == 0) {
+            LOG_ERR("%s: failed to load seq-state file '%s'\n", __func__, params.path_seq_state_in.c_str());
+            return 1;
+        }
+
+        session_tokens.resize(n_token_count_out);
+        LOG_INF("%s: loaded single-sequence state, prompt size = %d tokens, bytes = %zu\n",
+                __func__, (int) session_tokens.size(), nread);
     }
 
     const bool add_bos = llama_vocab_get_add_bos(vocab) && !params.use_jinja;
@@ -682,7 +717,7 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            if (!embd.empty() && !path_session.empty()) {
+            if (!embd.empty() && (!path_session.empty() || track_seq_state_tokens)) {
                 session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
                 n_session_consumed = session_tokens.size();
             }
@@ -976,6 +1011,27 @@ int main(int argc, char ** argv) {
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
+    }
+
+    if (!params.path_seq_state_out.empty()) {
+        LOG("\n%s: saving single-sequence state to '%s' from seq %d\n",
+                __func__, params.path_seq_state_out.c_str(), params.seq_state_out_id);
+
+        const llama_token * tokens_ptr = session_tokens.empty() ? nullptr : session_tokens.data();
+        const size_t nwrite = llama_state_seq_save_file(
+            ctx,
+            params.path_seq_state_out.c_str(),
+            params.seq_state_out_id,
+            tokens_ptr,
+            session_tokens.size());
+
+        if (nwrite == 0) {
+            LOG_ERR("%s: failed to save seq-state file '%s'\n", __func__, params.path_seq_state_out.c_str());
+            return 1;
+        }
+
+        LOG_INF("%s: saved single-sequence state, tokens = %d, bytes = %zu\n",
+                __func__, (int) session_tokens.size(), nwrite);
     }
 
     LOG("\n\n");

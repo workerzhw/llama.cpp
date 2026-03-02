@@ -34,7 +34,7 @@ typedef double ggml_float;
 // ---------------------------------------------------------------------------
 // FP8(E4M3) block-quant simulation helpers
 //
-// 目标：模拟实际工程的“每16点一个 scale(int8) + FP8(E4M3)”。
+// 目标：模拟实际工程的“每 block 点一个 scale(int8) + FP8(E4M3)”。
 //  - FP8: E4M3, 不考虑 NaN/Inf
 //  - 溢出：饱和到最大有限值（max finite，工程约定为 480）
 //  - 下溢：低于最小非规格数（min subnormal）才清零；支持非规格数
@@ -49,9 +49,9 @@ typedef double ggml_float;
 #define GGML_SIM_FP8E4M3 0
 #endif
 
-// block 大小（工程中为16）
+// block 大小（默认 128，可通过 -DGGML_SIM_FP8E4M3_BLOCK=... 覆盖）
 #ifndef GGML_SIM_FP8E4M3_BLOCK
-#define GGML_SIM_FP8E4M3_BLOCK 16
+#define GGML_SIM_FP8E4M3_BLOCK 128
 #endif
 
 // 分别控制 src0/src1 是否做 FP8+scale 回放

@@ -1151,6 +1151,7 @@ struct ggml_mm_dist_local {
 
 struct ggml_mm_dist_stat {
     bool used;
+    char op_kind[16];
     char dst_name[GGML_MAX_NAME];
     char src0_name[GGML_MAX_NAME];
     char src1_name[GGML_MAX_NAME];
@@ -1300,7 +1301,7 @@ static inline void ggml_mm_dist_accumulate_values(struct ggml_mm_dist_local * ac
     }
 }
 
-static void ggml_mm_dist_merge_local(const char * dst_name, const char * src0_name, const char * src1_name, const struct ggml_mm_dist_local * local) {
+static void ggml_mm_dist_merge_local(const char * op_kind, const char * dst_name, const char * src0_name, const char * src1_name, const struct ggml_mm_dist_local * local) {
     if (local->count == 0 && local->n_non_finite == 0 && local->chunks_total == 0 && local->chunks_sampled == 0) {
         return;
     }
@@ -1313,7 +1314,8 @@ static void ggml_mm_dist_merge_local(const char * dst_name, const char * src0_na
             if (idx < 0) idx = i;
             continue;
         }
-        if (strcmp(g_mm_dist_stats[i].dst_name, dst_name ? dst_name : "") == 0 &&
+        if (strcmp(g_mm_dist_stats[i].op_kind, op_kind ? op_kind : "") == 0 &&
+            strcmp(g_mm_dist_stats[i].dst_name, dst_name ? dst_name : "") == 0 &&
             strcmp(g_mm_dist_stats[i].src0_name, src0_name ? src0_name : "") == 0 &&
             strcmp(g_mm_dist_stats[i].src1_name, src1_name ? src1_name : "") == 0) {
             idx = i;
@@ -1323,6 +1325,7 @@ static void ggml_mm_dist_merge_local(const char * dst_name, const char * src0_na
 
     if (idx >= 0 && !g_mm_dist_stats[idx].used) {
         g_mm_dist_stats[idx].used = true;
+        snprintf(g_mm_dist_stats[idx].op_kind, sizeof(g_mm_dist_stats[idx].op_kind), "%s", op_kind ? op_kind : "");
         snprintf(g_mm_dist_stats[idx].dst_name, GGML_MAX_NAME, "%s", dst_name ? dst_name : "");
         snprintf(g_mm_dist_stats[idx].src0_name, GGML_MAX_NAME, "%s", src0_name ? src0_name : "");
         snprintf(g_mm_dist_stats[idx].src1_name, GGML_MAX_NAME, "%s", src1_name ? src1_name : "");
@@ -1525,9 +1528,9 @@ static void ggml_mm_dist_report_atexit(void) {
     fprintf(f, "  Tracked tensors: %d\n\n", n_used);
 
     fprintf(f, "  Summary (sorted by sample count)\n");
-    fprintf(f, "  %-18s %-10s %-10s %8s %8s %7s %10s %10s %10s %10s %8s %8s %8s %8s %8s %8s\n",
-            "dst", "src0", "src1", "chunks", "sampled", "cover", "samples", "min", "max", "mean", "std", "zero%", ">8%", "p50", "p95", "p99");
-    fprintf(f, "  %.*s\n", 140, "--------------------------------------------------------------------------------------------------------------------------------------------");
+        fprintf(f, "  %-12s %-18s %-10s %-10s %8s %8s %7s %10s %10s %10s %10s %8s %8s %8s %8s %8s %8s\n",
+            "op", "dst", "src0", "src1", "chunks", "sampled", "cover", "samples", "min", "max", "mean", "std", "zero%", ">8%", "p50", "p95", "p99");
+        fprintf(f, "  %.*s\n", 152, "--------------------------------------------------------------------------------------------------------------------------------------------------------");
 
     for (int i = 0; i < n_used; ++i) {
         const struct ggml_mm_dist_stat * st = used[i];
@@ -1543,7 +1546,8 @@ static void ggml_mm_dist_report_atexit(void) {
 
         const double cover_pct = st->s.chunks_total > 0 ? 100.0 * (double)st->s.chunks_sampled / (double)st->s.chunks_total : 0.0;
 
-        fprintf(f, "  %-18.18s %-10.10s %-10.10s %8" PRId64 " %8" PRId64 " %6.2f%% %10" PRId64 " %10.4g %10.4g %10.4g %8.4g %7.3f%% %7.3f%% %8.3g %8.3g %8.3g\n",
+        fprintf(f, "  %-12.12s %-18.18s %-10.10s %-10.10s %8" PRId64 " %8" PRId64 " %6.2f%% %10" PRId64 " %10.4g %10.4g %10.4g %8.4g %7.3f%% %7.3f%% %8.3g %8.3g %8.3g\n",
+            st->op_kind[0] ? st->op_kind : "(unknown)",
                 st->dst_name[0] ? st->dst_name : "(unnamed)",
                 st->src0_name[0] ? st->src0_name : "(unnamed)",
                 st->src1_name[0] ? st->src1_name : "(unnamed)",
@@ -1580,7 +1584,8 @@ static void ggml_mm_dist_report_atexit(void) {
 
         const double cover_pct = st->s.chunks_total > 0 ? 100.0 * (double)st->s.chunks_sampled / (double)st->s.chunks_total : 0.0;
 
-        fprintf(f, "  dst=%s | src0=%s | src1=%s\n",
+        fprintf(f, "  op=%s | dst=%s | src0=%s | src1=%s\n",
+            st->op_kind[0] ? st->op_kind : "(unknown)",
                 st->dst_name[0] ? st->dst_name : "(unnamed)",
                 st->src0_name[0] ? st->src0_name : "(unnamed)",
                 st->src1_name[0] ? st->src1_name : "(unnamed)");
@@ -1714,6 +1719,84 @@ static void ggml_mm_dist_report_atexit(void) {
         }
     }
 
+    {
+        static const char * kind_name[] = {
+            "mul_mat_pre",
+            "mul_mat_post",
+            "mul_mat_id_pre",
+            "mul_mat_id_post",
+            "gemv_repack_pre",
+            "gemv_repack_post",
+            "gemv_id_repack_pre",
+            "gemv_id_repack_post",
+            "gemm_repack_pre",
+            "gemm_repack_post",
+            "gemv_klei_f16_pre",
+            "gemv_klei_f16_post",
+            "gemm_klei_f16_pre",
+            "gemm_klei_f16_post",
+            "gemv_klei_q40_pre",
+            "gemv_klei_q40_post",
+            "gemm_klei_q40_pre",
+            "gemm_klei_q40_post",
+        };
+        enum { n_kind = (int)(sizeof(kind_name) / sizeof(kind_name[0])) };
+        struct ggml_mm_dist_local kind_agg[n_kind];
+        bool kind_used[n_kind];
+        memset(kind_agg, 0, sizeof(kind_agg));
+        memset(kind_used, 0, sizeof(kind_used));
+
+        for (int i = 0; i < n_used; ++i) {
+            const struct ggml_mm_dist_stat * st = used[i];
+            int kid = -1;
+            for (int k = 0; k < n_kind; ++k) {
+                if (strcmp(st->op_kind, kind_name[k]) == 0) {
+                    kid = k;
+                    break;
+                }
+            }
+            if (kid < 0) {
+                continue;
+            }
+            kind_used[kid] = true;
+            ggml_mm_dist_merge_local_stats(&kind_agg[kid], &st->s);
+        }
+
+        fprintf(f, "\n  MatMul Kind Aggregate\n");
+        fprintf(f, "  %.*s\n", 120, "------------------------------------------------------------------------------------------------------------------------");
+        fprintf(f, "  %12s %8s %8s %7s %12s %11s %11s %11s %11s %11s %11s\n",
+            "kind", "chunks", "sampled", "cover", "samples", "mean", "std", "p50|x|", "p95|x|", "p99|x|", "|x|>8%");
+
+        for (int kid = 0; kid < n_kind; ++kid) {
+            if (!kind_used[kid]) {
+                continue;
+            }
+            const struct ggml_mm_dist_local * s = &kind_agg[kid];
+            const double n = (double) s->count;
+            const double mean = n > 0 ? s->sum / n : 0.0;
+            const double var = n > 0 ? (s->sum_sq / n) - mean*mean : 0.0;
+            const double std = var > 0 ? sqrt(var) : 0.0;
+            const double p50_abs = ggml_mm_dist_hist_quantile_abs(s, 0.50);
+            const double p95_abs = ggml_mm_dist_hist_quantile_abs(s, 0.95);
+            const double p99_abs = ggml_mm_dist_hist_quantile_abs(s, 0.99);
+            const double gt8_pct = n > 0 ? 100.0 * (double)s->n_abs_gt_8 / n : 0.0;
+            const double cover_pct = s->chunks_total > 0 ? 100.0 * (double)s->chunks_sampled / (double)s->chunks_total : 0.0;
+
+            fprintf(f, "  %12s %8" PRId64 " %8" PRId64 " %6.2f%% %12" PRId64 " %11.4g %11.4g %11.3g %11.3g %11.3g %10.3f%%\n",
+                kind_name[kid],
+                s->chunks_total,
+                s->chunks_sampled,
+                cover_pct,
+                s->count,
+                mean,
+                std,
+                p50_abs,
+                p95_abs,
+                p99_abs,
+                gt8_pct);
+        }
+    }
+
     fprintf(f, "\n================================================================================\n");
     fclose(f);
     ggml_mm_dist_lock_release();
@@ -1726,6 +1809,65 @@ static bool ggml_mm_dist_should_collect(void) {
     const int rate = ggml_mm_dist_get_sample_rate();
     const int c = atomic_fetch_add_explicit(&g_mm_dist_chunk_counter, 1, memory_order_relaxed) + 1;
     return (rate <= 1) || (c % rate == 0);
+}
+
+void ggml_mm_dist_record_chunk_values(
+        const char * op_kind,
+        const char * dst_name,
+        const char * src0_name,
+        const char * src1_name,
+        const float * vals,
+        int64_t n) {
+    const bool dist_enabled = ggml_mm_dist_get_enabled();
+    if (!dist_enabled) {
+        return;
+    }
+
+    const bool collect_dist = ggml_mm_dist_should_collect();
+    struct ggml_mm_dist_local dist_local = {0};
+    dist_local.chunks_total = 1;
+    dist_local.chunks_sampled = collect_dist ? 1 : 0;
+
+    if (collect_dist && vals != NULL && n > 0) {
+        ggml_mm_dist_accumulate_values(&dist_local, vals, n);
+    }
+
+    ggml_mm_dist_merge_local(op_kind, dst_name, src0_name, src1_name, &dist_local);
+}
+
+void ggml_mm_dist_record_chunk_values_pair(
+        const char * op_kind_pre,
+        const char * op_kind_post,
+        const char * dst_name,
+        const char * src0_name,
+        const char * src1_name,
+        const float * vals_pre,
+        const float * vals_post,
+        int64_t n) {
+    const bool dist_enabled = ggml_mm_dist_get_enabled();
+    if (!dist_enabled) {
+        return;
+    }
+
+    const bool collect_dist = ggml_mm_dist_should_collect();
+
+    struct ggml_mm_dist_local dist_local_pre = {0};
+    dist_local_pre.chunks_total = 1;
+    dist_local_pre.chunks_sampled = collect_dist ? 1 : 0;
+
+    struct ggml_mm_dist_local dist_local_post = {0};
+    dist_local_post.chunks_total = 1;
+    dist_local_post.chunks_sampled = collect_dist ? 1 : 0;
+
+    if (collect_dist && vals_pre != NULL && n > 0) {
+        ggml_mm_dist_accumulate_values(&dist_local_pre, vals_pre, n);
+    }
+    if (collect_dist && vals_post != NULL && n > 0) {
+        ggml_mm_dist_accumulate_values(&dist_local_post, vals_post, n);
+    }
+
+    ggml_mm_dist_merge_local(op_kind_pre, dst_name, src0_name, src1_name, &dist_local_pre);
+    ggml_mm_dist_merge_local(op_kind_post, dst_name, src0_name, src1_name, &dist_local_post);
 }
 
 // ggml_compute_forward_mul_mat
@@ -1866,13 +2008,17 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // attempt to reduce false-sharing (does not seem to make a difference)
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
+    const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
 
     const bool dist_enabled = ggml_mm_dist_get_enabled();
     const bool collect_dist = dist_enabled && ggml_mm_dist_should_collect();
-    struct ggml_mm_dist_local dist_local = {0};
+    struct ggml_mm_dist_local dist_local_pre = {0};
+    struct ggml_mm_dist_local dist_local_post = {0};
     if (dist_enabled) {
-        dist_local.chunks_total = 1;
-        dist_local.chunks_sampled = collect_dist ? 1 : 0;
+        dist_local_pre.chunks_total = 1;
+        dist_local_pre.chunks_sampled = collect_dist ? 1 : 0;
+        dist_local_post.chunks_total = 1;
+        dist_local_post.chunks_sampled = collect_dist ? 1 : 0;
     }
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
@@ -1913,9 +2059,24 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
                     const int64_t n_copy = (MIN(iir0 + blck_0, ir0_end) - iir0);
                     const float * src_vals = tmp + (cn * 16);
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], src_vals, n_copy * sizeof(float));
+                    const float * vals_to_store = src_vals;
+                    float qdq_vals[GGML_SIM_FP8E4M3_BLOCK];
+                    if (use_fp8sim_out) {
+                        ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                            src_vals,
+                            qdq_vals,
+                            (int) n_copy,
+                            GGML_SIM_FP8E4M3_BLOCK,
+                            NULL,
+                            /*src_id=*/2,
+                            dst->name);
+                        vals_to_store = qdq_vals;
+                    }
+
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], vals_to_store, n_copy * sizeof(float));
                     if (collect_dist) {
-                        ggml_mm_dist_accumulate_values(&dist_local, src_vals, n_copy);
+                        ggml_mm_dist_accumulate_values(&dist_local_pre, src_vals, n_copy);
+                        ggml_mm_dist_accumulate_values(&dist_local_post, vals_to_store, n_copy);
                     }
                 }
             }
@@ -1923,7 +2084,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 
     if (dist_enabled) {
-        ggml_mm_dist_merge_local(dst->name, src0->name, src1->name, &dist_local);
+        ggml_mm_dist_merge_local("mul_mat_pre", dst->name, src0->name, src1->name, &dist_local_pre);
+        ggml_mm_dist_merge_local("mul_mat_post", dst->name, src0->name, src1->name, &dist_local_post);
     }
 }
 
@@ -2018,7 +2180,7 @@ void ggml_compute_forward_mul_mat(
 
         GGML_ASSERT(params->wsize >= ne13 * (int64_t) nbw3);
 
-        // Convert rows in parallel over the K-dimension blocks (default block=16)
+        // Convert rows in parallel over the K-dimension blocks (block size = GGML_SIM_FP8E4M3_BLOCK)
         const int block = GGML_SIM_FP8E4M3 ? GGML_SIM_FP8E4M3_BLOCK : (int) ggml_blck_size(vec_dot_type);
         const int64_t nblocks = (ne10 + block - 1) / block;
 
@@ -2037,7 +2199,7 @@ void ggml_compute_forward_mul_mat(
                         const float * in = (const float *) (src1_row_in);
                         ggml_bf16_t * out = (ggml_bf16_t *) (src1_row_out);
                         if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1) {
-                            // process in blocks to keep exactly "one scale per 16" semantics
+                            // process in blocks to keep exactly "one scale per block" semantics
                             for (int64_t b = b_start; b < b_end; ++b) {
                                 const int off = (int) (b * block);
                                 const int len = (off + block <= ne10) ? block : (int) (ne10 - off);
@@ -2280,22 +2442,36 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const int64_t ir1_start,
     const int64_t ir1_end,
     const char * src0_cur,
+    const size_t src0_nb01,
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
-    const bool src1_cont,
+    const bool src1_wdata_contig,
     const void * wdata) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const enum ggml_type type = src0->type;
+    const enum ggml_type type = GGML_TYPE_BF16;
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
+    // NOTE: these are compute tile sizes for this kernel, unrelated to FP8 block size.
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
+    const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
 
     float tmp[16];
+
+    const bool dist_enabled = ggml_mm_dist_get_enabled();
+    const bool collect_dist = dist_enabled && ggml_mm_dist_should_collect();
+    struct ggml_mm_dist_local dist_local_pre = {0};
+    struct ggml_mm_dist_local dist_local_post = {0};
+    if (dist_enabled) {
+        dist_local_pre.chunks_total = 1;
+        dist_local_pre.chunks_sampled = collect_dist ? 1 : 0;
+        dist_local_post.chunks_total = 1;
+        dist_local_post.chunks_sampled = collect_dist ? 1 : 0;
+    }
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -2316,19 +2492,46 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 //       the original src1 data pointer, so we should index using the indices directly
                 // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char *) wdata +
-                    (src1_cont || src1->type != vec_dot_type
+                    (src1_wdata_contig
                     ? (i11      + i12*ne11)*row_size
                     : (i11*nb11 + i12*nb12));
 
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                    vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*src0_nb01, 0, src1_col, 0, 1);
                 }
 
-                memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+                const int64_t n_copy = (MIN(iir0 + blck_0, ir0_end) - iir0);
+                if (use_fp8sim_out) {
+                    float qdq_vals[GGML_SIM_FP8E4M3_BLOCK];
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                        tmp,
+                        qdq_vals,
+                        (int) n_copy,
+                        GGML_SIM_FP8E4M3_BLOCK,
+                        NULL,
+                        /*src_id=*/2,
+                        dst->name);
+                    memcpy(&dst_col[iir0], qdq_vals, n_copy*sizeof(float));
+                    if (collect_dist) {
+                        ggml_mm_dist_accumulate_values(&dist_local_pre, tmp, n_copy);
+                        ggml_mm_dist_accumulate_values(&dist_local_post, qdq_vals, n_copy);
+                    }
+                } else {
+                    memcpy(&dst_col[iir0], tmp, n_copy*sizeof(float));
+                    if (collect_dist) {
+                        ggml_mm_dist_accumulate_values(&dist_local_pre, tmp, n_copy);
+                        ggml_mm_dist_accumulate_values(&dist_local_post, tmp, n_copy);
+                    }
+                }
             }
         }
+    }
+
+    if (dist_enabled) {
+        ggml_mm_dist_merge_local("mul_mat_id_pre", dst->name, src0->name, src1->name, &dist_local_pre);
+        ggml_mm_dist_merge_local("mul_mat_id_post", dst->name, src0->name, src1->name, &dist_local_post);
     }
 }
 
@@ -2353,15 +2556,15 @@ static void ggml_compute_forward_mul_mat_id(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const enum ggml_type type = src0->type;
+    const enum ggml_type dot_type = GGML_TYPE_BF16;
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
+    enum ggml_type    const vec_dot_type    = type_traits_cpu[dot_type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
     // we don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == ggml_type_size(type));
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
     // dst cannot be transposed or permuted
@@ -2376,8 +2579,153 @@ static void ggml_compute_forward_mul_mat_id(
 
     void * wdata_cur = params->wdata;
 
-    if (src1->type != vec_dot_type) {
-        incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+    size_t wsize_src1 = 0;
+    const bool need_src1_wdata =
+            (src1->type != vec_dot_type) ||
+            (!ggml_is_contiguous(src1))  ||
+            (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
+
+    if (need_src1_wdata) {
+        wsize_src1 = ggml_row_size(vec_dot_type, ne10) * (size_t) ne11 * (size_t) ne12 * (size_t) ne13;
+        wsize_src1 = GGML_PAD(wsize_src1, GGML_CACHE_LINE);
+
+        char * wdata = (char *) params->wdata;
+        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw2 = nbw1 * (size_t) ne11;
+        const size_t nbw3 = nbw2 * (size_t) ne12;
+
+        GGML_ASSERT(params->wsize >= ne13 * (int64_t) nbw3);
+
+        const int block = GGML_SIM_FP8E4M3 ? GGML_SIM_FP8E4M3_BLOCK : (int) ggml_blck_size(vec_dot_type);
+        const int64_t nblocks = (ne10 + block - 1) / block;
+
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    const char * src1_row_in  = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11;
+                    char       * src1_row_out = (char *) wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
+
+                    const int64_t b_start = (ith * nblocks) / nth;
+                    const int64_t b_end   = ((ith + 1) * nblocks) / nth;
+
+                    if (src1->type == GGML_TYPE_F32) {
+                        const float * in = (const float *) (src1_row_in);
+                        ggml_bf16_t * out = (ggml_bf16_t *) (src1_row_out);
+                        if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1) {
+                            for (int64_t b = b_start; b < b_end; ++b) {
+                                const int off = (int) (b * block);
+                                const int len = (off + block <= ne10) ? block : (int) (ne10 - off);
+                                ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
+                            }
+                        } else {
+                            for (int64_t b = b_start; b < b_end; ++b) {
+                                const int off = (int) (b * block);
+                                const int len = (off + block <= ne10) ? block : (int) (ne10 - off);
+                                from_float((float *)(in + off), (void *)(out + off), len);
+                            }
+                        }
+                    } else {
+                        float tmp_f32[GGML_SIM_FP8E4M3_BLOCK];
+                        for (int64_t b = b_start; b < b_end; ++b) {
+                            const int off = (int) (b * block);
+                            const int len = (off + block <= ne10) ? block : (int) (ne10 - off);
+
+                            if (src1->type == GGML_TYPE_BF16) {
+                                const ggml_bf16_t * in = (const ggml_bf16_t *) (src1_row_in);
+                                for (int i = 0; i < len; ++i) tmp_f32[i] = GGML_BF16_TO_FP32(in[off + i]);
+                            } else if (src1->type == GGML_TYPE_F16) {
+                                const ggml_fp16_t * in = (const ggml_fp16_t *) (src1_row_in);
+                                for (int i = 0; i < len; ++i) tmp_f32[i] = GGML_FP16_TO_FP32(in[off + i]);
+                            } else if (ggml_is_quantized(src1->type)) {
+                                float * tmp_big = (float *) alloca((size_t) ne10 * sizeof(float));
+                                ggml_dequantize_row_to_f32(src1->type, src1_row_in, tmp_big, ne10);
+                                for (int i = 0; i < len; ++i) tmp_f32[i] = tmp_big[off + i];
+                            } else {
+                                GGML_ABORT("mul_mat_id: src1 cast-to-bf16: unsupported src1->type=%s", ggml_type_name(src1->type));
+                            }
+
+                            ggml_bf16_t * out = (ggml_bf16_t *) (src1_row_out);
+                            if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1) {
+                                ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
+                            } else {
+                                from_float(tmp_f32, (void *)(out + off), len);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        wdata_cur = (void *)((char *) params->wdata + wsize_src1);
+    }
+
+    size_t wsize_src0 = 0;
+    const bool need_src0_wdata = (src0->type != GGML_TYPE_BF16) || (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0);
+    if (need_src0_wdata) {
+        wsize_src0 = ggml_row_size(GGML_TYPE_BF16, ne00) * (size_t) ne01 * (size_t) ne02 * (size_t) ne03;
+        wsize_src0 = GGML_PAD(wsize_src0, GGML_CACHE_LINE);
+
+        GGML_ASSERT(params->wsize >= wsize_src1 + wsize_src0);
+
+        char * dst0_bf16 = (char *) params->wdata + wsize_src1;
+        const size_t nb0w1 = ggml_row_size(GGML_TYPE_BF16, ne00);
+        const size_t nb0w2 = nb0w1 * (size_t) ne01;
+        const size_t nb0w3 = nb0w2 * (size_t) ne02;
+
+        const int64_t nrows_total = ne01 * ne02 * ne03;
+        const int64_t row_start = (ith * nrows_total) / nth;
+        const int64_t row_end   = ((ith + 1) * nrows_total) / nth;
+
+        float * tmp_f32 = NULL;
+        if (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) {
+            tmp_f32 = (float *) alloca((size_t) ne00 * sizeof(float));
+        }
+
+        for (int64_t rid = row_start; rid < row_end; ++rid) {
+            const int64_t i03 = rid / (ne02 * ne01);
+            const int64_t t   = rid - i03 * (ne02 * ne01);
+            const int64_t i02 = t / ne01;
+            const int64_t i01 = t - i02 * ne01;
+
+            const char * src0_row_in = (const char *) src0->data + i01 * nb01 + i02 * nb02 + i03 * nb03;
+            char * src0_row_out = dst0_bf16 + i01 * (int64_t) nb0w1 + i02 * (int64_t) nb0w2 + i03 * (int64_t) nb0w3;
+
+            if (src0->type == GGML_TYPE_F32) {
+                const float * in = (const float *) src0_row_in;
+                if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) {
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else {
+                    ggml_cpu_fp32_to_bf16(in, (ggml_bf16_t *) src0_row_out, ne00);
+                }
+            } else if (src0->type == GGML_TYPE_BF16) {
+                const ggml_bf16_t * in = (const ggml_bf16_t *) src0_row_in;
+                for (int64_t k = 0; k < ne00; ++k) tmp_f32[k] = GGML_BF16_TO_FP32(in[k]);
+                if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) {
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else {
+                    ggml_cpu_fp32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, ne00);
+                }
+            } else if (src0->type == GGML_TYPE_F16) {
+                const ggml_fp16_t * in = (const ggml_fp16_t *) src0_row_in;
+                for (int64_t k = 0; k < ne00; ++k) tmp_f32[k] = GGML_FP16_TO_FP32(in[k]);
+                if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) {
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else {
+                    ggml_cpu_fp32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, ne00);
+                }
+            } else if (ggml_is_quantized(src0->type)) {
+                ggml_dequantize_row_to_f32(src0->type, src0_row_in, tmp_f32, ne00);
+                if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) {
+                    ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else {
+                    ggml_cpu_fp32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, ne00);
+                }
+            } else {
+                GGML_ABORT("mul_mat_id: src0 cast-to-bf16: unsupported src0->type=%s", ggml_type_name(src0->type));
+            }
+        }
+
+        wdata_cur = (void *)((char *) params->wdata + wsize_src1 + wsize_src0);
     }
 
     int64_t * matrix_row_counts = // [n_as]
@@ -2390,43 +2738,6 @@ static void ggml_compute_forward_mul_mat_id(
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
-
-    if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
-
-        const size_t nbw0 = ggml_type_size(vec_dot_type);
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-        const size_t nbw2 = nbw1*ne11;
-        const size_t nbw3 = nbw2*ne12;
-
-        assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
-
-#if 0
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                               ne10);
-                }
-            }
-        }
-#else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
-                }
-            }
-        }
-#endif
-    }
 
     if (ith == 0) {
         // initialize matrix_row_counts
@@ -2460,8 +2771,14 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const bool src0_casted_for_dot = need_src0_wdata;
+        const size_t src0_nb01 = src0_casted_for_dot ? ggml_row_size(GGML_TYPE_BF16, ne00) : (size_t) nb01;
+        const size_t src0_nb02 = src0_casted_for_dot ? src0_nb01 * (size_t) ne01 : (size_t) nb02;
+        const char * src0_base = src0_casted_for_dot ? (const char *) params->wdata + wsize_src1 : (const char *) src0->data;
+        const char * src0_cur = src0_base + cur_a * (int64_t) src0_nb02;
+
+        const bool src1_wdata_contig = need_src1_wdata;
+        const void * wdata = need_src1_wdata ? params->wdata : src1->data;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         const int64_t nr0 = ne01;
@@ -2503,7 +2820,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, src0_nb01, matrix_rows, row_size, src1_wdata_contig, wdata
             );
 
             if (nth >= nchunk0 * nchunk1) {
