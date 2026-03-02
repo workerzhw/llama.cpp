@@ -405,7 +405,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
 
     const int sample_rate = fp8_get_sample_rate();
     const int64_t call_id = g_fp8_call_counter.fetch_add(1, std::memory_order_relaxed);
-    const bool collect = (sample_rate > 0) && (call_id % sample_rate == 0);
+    bool collect = (sample_rate > 0) && (call_id % sample_rate == 0);
 
     // Only allocate temp buffer when collecting stats (need FP32 dequant for error calc)
     float tmp_dq[4096];
