@@ -1115,6 +1115,619 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// -----------------------------------------------------------------------------
+// Optional matmul output distribution profiler
+//
+// Runtime switches:
+//   GGML_MATMUL_DIST=1              enable collection (default: 0)
+//   GGML_MATMUL_DIST_SAMPLE=N       collect every Nth one-chunk call (default: 200)
+//   GGML_MATMUL_DIST_FILE=path       output file (default: matmul_output_dist.log)
+// -----------------------------------------------------------------------------
+
+#define GGML_MM_DIST_MAX_STATS  512
+#define GGML_MM_DIST_HIST_BINS   64   // log2(|x|) bins over [-32, 32)
+#define GGML_MM_DIST_MAX_LAYERS 256
+
+struct ggml_mm_dist_local {
+    int64_t chunks_total;
+    int64_t chunks_sampled;
+    int64_t count;
+    int64_t n_zero;
+    int64_t n_pos;
+    int64_t n_neg;
+    int64_t n_non_finite;
+    int64_t n_abs_gt_1;
+    int64_t n_abs_gt_2;
+    int64_t n_abs_gt_4;
+    int64_t n_abs_gt_8;
+    int64_t n_abs_gt_16;
+    int64_t n_abs_gt_32;
+    double sum;
+    double sum_sq;
+    float min_v;
+    float max_v;
+    int64_t hist[GGML_MM_DIST_HIST_BINS];
+};
+
+struct ggml_mm_dist_stat {
+    bool used;
+    char dst_name[GGML_MAX_NAME];
+    char src0_name[GGML_MAX_NAME];
+    char src1_name[GGML_MAX_NAME];
+    struct ggml_mm_dist_local s;
+};
+
+static struct ggml_mm_dist_stat g_mm_dist_stats[GGML_MM_DIST_MAX_STATS];
+static atomic_flag g_mm_dist_lock = ATOMIC_FLAG_INIT;
+static atomic_int g_mm_dist_chunk_counter = 0;
+static bool g_mm_dist_atexit_registered = false;
+static int g_mm_dist_enabled = -1;
+static int g_mm_dist_sample_rate = -1;
+
+static void ggml_mm_dist_report_atexit(void);
+
+static void ggml_mm_dist_lock_acquire(void) {
+    while (atomic_flag_test_and_set(&g_mm_dist_lock)) {
+        ;
+    }
+}
+
+static void ggml_mm_dist_lock_release(void) {
+    atomic_flag_clear(&g_mm_dist_lock);
+}
+
+static int ggml_mm_dist_get_enabled(void) {
+    if (g_mm_dist_enabled >= 0) {
+        return g_mm_dist_enabled;
+    }
+    const char * env = getenv("GGML_MATMUL_DIST");
+    g_mm_dist_enabled = (env && atoi(env) > 0) ? 1 : 0;
+    return g_mm_dist_enabled;
+}
+
+static int ggml_mm_dist_get_sample_rate(void) {
+    if (g_mm_dist_sample_rate >= 0) {
+        return g_mm_dist_sample_rate;
+    }
+    const char * env = getenv("GGML_MATMUL_DIST_SAMPLE");
+    if (env) {
+        g_mm_dist_sample_rate = atoi(env);
+        if (g_mm_dist_sample_rate < 1) {
+            g_mm_dist_sample_rate = 1;
+        }
+    } else {
+        g_mm_dist_sample_rate = 200;
+    }
+    return g_mm_dist_sample_rate;
+}
+
+static inline int ggml_mm_dist_bin_for_abs(float ax) {
+    float lg = log2f(ax);
+    int b = (int) floorf(lg + 32.0f);
+    if (b < 0) b = 0;
+    if (b >= GGML_MM_DIST_HIST_BINS) b = GGML_MM_DIST_HIST_BINS - 1;
+    return b;
+}
+
+static inline double ggml_mm_dist_hist_quantile_abs(const struct ggml_mm_dist_local * s, double q) {
+    if (s->count <= 0) {
+        return 0.0;
+    }
+    if (q < 0.0) q = 0.0;
+    if (q > 1.0) q = 1.0;
+
+    const int64_t rank = (int64_t) floor(q * (double)(s->count - 1));
+    if (rank < s->n_zero) {
+        return 0.0;
+    }
+
+    int64_t rem = rank - s->n_zero;
+    int64_t cum = 0;
+    for (int b = 0; b < GGML_MM_DIST_HIST_BINS; ++b) {
+        cum += s->hist[b];
+        if (rem < cum) {
+            const double center = (double)(b - 32) + 0.5;
+            return exp2(center);
+        }
+    }
+
+    return exp2(31.5);
+}
+
+static inline void ggml_mm_dist_merge_local_stats(struct ggml_mm_dist_local * dst, const struct ggml_mm_dist_local * src) {
+    if (src->count > 0) {
+        if (dst->count == 0) {
+            dst->min_v = src->min_v;
+            dst->max_v = src->max_v;
+        } else {
+            if (src->min_v < dst->min_v) dst->min_v = src->min_v;
+            if (src->max_v > dst->max_v) dst->max_v = src->max_v;
+        }
+    }
+
+    dst->chunks_total += src->chunks_total;
+    dst->chunks_sampled += src->chunks_sampled;
+    dst->count += src->count;
+    dst->n_zero += src->n_zero;
+    dst->n_pos += src->n_pos;
+    dst->n_neg += src->n_neg;
+    dst->n_non_finite += src->n_non_finite;
+    dst->n_abs_gt_1 += src->n_abs_gt_1;
+    dst->n_abs_gt_2 += src->n_abs_gt_2;
+    dst->n_abs_gt_4 += src->n_abs_gt_4;
+    dst->n_abs_gt_8 += src->n_abs_gt_8;
+    dst->n_abs_gt_16 += src->n_abs_gt_16;
+    dst->n_abs_gt_32 += src->n_abs_gt_32;
+    dst->sum += src->sum;
+    dst->sum_sq += src->sum_sq;
+    for (int b = 0; b < GGML_MM_DIST_HIST_BINS; ++b) {
+        dst->hist[b] += src->hist[b];
+    }
+}
+
+static inline void ggml_mm_dist_accumulate_values(struct ggml_mm_dist_local * acc, const float * vals, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        const float x = vals[i];
+        if (!isfinite(x)) {
+            acc->n_non_finite++;
+            continue;
+        }
+        if (acc->count == 0) {
+            acc->min_v = x;
+            acc->max_v = x;
+        } else {
+            if (x < acc->min_v) acc->min_v = x;
+            if (x > acc->max_v) acc->max_v = x;
+        }
+        acc->count++;
+        acc->sum += (double) x;
+        acc->sum_sq += (double) x * (double) x;
+
+        if (x == 0.0f) {
+            acc->n_zero++;
+            continue;
+        }
+        if (x > 0.0f) acc->n_pos++; else acc->n_neg++;
+
+        const float ax = fabsf(x);
+        if (ax > 1.0f)  acc->n_abs_gt_1++;
+        if (ax > 2.0f)  acc->n_abs_gt_2++;
+        if (ax > 4.0f)  acc->n_abs_gt_4++;
+        if (ax > 8.0f)  acc->n_abs_gt_8++;
+        if (ax > 16.0f) acc->n_abs_gt_16++;
+        if (ax > 32.0f) acc->n_abs_gt_32++;
+        acc->hist[ggml_mm_dist_bin_for_abs(ax)]++;
+    }
+}
+
+static void ggml_mm_dist_merge_local(const char * dst_name, const char * src0_name, const char * src1_name, const struct ggml_mm_dist_local * local) {
+    if (local->count == 0 && local->n_non_finite == 0 && local->chunks_total == 0 && local->chunks_sampled == 0) {
+        return;
+    }
+
+    ggml_mm_dist_lock_acquire();
+
+    int idx = -1;
+    for (int i = 0; i < GGML_MM_DIST_MAX_STATS; ++i) {
+        if (!g_mm_dist_stats[i].used) {
+            if (idx < 0) idx = i;
+            continue;
+        }
+        if (strcmp(g_mm_dist_stats[i].dst_name, dst_name ? dst_name : "") == 0 &&
+            strcmp(g_mm_dist_stats[i].src0_name, src0_name ? src0_name : "") == 0 &&
+            strcmp(g_mm_dist_stats[i].src1_name, src1_name ? src1_name : "") == 0) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx >= 0 && !g_mm_dist_stats[idx].used) {
+        g_mm_dist_stats[idx].used = true;
+        snprintf(g_mm_dist_stats[idx].dst_name, GGML_MAX_NAME, "%s", dst_name ? dst_name : "");
+        snprintf(g_mm_dist_stats[idx].src0_name, GGML_MAX_NAME, "%s", src0_name ? src0_name : "");
+        snprintf(g_mm_dist_stats[idx].src1_name, GGML_MAX_NAME, "%s", src1_name ? src1_name : "");
+    }
+
+    if (idx >= 0) {
+        struct ggml_mm_dist_local * g = &g_mm_dist_stats[idx].s;
+        if (local->count > 0) {
+            if (g->count == 0) {
+                g->min_v = local->min_v;
+                g->max_v = local->max_v;
+            } else {
+                if (local->min_v < g->min_v) g->min_v = local->min_v;
+                if (local->max_v > g->max_v) g->max_v = local->max_v;
+            }
+        }
+        g->chunks_total += local->chunks_total;
+        g->chunks_sampled += local->chunks_sampled;
+        g->count += local->count;
+        g->n_zero += local->n_zero;
+        g->n_pos += local->n_pos;
+        g->n_neg += local->n_neg;
+        g->n_non_finite += local->n_non_finite;
+        g->n_abs_gt_1 += local->n_abs_gt_1;
+        g->n_abs_gt_2 += local->n_abs_gt_2;
+        g->n_abs_gt_4 += local->n_abs_gt_4;
+        g->n_abs_gt_8 += local->n_abs_gt_8;
+        g->n_abs_gt_16 += local->n_abs_gt_16;
+        g->n_abs_gt_32 += local->n_abs_gt_32;
+        g->sum += local->sum;
+        g->sum_sq += local->sum_sq;
+        for (int b = 0; b < GGML_MM_DIST_HIST_BINS; ++b) {
+            g->hist[b] += local->hist[b];
+        }
+    }
+
+    if (!g_mm_dist_atexit_registered) {
+        g_mm_dist_atexit_registered = true;
+        atexit(ggml_mm_dist_report_atexit);
+    }
+
+    ggml_mm_dist_lock_release();
+}
+
+static bool ggml_mm_dist_contains_icase(const char * s, const char * pat) {
+    if (!s || !pat || !pat[0]) return false;
+    for (const char * p = s; *p; ++p) {
+        const char * a = p;
+        const char * b = pat;
+        while (*a && *b) {
+            char ca = *a;
+            char cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+            if (ca != cb) break;
+            ++a;
+            ++b;
+        }
+        if (*b == '\0') return true;
+    }
+    return false;
+}
+
+static bool ggml_mm_dist_is_focus(const struct ggml_mm_dist_stat * st) {
+    return ggml_mm_dist_contains_icase(st->dst_name, "q") ||
+           ggml_mm_dist_contains_icase(st->dst_name, "k") ||
+           ggml_mm_dist_contains_icase(st->dst_name, "v") ||
+           ggml_mm_dist_contains_icase(st->dst_name, "kq") ||
+           ggml_mm_dist_contains_icase(st->dst_name, "qk") ||
+           ggml_mm_dist_contains_icase(st->src0_name, "q") ||
+           ggml_mm_dist_contains_icase(st->src1_name, "k") ||
+           ggml_mm_dist_contains_icase(st->src0_name, "k") ||
+           ggml_mm_dist_contains_icase(st->src1_name, "q");
+}
+
+static int ggml_mm_dist_extract_layer_id_from_name(const char * s) {
+    if (!s || !s[0]) {
+        return -1;
+    }
+
+    for (const char * p = s; p[0] != '\0'; ++p) {
+        if (p[0] == 'b' && p[1] == 'l' && p[2] == 'k' && p[3] == '.') {
+            const char * q = p + 4;
+            if (*q < '0' || *q > '9') {
+                continue;
+            }
+            int v = 0;
+            while (*q >= '0' && *q <= '9') {
+                v = v * 10 + (*q - '0');
+                if (v >= GGML_MM_DIST_MAX_LAYERS) {
+                    return -1;
+                }
+                ++q;
+            }
+            return v;
+        }
+    }
+    return -1;
+}
+
+static int ggml_mm_dist_extract_layer_id_stat(const struct ggml_mm_dist_stat * st) {
+    int lid = ggml_mm_dist_extract_layer_id_from_name(st->dst_name);
+    if (lid >= 0) return lid;
+    lid = ggml_mm_dist_extract_layer_id_from_name(st->src0_name);
+    if (lid >= 0) return lid;
+    return ggml_mm_dist_extract_layer_id_from_name(st->src1_name);
+}
+
+static const char * ggml_mm_dist_op_class_name(int cid) {
+    switch (cid) {
+        case 0: return "qk";
+        case 1: return "ov";
+        case 2: return "q";
+        case 3: return "k";
+        case 4: return "v";
+        case 5: return "ffn";
+        case 6: return "norm";
+        default: return "other";
+    }
+}
+
+static int ggml_mm_dist_op_class_id(const struct ggml_mm_dist_stat * st) {
+    const char * d = st->dst_name;
+    const char * s0 = st->src0_name;
+    const char * s1 = st->src1_name;
+
+    if (ggml_mm_dist_contains_icase(d, "qk") || ggml_mm_dist_contains_icase(d, "kq") ||
+        ggml_mm_dist_contains_icase(s0, "qk") || ggml_mm_dist_contains_icase(s1, "qk") ||
+        ggml_mm_dist_contains_icase(s0, "kq") || ggml_mm_dist_contains_icase(s1, "kq")) {
+        return 0; // qk score
+    }
+
+    if (ggml_mm_dist_contains_icase(d, "ov") || ggml_mm_dist_contains_icase(d, "attn_output") ||
+        ggml_mm_dist_contains_icase(d, "o_proj") || ggml_mm_dist_contains_icase(s0, "attn_output") ||
+        ggml_mm_dist_contains_icase(s1, "attn_output")) {
+        return 1; // ov / output projection
+    }
+
+    if (ggml_mm_dist_contains_icase(d, "attn_q") || ggml_mm_dist_contains_icase(d, "q_proj") ||
+        ggml_mm_dist_contains_icase(s0, "attn_q") || ggml_mm_dist_contains_icase(s1, "attn_q")) {
+        return 2;
+    }
+    if (ggml_mm_dist_contains_icase(d, "attn_k") || ggml_mm_dist_contains_icase(d, "k_proj") ||
+        ggml_mm_dist_contains_icase(s0, "attn_k") || ggml_mm_dist_contains_icase(s1, "attn_k")) {
+        return 3;
+    }
+    if (ggml_mm_dist_contains_icase(d, "attn_v") || ggml_mm_dist_contains_icase(d, "v_proj") ||
+        ggml_mm_dist_contains_icase(s0, "attn_v") || ggml_mm_dist_contains_icase(s1, "attn_v")) {
+        return 4;
+    }
+
+    if (ggml_mm_dist_contains_icase(d, "ffn") || ggml_mm_dist_contains_icase(d, "swiglu") ||
+        ggml_mm_dist_contains_icase(s0, "ffn") || ggml_mm_dist_contains_icase(s1, "ffn")) {
+        return 5;
+    }
+
+    if (ggml_mm_dist_contains_icase(d, "norm") || ggml_mm_dist_contains_icase(s0, "norm") ||
+        ggml_mm_dist_contains_icase(s1, "norm")) {
+        return 6;
+    }
+
+    return 7;
+}
+
+static int ggml_mm_dist_cmp_count_desc(const void * a, const void * b) {
+    const struct ggml_mm_dist_stat * sa = *(const struct ggml_mm_dist_stat * const *)a;
+    const struct ggml_mm_dist_stat * sb = *(const struct ggml_mm_dist_stat * const *)b;
+    if (sa->s.count < sb->s.count) return 1;
+    if (sa->s.count > sb->s.count) return -1;
+    return 0;
+}
+
+static void ggml_mm_dist_report_atexit(void) {
+    ggml_mm_dist_lock_acquire();
+
+    const char * path = getenv("GGML_MATMUL_DIST_FILE");
+    if (!path || !path[0]) {
+        path = "matmul_output_dist.log";
+    }
+
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        ggml_mm_dist_lock_release();
+        return;
+    }
+
+    struct ggml_mm_dist_stat * used[GGML_MM_DIST_MAX_STATS];
+    int n_used = 0;
+    for (int i = 0; i < GGML_MM_DIST_MAX_STATS; ++i) {
+        if (g_mm_dist_stats[i].used) {
+            used[n_used++] = &g_mm_dist_stats[i];
+        }
+    }
+    qsort(used, (size_t)n_used, sizeof(used[0]), ggml_mm_dist_cmp_count_desc);
+
+    fprintf(f, "================================================================================\n");
+    fprintf(f, "  MatMul Output Distribution Report\n");
+    fprintf(f, "================================================================================\n");
+    fprintf(f, "  Config: GGML_MATMUL_DIST=1, sample_rate=%d (one-chunk)\n", ggml_mm_dist_get_sample_rate());
+    fprintf(f, "  Tracked tensors: %d\n\n", n_used);
+
+    fprintf(f, "  Summary (sorted by sample count)\n");
+    fprintf(f, "  %-18s %-10s %-10s %8s %8s %7s %10s %10s %10s %10s %8s %8s %8s %8s %8s %8s\n",
+            "dst", "src0", "src1", "chunks", "sampled", "cover", "samples", "min", "max", "mean", "std", "zero%", ">8%", "p50", "p95", "p99");
+    fprintf(f, "  %.*s\n", 140, "--------------------------------------------------------------------------------------------------------------------------------------------");
+
+    for (int i = 0; i < n_used; ++i) {
+        const struct ggml_mm_dist_stat * st = used[i];
+        const double n = (double) st->s.count;
+        const double mean = n > 0 ? st->s.sum / n : 0.0;
+        const double var = n > 0 ? (st->s.sum_sq / n) - mean*mean : 0.0;
+        const double std = var > 0 ? sqrt(var) : 0.0;
+        const double zero_pct = n > 0 ? 100.0 * (double)st->s.n_zero / n : 0.0;
+        const double gt8_pct = n > 0 ? 100.0 * (double)st->s.n_abs_gt_8 / n : 0.0;
+        const double p50_abs = ggml_mm_dist_hist_quantile_abs(&st->s, 0.50);
+        const double p95_abs = ggml_mm_dist_hist_quantile_abs(&st->s, 0.95);
+        const double p99_abs = ggml_mm_dist_hist_quantile_abs(&st->s, 0.99);
+
+        const double cover_pct = st->s.chunks_total > 0 ? 100.0 * (double)st->s.chunks_sampled / (double)st->s.chunks_total : 0.0;
+
+        fprintf(f, "  %-18.18s %-10.10s %-10.10s %8" PRId64 " %8" PRId64 " %6.2f%% %10" PRId64 " %10.4g %10.4g %10.4g %8.4g %7.3f%% %7.3f%% %8.3g %8.3g %8.3g\n",
+                st->dst_name[0] ? st->dst_name : "(unnamed)",
+                st->src0_name[0] ? st->src0_name : "(unnamed)",
+                st->src1_name[0] ? st->src1_name : "(unnamed)",
+            st->s.chunks_total,
+            st->s.chunks_sampled,
+            cover_pct,
+                st->s.count,
+                st->s.min_v,
+                st->s.max_v,
+                mean,
+                std,
+                zero_pct,
+            gt8_pct,
+            p50_abs,
+            p95_abs,
+            p99_abs);
+    }
+
+    fprintf(f, "\n  Focus: q/k/v related outputs\n");
+    fprintf(f, "  %.*s\n", 100, "----------------------------------------------------------------------------------------------------");
+    for (int i = 0; i < n_used; ++i) {
+        const struct ggml_mm_dist_stat * st = used[i];
+        if (!ggml_mm_dist_is_focus(st)) {
+            continue;
+        }
+
+        const double n = (double) st->s.count;
+        const double mean = n > 0 ? st->s.sum / n : 0.0;
+        const double var = n > 0 ? (st->s.sum_sq / n) - mean*mean : 0.0;
+        const double std = var > 0 ? sqrt(var) : 0.0;
+        const double p50_abs = ggml_mm_dist_hist_quantile_abs(&st->s, 0.50);
+        const double p95_abs = ggml_mm_dist_hist_quantile_abs(&st->s, 0.95);
+        const double p99_abs = ggml_mm_dist_hist_quantile_abs(&st->s, 0.99);
+
+        const double cover_pct = st->s.chunks_total > 0 ? 100.0 * (double)st->s.chunks_sampled / (double)st->s.chunks_total : 0.0;
+
+        fprintf(f, "  dst=%s | src0=%s | src1=%s\n",
+                st->dst_name[0] ? st->dst_name : "(unnamed)",
+                st->src0_name[0] ? st->src0_name : "(unnamed)",
+                st->src1_name[0] ? st->src1_name : "(unnamed)");
+        fprintf(f, "    chunks: total=%" PRId64 ", sampled=%" PRId64 ", coverage=%.2f%%\n",
+            st->s.chunks_total, st->s.chunks_sampled, cover_pct);
+        fprintf(f, "    range=[%.6g, %.6g], mean=%.6g, std=%.6g, non_finite=%" PRId64 "\n",
+                st->s.min_v, st->s.max_v, mean, std, st->s.n_non_finite);
+        fprintf(f, "    |x| quantiles: p50=%.6g, p95=%.6g, p99=%.6g\n", p50_abs, p95_abs, p99_abs);
+        fprintf(f, "    outlier rates: |x|>1 %.3f%%, >2 %.3f%%, >4 %.3f%%, >8 %.3f%%, >16 %.3f%%, >32 %.3f%%\n",
+                n > 0 ? 100.0*(double)st->s.n_abs_gt_1/n : 0.0,
+                n > 0 ? 100.0*(double)st->s.n_abs_gt_2/n : 0.0,
+                n > 0 ? 100.0*(double)st->s.n_abs_gt_4/n : 0.0,
+                n > 0 ? 100.0*(double)st->s.n_abs_gt_8/n : 0.0,
+                n > 0 ? 100.0*(double)st->s.n_abs_gt_16/n : 0.0,
+                n > 0 ? 100.0*(double)st->s.n_abs_gt_32/n : 0.0);
+        fprintf(f, "    log2|x| bins (non-zero):");
+        int printed = 0;
+        for (int b = 0; b < GGML_MM_DIST_HIST_BINS; ++b) {
+            if (st->s.hist[b] == 0) continue;
+            if (printed >= 12) break;
+            const int lo = b - 32;
+            fprintf(f, " [%d,%d):%" PRId64, lo, lo + 1, st->s.hist[b]);
+            printed++;
+        }
+        fprintf(f, "\n");
+    }
+
+    {
+        bool layer_used[GGML_MM_DIST_MAX_LAYERS] = { false };
+        struct ggml_mm_dist_local layer_agg[GGML_MM_DIST_MAX_LAYERS];
+        memset(layer_agg, 0, sizeof(layer_agg));
+
+        for (int i = 0; i < n_used; ++i) {
+            const struct ggml_mm_dist_stat * st = used[i];
+            if (!ggml_mm_dist_is_focus(st)) {
+                continue;
+            }
+            const int lid = ggml_mm_dist_extract_layer_id_stat(st);
+            if (lid < 0 || lid >= GGML_MM_DIST_MAX_LAYERS) {
+                continue;
+            }
+            layer_used[lid] = true;
+            ggml_mm_dist_merge_local_stats(&layer_agg[lid], &st->s);
+        }
+
+        fprintf(f, "\n  Layer Aggregate: q/k/v focus\n");
+        fprintf(f, "  %.*s\n", 120, "------------------------------------------------------------------------------------------------------------------------");
+        fprintf(f, "  %8s %8s %8s %7s %12s %11s %11s %11s %11s %11s %11s\n",
+            "layer", "chunks", "sampled", "cover", "samples", "mean", "std", "p50|x|", "p95|x|", "p99|x|", "|x|>8%");
+
+        for (int lid = 0; lid < GGML_MM_DIST_MAX_LAYERS; ++lid) {
+            if (!layer_used[lid]) {
+                continue;
+            }
+            const struct ggml_mm_dist_local * s = &layer_agg[lid];
+            const double n = (double) s->count;
+            const double mean = n > 0 ? s->sum / n : 0.0;
+            const double var = n > 0 ? (s->sum_sq / n) - mean*mean : 0.0;
+            const double std = var > 0 ? sqrt(var) : 0.0;
+            const double p50_abs = ggml_mm_dist_hist_quantile_abs(s, 0.50);
+            const double p95_abs = ggml_mm_dist_hist_quantile_abs(s, 0.95);
+            const double p99_abs = ggml_mm_dist_hist_quantile_abs(s, 0.99);
+                const double gt8_pct = n > 0 ? 100.0 * (double)s->n_abs_gt_8 / n : 0.0;
+                const double cover_pct = s->chunks_total > 0 ? 100.0 * (double)s->chunks_sampled / (double)s->chunks_total : 0.0;
+
+                fprintf(f, "  %8d %8" PRId64 " %8" PRId64 " %6.2f%% %12" PRId64 " %11.4g %11.4g %11.3g %11.3g %11.3g %10.3f%%\n",
+                    lid,
+                    s->chunks_total,
+                    s->chunks_sampled,
+                    cover_pct,
+                    s->count,
+                    mean,
+                    std,
+                    p50_abs,
+                    p95_abs,
+                    p99_abs,
+                    gt8_pct);
+        }
+    }
+
+    {
+        struct ggml_mm_dist_local op_agg[8];
+        bool op_used[8] = { false };
+        memset(op_agg, 0, sizeof(op_agg));
+
+        for (int i = 0; i < n_used; ++i) {
+            const struct ggml_mm_dist_stat * st = used[i];
+            if (!ggml_mm_dist_is_focus(st)) {
+                continue;
+            }
+            const int cid = ggml_mm_dist_op_class_id(st);
+            if (cid < 0 || cid >= 8) {
+                continue;
+            }
+            op_used[cid] = true;
+            ggml_mm_dist_merge_local_stats(&op_agg[cid], &st->s);
+        }
+
+        fprintf(f, "\n  Operator Aggregate: q/k/v/qk/ov focus\n");
+        fprintf(f, "  %.*s\n", 120, "------------------------------------------------------------------------------------------------------------------------");
+        fprintf(f, "  %10s %8s %8s %7s %12s %11s %11s %11s %11s %11s %11s\n",
+            "op", "chunks", "sampled", "cover", "samples", "mean", "std", "p50|x|", "p95|x|", "p99|x|", "|x|>8%");
+
+        for (int cid = 0; cid < 8; ++cid) {
+            if (!op_used[cid]) {
+                continue;
+            }
+            const struct ggml_mm_dist_local * s = &op_agg[cid];
+            const double n = (double) s->count;
+            const double mean = n > 0 ? s->sum / n : 0.0;
+            const double var = n > 0 ? (s->sum_sq / n) - mean*mean : 0.0;
+            const double std = var > 0 ? sqrt(var) : 0.0;
+            const double p50_abs = ggml_mm_dist_hist_quantile_abs(s, 0.50);
+            const double p95_abs = ggml_mm_dist_hist_quantile_abs(s, 0.95);
+            const double p99_abs = ggml_mm_dist_hist_quantile_abs(s, 0.99);
+                const double gt8_pct = n > 0 ? 100.0 * (double)s->n_abs_gt_8 / n : 0.0;
+                const double cover_pct = s->chunks_total > 0 ? 100.0 * (double)s->chunks_sampled / (double)s->chunks_total : 0.0;
+
+                fprintf(f, "  %10s %8" PRId64 " %8" PRId64 " %6.2f%% %12" PRId64 " %11.4g %11.4g %11.3g %11.3g %11.3g %10.3f%%\n",
+                    ggml_mm_dist_op_class_name(cid),
+                    s->chunks_total,
+                    s->chunks_sampled,
+                    cover_pct,
+                    s->count,
+                    mean,
+                    std,
+                    p50_abs,
+                    p95_abs,
+                    p99_abs,
+                    gt8_pct);
+        }
+    }
+
+    fprintf(f, "\n================================================================================\n");
+    fclose(f);
+    ggml_mm_dist_lock_release();
+}
+
+static bool ggml_mm_dist_should_collect(void) {
+    if (!ggml_mm_dist_get_enabled()) {
+        return false;
+    }
+    const int rate = ggml_mm_dist_get_sample_rate();
+    const int c = atomic_fetch_add_explicit(&g_mm_dist_chunk_counter, 1, memory_order_relaxed) + 1;
+    return (rate <= 1) || (c % rate == 0);
+}
+
 // ggml_compute_forward_mul_mat
 
 static void ggml_compute_forward_mul_mat_one_chunk(
@@ -1254,6 +1867,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
 
+    const bool dist_enabled = ggml_mm_dist_get_enabled();
+    const bool collect_dist = dist_enabled && ggml_mm_dist_should_collect();
+    struct ggml_mm_dist_local dist_local = {0};
+    if (dist_enabled) {
+        dist_local.chunks_total = 1;
+        dist_local.chunks_sampled = collect_dist ? 1 : 0;
+    }
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
@@ -1290,10 +1911,19 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    const int64_t n_copy = (MIN(iir0 + blck_0, ir0_end) - iir0);
+                    const float * src_vals = tmp + (cn * 16);
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], src_vals, n_copy * sizeof(float));
+                    if (collect_dist) {
+                        ggml_mm_dist_accumulate_values(&dist_local, src_vals, n_copy);
+                    }
                 }
             }
         }
+    }
+
+    if (dist_enabled) {
+        ggml_mm_dist_merge_local(dst->name, src0->name, src1->name, &dist_local);
     }
 }
 
