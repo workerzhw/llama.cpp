@@ -1,4 +1,4 @@
-// Vectorized functions for fundamental operations
+﻿// Vectorized functions for fundamental operations
 
 #pragma once
 
@@ -34,10 +34,10 @@ typedef double ggml_float;
 // ---------------------------------------------------------------------------
 // FP8(E4M3) block-quant simulation helpers
 //
-// 目标：模拟实际工程的“每 block 点一个 scale(int8) + FP8(E4M3)”。
+// 目标：模拟实际工程的“每 block 点一个 scale + FP8(E4M3)”。
 //  - FP8: E4M3, 不考虑 NaN/Inf
 //  - 溢出：饱和到最大有限值（max finite，工程约定为 480）
-//  - 下溢：低于最小非规格数（min subnormal）才清零；支持非规格数
+//  - 下溢：低于最小非规格数（min subnormal * 0.5）才清零；支持非规格数
 //  - 舍入：RNE (round-to-nearest-even)
 //
 // 注意：量化必须作用在“原始高精度数值(逻辑值)”上，而不是已被 BF16 截断后的值。
@@ -54,6 +54,21 @@ typedef double ggml_float;
 #define GGML_SIM_FP8E4M3_BLOCK 128
 #endif
 
+// ---------------------------------------------------------------------------
+// Scale type selection（编译期 -DGGML_SIM_FP8E4M3_SCALE_TYPE=0/1 覆盖）
+//
+//   0 = int8 power-of-2 scale（当前默认）
+//       每个 block 计算 k = ceil(log2(amax / max_finite))，存为 int8_t
+//       缩放因子 = 2^k （整数幂，快速 ldexpf）
+//
+//   1 = bf16 exact scale
+//       每个 block 计算 scale = amax / max_finite，存为 ggml_bf16_t
+//       缩放因子 = bf16_to_f32(scale) （精确比值，粒度更细）
+// ---------------------------------------------------------------------------
+#ifndef GGML_SIM_FP8E4M3_SCALE_TYPE
+#define GGML_SIM_FP8E4M3_SCALE_TYPE 0
+#endif
+
 // 分别控制 src0/src1 是否做 FP8+scale 回放
 #ifndef GGML_SIM_FP8E4M3_APPLY_SRC0
 #define GGML_SIM_FP8E4M3_APPLY_SRC0 1
@@ -67,14 +82,16 @@ typedef double ggml_float;
 extern "C" {
 #endif
 
-// 将输入 FP32 做“FP8(E4M3)+scale(int8)”的块量化，再解量化回 FP32。
-// scales_out 可为 NULL；若非空，则写出每块的 k（表示 2^k）。
+// 将输入 FP32 做“FP8(E4M3)+scale”的块量化，再解量化回 FP32。
+// scales_out 可为 NULL；若非空：
+//   SCALE_TYPE==0 时写出 int8_t k（表示 2^k）；
+//   SCALE_TYPE==1 时写出 ggml_bf16_t scale（精确比值）。
 void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         const float * in,
         float       * out,
         int           n,
         int           block,
-        int8_t      * scales_out,
+        void        * scales_out,
         int           src_id,
         const char  * layer_name);
 
@@ -84,7 +101,7 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         ggml_bf16_t     * out,
         int               n,
         int               block,
-        int8_t          * scales_out,
+        void            * scales_out,
         int               src_id,
         const char      * layer_name);
 

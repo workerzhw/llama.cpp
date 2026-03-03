@@ -148,12 +148,33 @@ static inline int8_t ggml_choose_k_for_block(const float * in, int n) {
     return (int8_t)k;
 }
 
+// ---------------------------------------------------------------------------
+// BF16 exact scale: scale = bf16(amax / max_finite)
+// Returns the scale factor as a float (already rounded to BF16 precision).
+// When amax == 0, returns 0 (the block is all-zero, inv should not be used).
+// ---------------------------------------------------------------------------
+static inline float ggml_choose_scale_for_block_bf16(const float * in, int n) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float ax = fabsf(in[i]);
+        if (ax > amax) amax = ax;
+    }
+    if (amax == 0.0f) {
+        return 0.0f;
+    }
+    const float max_f = ggml_fp8e4m3_max_finite(); // 480
+    float scale = amax / max_f;
+    // Round to BF16 precision
+    ggml_bf16_t scale_bf16 = GGML_FP32_TO_BF16(scale);
+    return GGML_BF16_TO_FP32(scale_bf16);
+}
+
 extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         const float * in,
         float       * out,
         int           n,
         int           block,
-        int8_t      * scales_out,
+        void        * scales_out,
         int           src_id,
         const char  * layer_name);
 
@@ -162,7 +183,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         ggml_bf16_t     * out,
         int               n,
         int               block,
-        int8_t          * scales_out,
+        void            * scales_out,
         int               src_id,
         const char      * layer_name);
 
@@ -238,20 +259,30 @@ static void fp8_stats_atexit_handler(void) {
 }
 
 // Accumulate per-element stats for one block into a LOCAL accumulator (no lock).
+// inv_scale = reciprocal of the block scale factor (maps original values into FP8 range).
+// For int8 pow2 mode: inv_scale = 2^(-k).
+// For bf16 exact mode: inv_scale = max_finite / amax.
+// k_for_hist = integer exponent for scale_hist binning (floor(log2(scale_factor))).
 static inline void fp8_accumulate_block_stats_local(
         FP8SimSrcStats & local,
         const float * original,
         const float * dequant,
         int           len,
-        int8_t        k)
+        float         inv_scale,
+        int           k_for_hist)
 {
     const float max_f    = ggml_fp8e4m3_max_finite();
     const float min_sub  = ggml_fp8e4m3_min_subnormal();
     const float min_norm = ldexpf(1.0f, -6);
-    const float inv      = ldexpf(1.0f, -k);
+    const float inv      = inv_scale;
 
     local.total_blocks += 1;
-    local.scale_hist[(int)k + 128] += 1;
+    {
+        int bin = k_for_hist + 128;
+        if (bin < 0)   bin = 0;
+        if (bin > 255) bin = 255;
+        local.scale_hist[bin] += 1;
+    }
 
     for (int j = 0; j < len; ++j) {
         const float x  = original[j];
@@ -354,7 +385,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         float       * out,
         int           n,
         int           block,
-        int8_t      * scales_out,
+        void        * scales_out,
         int           src_id,
         const char  * layer_name) {
     if (block <= 0) {
@@ -371,18 +402,35 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
 
     for (int i = 0; i < n; i += block) {
         const int len = (i + block <= n) ? block : (n - i);
-        const int8_t k = ggml_choose_k_for_block(in + i, len);
+
+#if GGML_SIM_FP8E4M3_SCALE_TYPE == 0
+        // --- int8 power-of-2 scale ---
+        const int8_t k   = ggml_choose_k_for_block(in + i, len);
+        const float  inv = ldexpf(1.0f, -k);
+        const float  mul = ldexpf(1.0f,  k);
+        const int k_hist = (int)k;
         if (scales_out) {
-            scales_out[i / block] = k;
+            ((int8_t *)scales_out)[i / block] = k;
         }
-        const float inv = ldexpf(1.0f, -k);
-        const float mul = ldexpf(1.0f,  k);
+#elif GGML_SIM_FP8E4M3_SCALE_TYPE == 1
+        // --- bf16 exact scale ---
+        const float  scale_f = ggml_choose_scale_for_block_bf16(in + i, len);
+        const float  inv = (scale_f > 0.0f) ? (1.0f / scale_f) : 0.0f;
+        const float  mul = scale_f;
+        const int k_hist = (scale_f > 0.0f) ? (int)floorf(log2f(scale_f)) : 0;
+        if (scales_out) {
+            ((ggml_bf16_t *)scales_out)[i / block] = GGML_FP32_TO_BF16(scale_f);
+        }
+#else
+        #error "GGML_SIM_FP8E4M3_SCALE_TYPE must be 0 or 1"
+#endif
+
         for (int j = 0; j < len; ++j) {
             const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
             out[i + j] = q * mul;
         }
         if (collect) {
-            fp8_accumulate_block_stats_local(local, in + i, out + i, len, k);
+            fp8_accumulate_block_stats_local(local, in + i, out + i, len, inv, k_hist);
         }
     }
 
@@ -396,7 +444,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         ggml_bf16_t     * out,
         int               n,
         int               block,
-        int8_t          * scales_out,
+        void            * scales_out,
         int               src_id,
         const char      * layer_name) {
     if (block <= 0) {
@@ -422,12 +470,29 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
 
     for (int i = 0; i < n; i += block) {
         const int len = (i + block <= n) ? block : (n - i);
-        const int8_t k = ggml_choose_k_for_block(in + i, len);
+
+#if GGML_SIM_FP8E4M3_SCALE_TYPE == 0
+        // --- int8 power-of-2 scale ---
+        const int8_t k   = ggml_choose_k_for_block(in + i, len);
+        const float  inv = ldexpf(1.0f, -k);
+        const float  mul = ldexpf(1.0f,  k);
+        const int k_hist = (int)k;
         if (scales_out) {
-            scales_out[i / block] = k;
+            ((int8_t *)scales_out)[i / block] = k;
         }
-        const float inv = ldexpf(1.0f, -k);
-        const float mul = ldexpf(1.0f,  k);
+#elif GGML_SIM_FP8E4M3_SCALE_TYPE == 1
+        // --- bf16 exact scale ---
+        const float  scale_f = ggml_choose_scale_for_block_bf16(in + i, len);
+        const float  inv = (scale_f > 0.0f) ? (1.0f / scale_f) : 0.0f;
+        const float  mul = scale_f;
+        const int k_hist = (scale_f > 0.0f) ? (int)floorf(log2f(scale_f)) : 0;
+        if (scales_out) {
+            ((ggml_bf16_t *)scales_out)[i / block] = GGML_FP32_TO_BF16(scale_f);
+        }
+#else
+        #error "GGML_SIM_FP8E4M3_SCALE_TYPE must be 0 or 1"
+#endif
+
         for (int j = 0; j < len; ++j) {
             const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
             const float val = q * mul;
@@ -437,7 +502,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
             }
         }
         if (collect) {
-            fp8_accumulate_block_stats_local(local, in + i, dq_buf + i, len, k);
+            fp8_accumulate_block_stats_local(local, in + i, dq_buf + i, len, inv, k_hist);
         }
     }
 
@@ -508,7 +573,11 @@ static void fp8_write_src_section(FILE * f, const char * name, const FP8SimSrcSt
     fprintf(f, "\n");
 
     // Scale histogram – show nonzero bins grouped
-    fprintf(f, "    Scale exponent (k=log2) distribution:\n");
+#if GGML_SIM_FP8E4M3_SCALE_TYPE == 0
+    fprintf(f, "    Scale exponent (k=log2, int8 pow2 mode) distribution:\n");
+#else
+    fprintf(f, "    Scale exponent (k=floor(log2(scale)), bf16 exact mode) distribution:\n");
+#endif
     // Find range of nonzero bins
     int kmin = 255, kmax = 0;
     int64_t total_blocks = 0;
@@ -571,6 +640,11 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "    Max finite value     : 480.0\n");
         fprintf(f, "    Min subnormal value  : 2^-9 = %.6f\n", ldexpf(1.0f, -9));
         fprintf(f, "    Block size           : %d\n", GGML_SIM_FP8E4M3_BLOCK);
+#if GGML_SIM_FP8E4M3_SCALE_TYPE == 0
+        fprintf(f, "    Scale type           : int8 power-of-2 (scale = 2^k)\n");
+#elif GGML_SIM_FP8E4M3_SCALE_TYPE == 1
+        fprintf(f, "    Scale type           : bf16 exact (scale = amax / max_finite)\n");
+#endif
         fprintf(f, "    Rounding             : RNE (round to nearest even)\n");
         fprintf(f, "    Applied to src0 (weights)     : %s\n", GGML_SIM_FP8E4M3_APPLY_SRC0 ? "YES" : "NO");
         fprintf(f, "    Applied to src1 (activations) : %s\n", GGML_SIM_FP8E4M3_APPLY_SRC1 ? "YES" : "NO");
