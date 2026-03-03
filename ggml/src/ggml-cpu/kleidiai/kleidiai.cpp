@@ -727,6 +727,13 @@ static size_t ggml_backend_cpu_kleidiai_buffer_type_get_alloc_size(ggml_backend_
 namespace ggml::cpu::kleidiai {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+#if GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0
+        // q4_0 KleidiAI path does not apply FP8 simulation to src0, while the
+        // generic path does. Reject this fast path to avoid semantic mismatch.
+        GGML_UNUSED(op);
+        return false;
+#endif
+
         if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_GET_ROWS) &&
             op->src[0]->type == GGML_TYPE_Q4_0 &&
             op->src[0]->buffer &&
