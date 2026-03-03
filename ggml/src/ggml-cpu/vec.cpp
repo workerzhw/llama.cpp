@@ -128,21 +128,27 @@ static inline int8_t ggml_choose_k_for_block(const float * in, int n) {
     if (amax == 0.0f) {
         return 0;
     }
-    // We want to choose k such that  amax / 2^k  is as close to max_finite
-    // as possible WITHOUT exceeding it.
+    // ---- exponent-alignment approach ----
+    // Extract the unbiased exponent of amax (i.e. floor(log2(|amax|))):
+    //   amax = m * 2^exp_max,  1 <= m < 2
     //
-    //   amax / 2^k <= max_finite   =>   k >= log2(amax / max_finite)
+    // FP8 E4M3 (bias=7, no NaN/Inf) max exponent code = 15 → unbiased = 8.
+    //   max_finite = 1.875 * 2^8 = 480
     //
-    // To maximise FP8 utilisation (scale UP small values, scale DOWN large
-    // values) we pick the smallest integer k that satisfies the constraint:
+    // We align exp_max to the FP8 max exponent:
+    //   k = exp_max - fp8_max_exp
     //
-    //   k = ceil(log2(amax / max_finite))
+    // After scaling by 2^(-k), amax falls into [2^8, 2^9).
+    // Values in (480, 512) will saturate to 480 — this is a small, bounded
+    // clipping that trades negligible saturation for better average precision
+    // (avoids wasting a full power-of-2 headroom as the old ceil-ratio method
+    // would).
     //
-    // When amax < max_finite this yields a NEGATIVE k, meaning we multiply
-    // the values by 2^|k| (scale up) before quantising, then divide back
-    // after dequantising -- dramatically improving precision for small weights.
-    const float max_f = ggml_fp8e4m3_max_finite(); // 480
-    int k = (int)ceilf(log2f(amax / max_f));
+    // When amax < 2^8 this yields a NEGATIVE k, meaning we multiply the
+    // values by 2^|k| (scale up) before quantising, improving precision.
+    const int fp8_max_exp = 8;
+    int exp_max = ilogbf(amax);
+    int k = exp_max - fp8_max_exp;
     if (k < -128) k = -128;
     if (k > 127)  k = 127;
     return (int8_t)k;
