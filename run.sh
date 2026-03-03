@@ -14,15 +14,18 @@ BATCH="${BATCH:-2048}"
 UBATCH="${UBATCH:-512}"
 STRIDE="${STRIDE:-0}"
 
+source ~/miniforge3/bin/activate
 rm -rf build
 mkdir -p "${OUT_DIR}"
 
 cmake -B build \
-  -DCMAKE_C_FLAGS="-DGGML_SIM_FP8E4M3=1 -DGGML_SIM_FP8E4M3_APPLY_SRC0=1 -DGGML_SIM_FP8E4M3_APPLY_SRC1=1" \
-  -DCMAKE_CXX_FLAGS="-DGGML_SIM_FP8E4M3=1 -DGGML_SIM_FP8E4M3_APPLY_SRC0=1 -DGGML_SIM_FP8E4M3_APPLY_SRC1=1" \
+  -DCMAKE_C_COMPILER=x86_64-conda-linux-gnu-gcc \
+  -DCMAKE_CXX_COMPILER=x86_64-conda-linux-gnu-g++ \
+  -DCMAKE_C_FLAGS="-DGGML_SIM_FP8E4M3=1 -DGGML_SIM_FP8E4M3_APPLY_SRC0=1 -DGGML_SIM_FP8E4M3_APPLY_SRC1=1 -DGGML_SIM_FP8E4M3_SCALE_TYPE=0 -DGGML_SIM_FP8E4M3_BLOCK=128" \
+  -DCMAKE_CXX_FLAGS="-DGGML_SIM_FP8E4M3=1 -DGGML_SIM_FP8E4M3_APPLY_SRC0=1 -DGGML_SIM_FP8E4M3_APPLY_SRC1=1 -DGGML_SIM_FP8E4M3_SCALE_TYPE=0 -DGGML_SIM_FP8E4M3_BLOCK=128" \
   -DLLAMA_CURL=OFF
 
-cmake --build build --config Release --target llama-cli llama-perplexity -j "${THREADS}"
+cmake --build build --config Release --target llama-perplexity -j "${THREADS}"
 
 export FP8_SIM_STATS_SAMPLE=100
 export GGML_MATMUL_DIST=1
@@ -36,19 +39,19 @@ PPL_LOG="${OUT_DIR}/ppl.log"
 FP8_CLI_LOG="${OUT_DIR}/fp8_sim_analysis_cli.log"
 FP8_PPL_LOG="${OUT_DIR}/fp8_sim_analysis_ppl.log"
 
-./build/bin/llama-cli \
-  -m "${MODEL}" \
-  -p "${PROMPT}" \
-  -c "${CTX}" \
-  -t "${THREADS}" \
-  -n "${N_PREDICT}" \
-  --seq-state-out "${SEQ_BIN}" \
-  --seq-state-out-id "${SEQ_ID}" \
-  | tee "${RUN_LOG}"
+# ./build/bin/llama-cli \
+#   -m "${MODEL}" \
+#   -p "${PROMPT}" \
+#   -c "${CTX}" \
+#   -t "${THREADS}" \
+#   -n "${N_PREDICT}" \
+#   --seq-state-out "${SEQ_BIN}" \
+#   --seq-state-out-id "${SEQ_ID}" \
+#   | tee "${RUN_LOG}"
 
-if [ -f fp8_sim_analysis.log ]; then
-  mv -f fp8_sim_analysis.log "${FP8_CLI_LOG}"
-fi
+# if [ -f fp8_sim_analysis.log ]; then
+#   mv -f fp8_sim_analysis.log "${FP8_CLI_LOG}"
+# fi
 
 ./build/bin/llama-perplexity \
   -m "${MODEL}" \
@@ -58,59 +61,16 @@ fi
   -ub "${UBATCH}" \
   -t "${THREADS}" \
   --ppl-stride "${STRIDE}" \
+  --seq-state-out "${SEQ_BIN}" \
+  --seq-state-out-id "${SEQ_ID}" \
   | tee "${PPL_LOG}"
 
 if [ -f fp8_sim_analysis.log ]; then
   mv -f fp8_sim_analysis.log "${FP8_PPL_LOG}"
 fi
 
-if command -v xxd >/dev/null 2>&1; then
-  {
-    echo "=== KV SEQ STATE REPORT ==="
-    echo "timestamp      : $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "model          : ${MODEL}"
-    echo "seq_id         : ${SEQ_ID}"
-    echo "ctx            : ${CTX}"
-    echo "threads        : ${THREADS}"
-    echo "n_predict      : ${N_PREDICT}"
-    echo "run_log        : ${RUN_LOG}"
-    echo "matmul_log     : ${OUT_DIR}/matmul.log"
-    echo "bin_file       : ${SEQ_BIN}"
-    echo "bin_size_bytes : $(wc -c < "${SEQ_BIN}")"
-    if command -v sha256sum >/dev/null 2>&1; then
-      echo "sha256         : $(sha256sum "${SEQ_BIN}" | awk '{print $1}')"
-    fi
-    echo
-    echo "=== HEXDUMP (FULL, 16 BYTES PER LINE) ==="
-    xxd -g 1 -c 16 "${SEQ_BIN}"
-  } > "${SEQ_TXT}"
-else
-  {
-    echo "=== KV SEQ STATE REPORT ==="
-    echo "timestamp      : $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "model          : ${MODEL}"
-    echo "seq_id         : ${SEQ_ID}"
-    echo "ctx            : ${CTX}"
-    echo "threads        : ${THREADS}"
-    echo "n_predict      : ${N_PREDICT}"
-    echo "run_log        : ${RUN_LOG}"
-    echo "matmul_log     : ${OUT_DIR}/matmul.log"
-    echo "bin_file       : ${SEQ_BIN}"
-    echo "bin_size_bytes : $(wc -c < "${SEQ_BIN}")"
-    if command -v sha256sum >/dev/null 2>&1; then
-      echo "sha256         : $(sha256sum "${SEQ_BIN}" | awk '{print $1}')"
-    fi
-    echo
-    echo "=== HEXDUMP (FULL) ==="
-    od -An -tx1 -v "${SEQ_BIN}"
-  } > "${SEQ_TXT}"
-fi
-
 echo "done."
 echo "seq state bin: ${SEQ_BIN}"
-echo "seq state txt: ${SEQ_TXT}"
-echo "run log      : ${RUN_LOG}"
 echo "ppl log      : ${PPL_LOG}"
 echo "matmul log   : ${OUT_DIR}/matmul.log"
-echo "fp8 cli log  : ${FP8_CLI_LOG}"
 echo "fp8 ppl log  : ${FP8_PPL_LOG}"

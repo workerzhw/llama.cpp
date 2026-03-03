@@ -638,6 +638,30 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             }
         }
 
+        // save last chunk's KV cache sequence state if requested
+        if (!params.path_seq_state_out.empty() && (i + n_seq_batch >= n_chunk)) {
+            for (int seq = 0; seq < n_seq_batch; seq++) {
+                const int chunk_id = i + seq;
+                if (chunk_id + 1 != n_chunk) {
+                    continue; // only save the very last chunk
+                }
+
+                const size_t nwrite = llama_state_seq_save_file(
+                    ctx,
+                    params.path_seq_state_out.c_str(),
+                    seq,
+                    tokens.data() + chunk_id * n_ctx,
+                    n_ctx);
+
+                if (nwrite == 0) {
+                    LOG_ERR("%s: failed to save seq-state to '%s'\n", __func__, params.path_seq_state_out.c_str());
+                } else {
+                    LOG_INF("%s: saved KV cache (last chunk %d/%d, seq %d, %d cells, bytes = %zu) -> %s\n",
+                            __func__, chunk_id + 1, n_chunk, seq, n_ctx, nwrite, params.path_seq_state_out.c_str());
+                }
+            }
+        }
+
         logits.clear();
     }
     LOG("\n");

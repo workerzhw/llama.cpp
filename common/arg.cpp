@@ -1128,14 +1128,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.path_seq_state_out = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--seq-state-out-id"}, "N",
         "source sequence ID for --seq-state-out (default: 0)",
         [](common_params & params, int value) {
             params.seq_state_out_id = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--prompt-cache-all"},
         "if specified, saves user input and generations to cache as well\n",
