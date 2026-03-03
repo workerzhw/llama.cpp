@@ -62,9 +62,9 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     float ax = fabsf(x);
 
-    // underflow to 0 below min subnormal
+    // underflow to 0 below half of min subnormal (RNE midpoint between 0 and min_sub)
     const float min_sub = ggml_fp8e4m3_min_subnormal();
-    if (ax < min_sub) {
+    if (ax < min_sub * 0.5f) {
         return 0.0f;
     }
 
@@ -84,10 +84,7 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
         e -= 1;
         // exp field = e + bias
         int ef = e + 7;
-        if (ef <= 0) {
-            // should not happen because ax>=min_norm
-            ef = 0;
-        }
+        GGML_ASSERT(ef >= 1 && "ef <= 0 should not happen because ax >= min_norm");
         if (ef > 15) {
             return sign * max_f;
         }
@@ -212,18 +209,21 @@ static std::unordered_map<std::string, FP8SimSrcStats> g_fp8_layer_stats[3]; // 
 static std::mutex     g_fp8_stats_mtx;
 static bool           g_fp8_atexit_registered = false;
 static std::atomic<int64_t> g_fp8_call_counter{0}; // global call counter for sampling
-static int g_fp8_sample_rate = -1; // -1 = uninitialized; 0 = disabled; N = collect every Nth call
+static std::atomic<int> g_fp8_sample_rate{-1}; // -1 = uninitialized; 0 = disabled; N = collect every Nth call
 
 static int fp8_get_sample_rate(void) {
-    if (g_fp8_sample_rate >= 0) return g_fp8_sample_rate;
+    int rate = g_fp8_sample_rate.load(std::memory_order_relaxed);
+    if (rate >= 0) return rate;
     const char * env = getenv("FP8_SIM_STATS_SAMPLE");
     if (env) {
-        g_fp8_sample_rate = atoi(env);
-        if (g_fp8_sample_rate < 0) g_fp8_sample_rate = 0;
+        rate = atoi(env);
+        if (rate < 0) rate = 0;
     } else {
-        g_fp8_sample_rate = 100; // default: collect 1 in 100
+        rate = 100; // default: collect 1 in 100
     }
-    return g_fp8_sample_rate;
+    // Benign race: multiple threads may store the same value
+    g_fp8_sample_rate.store(rate, std::memory_order_relaxed);
+    return rate;
 }
 
 static inline int fp8_src_slot(int src_id) {

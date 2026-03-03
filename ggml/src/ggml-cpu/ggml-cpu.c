@@ -2006,9 +2006,10 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     #endif
 
     // attempt to reduce false-sharing (does not seem to make a difference)
-    // 16 * 2, accounting for mmla kernels
+    // blck_0(=16) * 2, accounting for mmla kernels
     float tmp[32];
     const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
+    enum { FP8_QDQ_TMP_CAP = (GGML_SIM_FP8E4M3_BLOCK > 16 ? GGML_SIM_FP8E4M3_BLOCK : 16) };
 
     const bool dist_enabled = ggml_mm_dist_get_enabled();
     const bool collect_dist = dist_enabled && ggml_mm_dist_should_collect();
@@ -2053,14 +2054,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * (int64_t) src0_nb01, (num_rows_per_vec_dot > 1 ? src0_nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? (size_t) blck_0 : 0), src0_row + ir0 * (int64_t) src0_nb01, (num_rows_per_vec_dot > 1 ? src0_nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
                     const int64_t n_copy = (MIN(iir0 + blck_0, ir0_end) - iir0);
-                    const float * src_vals = tmp + (cn * 16);
+                    const float * src_vals = tmp + (cn * (int) blck_0);
                     const float * vals_to_store = src_vals;
-                    float qdq_vals[GGML_SIM_FP8E4M3_BLOCK];
+                    float qdq_vals[FP8_QDQ_TMP_CAP];
                     if (use_fp8sim_out) {
                         ggml_sim_fp8e4m3_block_quant_dequant_f32(
                             src_vals,
@@ -2216,6 +2217,14 @@ void ggml_compute_forward_mul_mat(
                     } else {
                         // Generic path: BF16 / F16 / (rare) quantized activation
                         float tmp_f32[GGML_SIM_FP8E4M3_BLOCK];
+
+                        // Pre-dequantize quantized rows once outside the loop (avoid alloca in loop)
+                        float * quant_row = NULL;
+                        if (ggml_is_quantized(src1->type)) {
+                            quant_row = (float *) alloca((size_t) ne10 * sizeof(float));
+                            ggml_dequantize_row_to_f32(src1->type, src1_row_in, quant_row, ne10);
+                        }
+
                         for (int64_t b = b_start; b < b_end; ++b) {
                             const int off = (int) (b * block);
                             const int len = (off + block <= ne10) ? block : (int) (ne10 - off);
@@ -2228,10 +2237,7 @@ void ggml_compute_forward_mul_mat(
                                 const ggml_fp16_t * in = (const ggml_fp16_t *) (src1_row_in);
                                 for (int i = 0; i < len; ++i) tmp_f32[i] = GGML_FP16_TO_FP32(in[off + i]);
                             } else if (ggml_is_quantized(src1->type)) {
-                                // dequantize the whole row segment (slow, but very uncommon for activations)
-                                float * tmp_big = (float *) alloca((size_t) ne10 * sizeof(float));
-                                ggml_dequantize_row_to_f32(src1->type, src1_row_in, tmp_big, ne10);
-                                for (int i = 0; i < len; ++i) tmp_f32[i] = tmp_big[off + i];
+                                for (int i = 0; i < len; ++i) tmp_f32[i] = quant_row[off + i];
                             } else {
                                 GGML_ABORT("mul_mat: src1 cast-to-bf16: unsupported src1->type=%s", ggml_type_name(src1->type));
                             }
@@ -2504,7 +2510,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
                 const int64_t n_copy = (MIN(iir0 + blck_0, ir0_end) - iir0);
                 if (use_fp8sim_out) {
-                    float qdq_vals[GGML_SIM_FP8E4M3_BLOCK];
+                    enum { FP8_QDQ_TMP_CAP = (GGML_SIM_FP8E4M3_BLOCK > 16 ? GGML_SIM_FP8E4M3_BLOCK : 16) };
+                    float qdq_vals[FP8_QDQ_TMP_CAP];
                     ggml_sim_fp8e4m3_block_quant_dequant_f32(
                         tmp,
                         qdq_vals,
@@ -2626,6 +2633,14 @@ static void ggml_compute_forward_mul_mat_id(
                         }
                     } else {
                         float tmp_f32[GGML_SIM_FP8E4M3_BLOCK];
+
+                        // Pre-dequantize quantized rows once outside the loop (avoid alloca in loop)
+                        float * quant_row = NULL;
+                        if (ggml_is_quantized(src1->type)) {
+                            quant_row = (float *) alloca((size_t) ne10 * sizeof(float));
+                            ggml_dequantize_row_to_f32(src1->type, src1_row_in, quant_row, ne10);
+                        }
+
                         for (int64_t b = b_start; b < b_end; ++b) {
                             const int off = (int) (b * block);
                             const int len = (off + block <= ne10) ? block : (int) (ne10 - off);
@@ -2637,9 +2652,7 @@ static void ggml_compute_forward_mul_mat_id(
                                 const ggml_fp16_t * in = (const ggml_fp16_t *) (src1_row_in);
                                 for (int i = 0; i < len; ++i) tmp_f32[i] = GGML_FP16_TO_FP32(in[off + i]);
                             } else if (ggml_is_quantized(src1->type)) {
-                                float * tmp_big = (float *) alloca((size_t) ne10 * sizeof(float));
-                                ggml_dequantize_row_to_f32(src1->type, src1_row_in, tmp_big, ne10);
-                                for (int i = 0; i < len; ++i) tmp_f32[i] = tmp_big[off + i];
+                                for (int i = 0; i < len; ++i) tmp_f32[i] = quant_row[off + i];
                             } else {
                                 GGML_ABORT("mul_mat_id: src1 cast-to-bf16: unsupported src1->type=%s", ggml_type_name(src1->type));
                             }
