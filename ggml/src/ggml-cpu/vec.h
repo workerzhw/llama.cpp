@@ -78,6 +78,31 @@ typedef double ggml_float;
 #define GGML_SIM_FP8E4M3_APPLY_SRC1 1
 #endif
 
+// Output simulation mode for GEMM/GEMV results before storing F32:
+//   0 = keep existing FP8(E4M3) block QDQ behavior (gated by GGML_SIM_FP8E4M3)
+//   1 = round to BF16 then convert back to F32
+#ifndef GGML_SIM_MATMUL_OUT_MODE
+#define GGML_SIM_MATMUL_OUT_MODE 0
+#endif
+
+#define GGML_SIM_MATMUL_OUT_MODE_FP8E4M3 0
+#define GGML_SIM_MATMUL_OUT_MODE_BF16    1
+
+#if GGML_SIM_MATMUL_OUT_MODE != GGML_SIM_MATMUL_OUT_MODE_FP8E4M3 && \
+    GGML_SIM_MATMUL_OUT_MODE != GGML_SIM_MATMUL_OUT_MODE_BF16
+#error "GGML_SIM_MATMUL_OUT_MODE must be 0 (FP8E4M3) or 1 (BF16)"
+#endif
+
+static inline float ggml_sim_bf16_roundtrip_f32(float x) {
+    return GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x));
+}
+
+static inline void ggml_sim_bf16_roundtrip_f32_array(const float * in, float * out, int n) {
+    for (int i = 0; i < n; ++i) {
+        out[i] = ggml_sim_bf16_roundtrip_f32(in[i]);
+    }
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif

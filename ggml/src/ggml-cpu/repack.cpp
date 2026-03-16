@@ -1611,28 +1611,36 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const void * src1_wdata      = params->wdata;
         const size_t src1_col_stride = ggml_row_size(PARAM_TYPE, ne10);
-        const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
+        const bool use_fp8sim_out =
+            (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
+        const bool use_bf16sim_out =
+            (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_BF16);
+        const bool use_out_sim = use_fp8sim_out || use_bf16sim_out;
         const int64_t n_out = src0_end - src0_start;
-        std::vector<float> fp8sim_out;
-        std::vector<float> fp8sim_pre;
-        if (use_fp8sim_out) {
-            fp8sim_out.resize((size_t) n_out);
-            fp8sim_pre.resize((size_t) n_out);
+        std::vector<float> out_sim_vals;
+        std::vector<float> out_pre_vals;
+        if (use_out_sim) {
+            out_sim_vals.resize((size_t) n_out);
+            out_pre_vals.resize((size_t) n_out);
         }
 
         auto qdq_row_if_needed = [&](float * row_ptr) {
-            if (!use_fp8sim_out || n_out <= 0) {
+            if (!use_out_sim || n_out <= 0) {
                 return;
             }
-            ggml_sim_fp8e4m3_block_quant_dequant_f32(
-                row_ptr,
-                fp8sim_out.data(),
-                (int) n_out,
-                GGML_SIM_FP8E4M3_BLOCK,
-                NULL,
-                /*src_id=*/2,
-                dst->name);
-            memcpy(row_ptr, fp8sim_out.data(), (size_t) n_out * sizeof(float));
+            if (use_fp8sim_out) {
+                ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                    row_ptr,
+                    out_sim_vals.data(),
+                    (int) n_out,
+                    GGML_SIM_FP8E4M3_BLOCK,
+                    NULL,
+                    /*src_id=*/2,
+                    dst->name);
+            } else {
+                ggml_sim_bf16_roundtrip_f32_array(row_ptr, out_sim_vals.data(), (int) n_out);
+            }
+            memcpy(row_ptr, out_sim_vals.data(), (size_t) n_out * sizeof(float));
         };
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
@@ -1646,9 +1654,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 float * dst_row = (float *) ((char *) dst->data + (iter * nb1)) + src0_start;
                 const float * pre_vals = dst_row;
                 const float * post_vals = dst_row;
-                if (use_fp8sim_out && n_out > 0) {
-                    memcpy(fp8sim_pre.data(), dst_row, (size_t) n_out * sizeof(float));
-                    pre_vals = fp8sim_pre.data();
+                if (use_out_sim && n_out > 0) {
+                    memcpy(out_pre_vals.data(), dst_row, (size_t) n_out * sizeof(float));
+                    pre_vals = out_pre_vals.data();
                 }
                 qdq_row_if_needed(dst_row);
                 ggml_mm_dist_record_chunk_values_pair(
@@ -1671,9 +1679,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     src0_end - src0_start);
             const float * pre_vals = dst_row;
             const float * post_vals = dst_row;
-            if (use_fp8sim_out && n_out > 0) {
-                memcpy(fp8sim_pre.data(), dst_row, (size_t) n_out * sizeof(float));
-                pre_vals = fp8sim_pre.data();
+            if (use_out_sim && n_out > 0) {
+                memcpy(out_pre_vals.data(), dst_row, (size_t) n_out * sizeof(float));
+                pre_vals = out_pre_vals.data();
             }
             qdq_row_if_needed(dst_row);
             ggml_mm_dist_record_chunk_values_pair(
@@ -1836,7 +1844,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
         const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
-        const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
+        const bool use_fp8sim_out =
+            (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
+        const bool use_bf16sim_out =
+            (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_BF16);
+        const bool use_out_sim = use_fp8sim_out || use_bf16sim_out;
         std::vector<float> fp8sim_tmp_src1;
         if (use_fp8sim_src1) {
             fp8sim_tmp_src1.resize((size_t) ne10);
@@ -1954,11 +1966,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             const int64_t n_out = src0_cur_end - src0_cur_start;
-            std::vector<float> fp8sim_out_id;
-            std::vector<float> fp8sim_pre_id;
-            if (use_fp8sim_out && n_out > 0) {
-                fp8sim_out_id.resize((size_t) n_out);
-                fp8sim_pre_id.resize((size_t) n_out);
+            std::vector<float> out_sim_vals_id;
+            std::vector<float> out_pre_vals_id;
+            if (use_out_sim && n_out > 0) {
+                out_sim_vals_id.resize((size_t) n_out);
+                out_pre_vals_id.resize((size_t) n_out);
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
@@ -1982,18 +1994,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 float * dst_row = (float *)((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start;
                 const float * pre_vals = dst_row;
                 const float * post_vals = dst_row;
-                if (use_fp8sim_out && n_out > 0) {
-                    memcpy(fp8sim_pre_id.data(), dst_row, (size_t) n_out * sizeof(float));
-                    pre_vals = fp8sim_pre_id.data();
-                    ggml_sim_fp8e4m3_block_quant_dequant_f32(
-                        dst_row,
-                        fp8sim_out_id.data(),
-                        (int) n_out,
-                        GGML_SIM_FP8E4M3_BLOCK,
-                        NULL,
-                        /*src_id=*/2,
-                        dst->name);
-                    memcpy(dst_row, fp8sim_out_id.data(), (size_t) n_out * sizeof(float));
+                if (use_out_sim && n_out > 0) {
+                    memcpy(out_pre_vals_id.data(), dst_row, (size_t) n_out * sizeof(float));
+                    pre_vals = out_pre_vals_id.data();
+                    if (use_fp8sim_out) {
+                        ggml_sim_fp8e4m3_block_quant_dequant_f32(
+                            dst_row,
+                            out_sim_vals_id.data(),
+                            (int) n_out,
+                            GGML_SIM_FP8E4M3_BLOCK,
+                            NULL,
+                            /*src_id=*/2,
+                            dst->name);
+                    } else {
+                        ggml_sim_bf16_roundtrip_f32_array(dst_row, out_sim_vals_id.data(), (int) n_out);
+                    }
+                    memcpy(dst_row, out_sim_vals_id.data(), (size_t) n_out * sizeof(float));
                 }
 
                 ggml_mm_dist_record_chunk_values_pair(

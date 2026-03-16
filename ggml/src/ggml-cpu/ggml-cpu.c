@@ -2008,7 +2008,10 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // attempt to reduce false-sharing (does not seem to make a difference)
     // blck_0(=16) * 2, accounting for mmla kernels
     float tmp[32];
-    const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
+    const bool use_fp8sim_out =
+        (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
+    const bool use_bf16sim_out =
+        (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_BF16);
     enum { FP8_QDQ_TMP_CAP = (GGML_SIM_FP8E4M3_BLOCK > 16 ? GGML_SIM_FP8E4M3_BLOCK : 16) };
 
     const bool dist_enabled = ggml_mm_dist_get_enabled();
@@ -2061,17 +2064,20 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                     const int64_t n_copy = (MIN(iir0 + blck_0, ir0_end) - iir0);
                     const float * src_vals = tmp + (cn * (int) blck_0);
                     const float * vals_to_store = src_vals;
-                    float qdq_vals[FP8_QDQ_TMP_CAP];
+                    float sim_vals[FP8_QDQ_TMP_CAP];
                     if (use_fp8sim_out) {
                         ggml_sim_fp8e4m3_block_quant_dequant_f32(
                             src_vals,
-                            qdq_vals,
+                            sim_vals,
                             (int) n_copy,
                             GGML_SIM_FP8E4M3_BLOCK,
                             NULL,
                             /*src_id=*/2,
                             dst->name);
-                        vals_to_store = qdq_vals;
+                        vals_to_store = sim_vals;
+                    } else if (use_bf16sim_out) {
+                        ggml_sim_bf16_roundtrip_f32_array(src_vals, sim_vals, (int) n_copy);
+                        vals_to_store = sim_vals;
                     }
 
                     memcpy(&dst_col[iir0 + cn * nb1 / nb0], vals_to_store, n_copy * sizeof(float));
@@ -2464,7 +2470,10 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     // NOTE: these are compute tile sizes for this kernel, unrelated to FP8 block size.
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
-    const bool use_fp8sim_out = GGML_SIM_FP8E4M3;
+    const bool use_fp8sim_out =
+        (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
+    const bool use_bf16sim_out =
+        (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_BF16);
 
     float tmp[16];
 
@@ -2511,19 +2520,28 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const int64_t n_copy = (MIN(iir0 + blck_0, ir0_end) - iir0);
                 if (use_fp8sim_out) {
                     enum { FP8_QDQ_TMP_CAP = (GGML_SIM_FP8E4M3_BLOCK > 16 ? GGML_SIM_FP8E4M3_BLOCK : 16) };
-                    float qdq_vals[FP8_QDQ_TMP_CAP];
+                    float sim_vals[FP8_QDQ_TMP_CAP];
                     ggml_sim_fp8e4m3_block_quant_dequant_f32(
                         tmp,
-                        qdq_vals,
+                        sim_vals,
                         (int) n_copy,
                         GGML_SIM_FP8E4M3_BLOCK,
                         NULL,
                         /*src_id=*/2,
                         dst->name);
-                    memcpy(&dst_col[iir0], qdq_vals, n_copy*sizeof(float));
+                    memcpy(&dst_col[iir0], sim_vals, n_copy*sizeof(float));
                     if (collect_dist) {
                         ggml_mm_dist_accumulate_values(&dist_local_pre, tmp, n_copy);
-                        ggml_mm_dist_accumulate_values(&dist_local_post, qdq_vals, n_copy);
+                        ggml_mm_dist_accumulate_values(&dist_local_post, sim_vals, n_copy);
+                    }
+                } else if (use_bf16sim_out) {
+                    enum { BF16_ROUND_TMP_CAP = 16 };
+                    float sim_vals[BF16_ROUND_TMP_CAP];
+                    ggml_sim_bf16_roundtrip_f32_array(tmp, sim_vals, (int) n_copy);
+                    memcpy(&dst_col[iir0], sim_vals, n_copy*sizeof(float));
+                    if (collect_dist) {
+                        ggml_mm_dist_accumulate_values(&dist_local_pre, tmp, n_copy);
+                        ggml_mm_dist_accumulate_values(&dist_local_post, sim_vals, n_copy);
                     }
                 } else {
                     memcpy(&dst_col[iir0], tmp, n_copy*sizeof(float));
