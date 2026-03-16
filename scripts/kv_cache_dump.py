@@ -4,23 +4,23 @@ a human-readable text report.
 
 Usage examples:
   # Summary only (stats per layer, no values)
-  python3 scripts/kv_cache_dump.py kv_seq_0.bin
+  python3 scripts/kv_cache_dump.py ke_seq_xxx.bin
 
   # Export layer 0 with all values
-  python3 scripts/kv_cache_dump.py kv_seq_0.bin --layers 0
+  python3 scripts/kv_cache_dump.py ke_seq_xxx.bin --layers 0
 
   # Export layers 0,1,31 with all values
-  python3 scripts/kv_cache_dump.py kv_seq_0.bin --layers 0,1,31
+  python3 scripts/kv_cache_dump.py ke_seq_xxx.bin --layers 0,1,31
 
   # Export all layers with all values
-  python3 scripts/kv_cache_dump.py kv_seq_0.bin --layers all
+  python3 scripts/kv_cache_dump.py ke_seq_xxx.bin --layers all
 
   # Export layers 0-3 with all values, only cells 0-15
-  python3 scripts/kv_cache_dump.py kv_seq_0.bin --layers 0-3 --cells 0-15
+  python3 scripts/kv_cache_dump.py ke_seq_xxx.bin --layers 0-3 --cells 0-15
 
   # Only K or V
-  python3 scripts/kv_cache_dump.py kv_seq_0.bin --layers 0 --only k
-  python3 scripts/kv_cache_dump.py kv_seq_0.bin --layers 0 --only v
+  python3 scripts/kv_cache_dump.py ke_seq_xxx.bin --layers 0 --only k
+  python3 scripts/kv_cache_dump.py ke_seq_xxx.bin --layers 0 --only v
 
 Binary format (LLAMA_STATE_SEQ_VERSION = 2):
   Header:  u32 magic, u32 version, u32 n_tokens, i32 tokens[n_tokens]
@@ -90,10 +90,11 @@ def decode_kv_data(raw: bytes, dtype_id: int, n_elements: int):
 def stats_str(arr) -> str:
     if arr is None or len(arr) == 0:
         return "(quantized, raw bytes)"
+    a = arr.astype(np.float32) if arr.dtype != np.float32 else arr
     return (
-        f"min={arr.min():.6g}, max={arr.max():.6g}, "
-        f"mean={arr.mean():.6g}, std={arr.std():.6g}, "
-        f"absmax={np.abs(arr).max():.6g}"
+        f"min={a.min():.6g}, max={a.max():.6g}, "
+        f"mean={a.mean():.6g}, std={a.std():.6g}, "
+        f"absmax={np.abs(a).max():.6g}"
     )
 
 
@@ -346,22 +347,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   # Summary only (stats per layer, no actual values)
-  python3 %(prog)s kv_seq_0.bin
+  python3 %(prog)s ke_seq_xxx.bin
 
   # Dump layer 0 values
-  python3 %(prog)s kv_seq_0.bin --layers 0
+  python3 %(prog)s ke_seq_xxx.bin --layers 0
 
   # Dump layers 0-3 and 31
-  python3 %(prog)s kv_seq_0.bin --layers 0-3,31
+  python3 %(prog)s ke_seq_xxx.bin --layers 0-3,31
 
   # Dump all layers
-  python3 %(prog)s kv_seq_0.bin --layers all
+  python3 %(prog)s ke_seq_xxx.bin --layers all
 
   # Dump layer 0, only cells 0-15
-  python3 %(prog)s kv_seq_0.bin --layers 0 --cells 0-15
+  python3 %(prog)s ke_seq_xxx.bin --layers 0 --cells 0-15
 
   # Dump layer 0, only K (no V)
-  python3 %(prog)s kv_seq_0.bin --layers 0 --only k
+  python3 %(prog)s ke_seq_xxx.bin --layers 0 --only k
 """,
     )
     p.add_argument("bin_file", help="KV cache .bin file")
