@@ -55,18 +55,45 @@ typedef double ggml_float;
 #endif
 
 // ---------------------------------------------------------------------------
-// Scale type selection（编译期 -DGGML_SIM_FP8E4M3_SCALE_TYPE=0/1 覆盖）
+// Scale type selection（编译期宏）
 //
-//   0 = int8 power-of-2 scale（当前默认）
+//   0 = int8 power-of-2 scale
 //       每个 block 计算 k = ceil(log2(amax / max_finite))，存为 int8_t
 //       缩放因子 = 2^k （整数幂，快速 ldexpf）
 //
 //   1 = bf16 exact scale
 //       每个 block 计算 scale = amax / max_finite，存为 ggml_bf16_t
 //       缩放因子 = bf16_to_f32(scale) （精确比值，粒度更细）
+//
+// 兼容性说明：
+//   - 旧宏 GGML_SIM_FP8E4M3_SCALE_TYPE 仍可用（同时控制输入/输出）
+//   - 新宏可分开控制输入(src0/src1)和输出(src2)：
+//       GGML_SIM_FP8E4M3_SCALE_TYPE_IN
+//       GGML_SIM_FP8E4M3_SCALE_TYPE_OUT
 // ---------------------------------------------------------------------------
+#define GGML_SIM_FP8E4M3_SCALE_TYPE_INT8_POW2 0
+#define GGML_SIM_FP8E4M3_SCALE_TYPE_BF16_EXACT 1
+
 #ifndef GGML_SIM_FP8E4M3_SCALE_TYPE
-#define GGML_SIM_FP8E4M3_SCALE_TYPE 0
+#define GGML_SIM_FP8E4M3_SCALE_TYPE GGML_SIM_FP8E4M3_SCALE_TYPE_INT8_POW2
+#endif
+
+#ifndef GGML_SIM_FP8E4M3_SCALE_TYPE_IN
+#define GGML_SIM_FP8E4M3_SCALE_TYPE_IN GGML_SIM_FP8E4M3_SCALE_TYPE
+#endif
+
+#ifndef GGML_SIM_FP8E4M3_SCALE_TYPE_OUT
+#define GGML_SIM_FP8E4M3_SCALE_TYPE_OUT GGML_SIM_FP8E4M3_SCALE_TYPE
+#endif
+
+#if GGML_SIM_FP8E4M3_SCALE_TYPE_IN != GGML_SIM_FP8E4M3_SCALE_TYPE_INT8_POW2 && \
+    GGML_SIM_FP8E4M3_SCALE_TYPE_IN != GGML_SIM_FP8E4M3_SCALE_TYPE_BF16_EXACT
+#error "GGML_SIM_FP8E4M3_SCALE_TYPE_IN must be 0 (int8 pow2) or 1 (bf16 exact)"
+#endif
+
+#if GGML_SIM_FP8E4M3_SCALE_TYPE_OUT != GGML_SIM_FP8E4M3_SCALE_TYPE_INT8_POW2 && \
+    GGML_SIM_FP8E4M3_SCALE_TYPE_OUT != GGML_SIM_FP8E4M3_SCALE_TYPE_BF16_EXACT
+#error "GGML_SIM_FP8E4M3_SCALE_TYPE_OUT must be 0 (int8 pow2) or 1 (bf16 exact)"
 #endif
 
 // 分别控制 src0/src1 是否做 FP8+scale 回放
