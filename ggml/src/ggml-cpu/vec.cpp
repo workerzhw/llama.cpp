@@ -1,10 +1,11 @@
 #include "vec.h"
 
 // ---------------------------------------------------------------------------
-// FP8/FP9(E4M3/E4M4-like) block-quant simulation implementation
+// FP8/FP9 block-quant simulation implementation
 //
 // 约定：
-//  - Format: 1 sign, 4 exp (bias=7), mantissa bits selected by GGML_SIM_FP_FORMAT
+//  - Format由编译期宏选择：
+//      F8(E4M3) / F8(E3M4) / F9(E4M4-like)
 //  - 不生成 NaN/Inf（输入若超范围 -> 饱和到 max finite）
 //  - 支持 subnormal；小于最小 subnormal 才刷 0
 //  - 舍入：RNE (round-to-nearest-even)
@@ -34,23 +35,47 @@ static inline int ggml_sim_mantissa_bits(void) {
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
     return 4;
 #else
-    return 3;
+    return GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ? 4 : 3;
 #endif
+}
+
+static inline int ggml_sim_exponent_bits(void) {
+#if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
+    return 4;
+#else
+    return GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ? 3 : 4;
+#endif
+}
+
+static inline int ggml_sim_exponent_bias(void) {
+    return (1 << (ggml_sim_exponent_bits() - 1)) - 1;
+}
+
+static inline int ggml_sim_min_norm_exp_unbiased(void) {
+    return 1 - ggml_sim_exponent_bias();
+}
+
+static inline int ggml_sim_max_exp_field(void) {
+    return (1 << ggml_sim_exponent_bits()) - 1;
+}
+
+static inline int ggml_sim_max_norm_exp_unbiased(void) {
+    return ggml_sim_max_exp_field() - ggml_sim_exponent_bias();
 }
 
 static inline const char * ggml_sim_format_name(void) {
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
     return "F9(E4M4-like)";
 #else
-    return "F8(E4M3)";
+    return GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ? "F8(E3M4)" : "F8(E4M3)";
 #endif
 }
 
 static inline float ggml_fp8e4m3_max_finite(void) {
-    // max_finite = (2 - 2^-mant_bits) * 2^8, where mant_bits is 3(F8) or 4(F9).
+    // max_finite = (2 - 2^-mant_bits) * 2^(max_normal_exp_unbiased)
     const int mant_bits = ggml_sim_mantissa_bits();
     const float sig_max = 2.0f - ldexpf(1.0f, -mant_bits);
-    return ldexpf(sig_max, 8);
+    return ldexpf(sig_max, ggml_sim_max_norm_exp_unbiased());
 }
 
 static inline float ggml_fp8e4m3_handle_non_finite(float x) {
@@ -62,8 +87,8 @@ static inline float ggml_fp8e4m3_handle_non_finite(float x) {
 }
 
 static inline float ggml_fp8e4m3_min_subnormal(void) {
-    // exp=0, mant=1 => 2^(1-bias) * 2^(-mant_bits) = 2^(-6-mant_bits)
-    return ldexpf(1.0f, -(6 + ggml_sim_mantissa_bits()));
+    // exp=0, mant=1 => 2^(1-bias) * 2^(-mant_bits)
+    return ldexpf(1.0f, ggml_sim_min_norm_exp_unbiased() - ggml_sim_mantissa_bits());
 }
 
 static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
@@ -93,8 +118,12 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
     const int mant_bits = ggml_sim_mantissa_bits();
     const int mant_levels = 1 << mant_bits;
 
-    // normalized threshold: exp==1, mant==0 => 1.0 * 2^(1-bias) = 2^-6
-    const float min_norm = ldexpf(1.0f, -6);
+    const int exp_bias = ggml_sim_exponent_bias();
+    const int max_exp_field = ggml_sim_max_exp_field();
+    const int min_norm_exp = ggml_sim_min_norm_exp_unbiased();
+
+    // normalized threshold: exp==1, mant==0 => 1.0 * 2^(1-bias)
+    const float min_norm = ldexpf(1.0f, min_norm_exp);
     if (ax >= min_norm) {
         int e;
         float m = frexpf(ax, &e); // ax = m*2^e, m in [0.5,1)
@@ -102,9 +131,9 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
         m *= 2.0f;
         e -= 1;
         // exp field = e + bias
-        int ef = e + 7;
+        int ef = e + exp_bias;
         GGML_ASSERT(ef >= 1 && "ef <= 0 should not happen because ax >= min_norm");
-        if (ef > 15) {
+        if (ef > max_exp_field) {
             return sign * max_f;
         }
         // mantissa quantization for frac=(m-1) in [0,1)
@@ -114,27 +143,27 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
             // carry into exponent
             q = 0;
             ef += 1;
-            if (ef > 15) {
+            if (ef > max_exp_field) {
                 return sign * max_f;
             }
         }
         const float dq = 1.0f + (float)q / (float)mant_levels;
-        const int de = ef - 7;
+        const int de = ef - exp_bias;
         return sign * ldexpf(dq, de);
     } else {
-        // subnormal: exp field=0, value = 2^(1-bias) * (mant/8)
+        // subnormal: exp field=0, value = 2^(1-bias) * (mant / 2^mant_bits)
         // so mant = round(ax / 2^(1-bias) * 2^mant_bits)
-        const float scale = ldexpf(1.0f, 6) * (float)mant_levels;
+        const float scale = ldexpf(1.0f, -min_norm_exp) * (float)mant_levels;
         int mant = ggml_rne_int(ax * scale);
         if (mant <= 0) {
             return 0.0f;
         }
         if (mant > (mant_levels - 1)) {
             // rounding carry from subnormal into normalized range:
-            // exp=1, mant=0 => min normal = 2^-6
+            // exp=1, mant=0 => min normal = 2^(1-bias)
             return sign * min_norm;
         }
-        return sign * ldexpf((float)mant, -(6 + mant_bits));
+        return sign * ldexpf((float)mant, min_norm_exp - mant_bits);
     }
 }
 
@@ -151,21 +180,21 @@ static inline int8_t ggml_choose_k_for_block(const float * in, int n) {
     // Extract the unbiased exponent of amax (i.e. floor(log2(|amax|))):
     //   amax = m * 2^exp_max,  1 <= m < 2
     //
-    // E4M* (bias=7, no NaN/Inf) max exponent code = 15 -> unbiased = 8.
+    // E*M* (no NaN/Inf) max exponent depends on selected format.
     // max_finite is derived from mantissa bits.
     //
     // We align exp_max to the FP8 max exponent:
     //   k = exp_max - fp8_max_exp
     //
-    // After scaling by 2^(-k), amax falls into [2^8, 2^9).
-    // Values in (max_finite, 512) may saturate to max_finite - this is a small, bounded
+    // After scaling by 2^(-k), amax falls into [2^Emax, 2^(Emax+1)).
+    // Values in (max_finite, 2^(Emax+1)) may saturate to max_finite - this is a small, bounded
     // clipping that trades negligible saturation for better average precision
     // (avoids wasting a full power-of-2 headroom as the old ceil-ratio method
     // would).
     //
-    // When amax < 2^8 this yields a NEGATIVE k, meaning we multiply the
+    // When amax < 2^Emax this yields a NEGATIVE k, meaning we multiply the
     // values by 2^|k| (scale up) before quantising, improving precision.
-    const int fp8_max_exp = 8;
+    const int fp8_max_exp = ggml_sim_max_norm_exp_unbiased();
     int exp_max = ilogbf(amax);
     int k = exp_max - fp8_max_exp;
     if (k < -128) k = -128;
@@ -303,7 +332,7 @@ static inline void fp8_accumulate_block_stats_local(
 {
     const float max_f    = ggml_fp8e4m3_max_finite();
     const float min_sub  = ggml_fp8e4m3_min_subnormal();
-    const float min_norm = ldexpf(1.0f, -6);
+    const float min_norm = ldexpf(1.0f, ggml_sim_min_norm_exp_unbiased());
     const float inv      = inv_scale;
 
     local.total_blocks += 1;
@@ -677,10 +706,15 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         // Configuration
         fprintf(f, "\n  Configuration\n");
         fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        const int exp_bits = ggml_sim_exponent_bits();
+        const int exp_bias = ggml_sim_exponent_bias();
+        const int min_sub_exp = ggml_sim_min_norm_exp_unbiased() - ggml_sim_mantissa_bits();
         fprintf(f, "    Simulated format     : %s\n", ggml_sim_format_name());
+        fprintf(f, "    Exponent bits        : %d\n", exp_bits);
         fprintf(f, "    Mantissa bits        : %d\n", ggml_sim_mantissa_bits());
+        fprintf(f, "    Exponent bias        : %d\n", exp_bias);
         fprintf(f, "    Max finite value     : %.1f\n", ggml_fp8e4m3_max_finite());
-        fprintf(f, "    Min subnormal value  : 2^-%d = %.6f\n", 6 + ggml_sim_mantissa_bits(), ggml_fp8e4m3_min_subnormal());
+        fprintf(f, "    Min subnormal value  : 2^(%d) = %.6f\n", min_sub_exp, ggml_fp8e4m3_min_subnormal());
         fprintf(f, "    Block size           : %d\n", GGML_SIM_FP8E4M3_BLOCK);
     fprintf(f, "    Scale type for src0/src1      : %s\n",
         GGML_SIM_FP8E4M3_SCALE_TYPE_IN == GGML_SIM_FP8E4M3_SCALE_TYPE_INT8_POW2

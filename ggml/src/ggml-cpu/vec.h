@@ -32,10 +32,11 @@ typedef double ggml_float;
 #endif
 
 // ---------------------------------------------------------------------------
-// FP8/FP9(E4M3/E4M4-like) block-quant simulation helpers
+// FP8/FP9 block-quant simulation helpers
 //
-// 目标：模拟实际工程的“每 block 点一个 scale + FP8(E4M3)”。
-//  - FP8: E4M3, 不考虑 NaN/Inf
+// 目标：模拟实际工程的“每 block 点一个 scale + 低比特浮点”。
+//  - FP8: E4M3 / E3M4（可选）
+//  - FP9: E4M4-like
 //  - 溢出：饱和到最大有限值（max finite，工程约定为 480）
 //  - 下溢：低于最小非规格数（min subnormal * 0.5）才清零；支持非规格数
 //  - 舍入：RNE (round-to-nearest-even)
@@ -49,10 +50,9 @@ typedef double ggml_float;
 #define GGML_SIM_FP8E4M3 0
 #endif
 
-// Simulated floating-point format for block QDQ.
-//   8 => F8  (E4M3, 3 mantissa bits)
-//   9 => F9  (E4M4-like, 4 mantissa bits)
-// This only changes mantissa precision (and derived max finite / min subnormal).
+// Simulated floating-point bit-width for block QDQ.
+//   8 => F8  (sub-format selected by GGML_SIM_FP8_LAYOUT)
+//   9 => F9  (E4M4-like)
 #ifndef GGML_SIM_FP_FORMAT
 #define GGML_SIM_FP_FORMAT 8
 #endif
@@ -62,7 +62,22 @@ typedef double ggml_float;
 
 #if GGML_SIM_FP_FORMAT != GGML_SIM_FP_FORMAT_F8 && \
     GGML_SIM_FP_FORMAT != GGML_SIM_FP_FORMAT_F9
-#error "GGML_SIM_FP_FORMAT must be 8 (F8/E4M3) or 9 (F9/E4M4-like)"
+#error "GGML_SIM_FP_FORMAT must be 8 (F8) or 9 (F9/E4M4-like)"
+#endif
+
+// FP8 sub-format selection (only used when GGML_SIM_FP_FORMAT == 8):
+//   0 => E4M3
+//   1 => E3M4
+#ifndef GGML_SIM_FP8_LAYOUT
+#define GGML_SIM_FP8_LAYOUT 0
+#endif
+
+#define GGML_SIM_FP8_LAYOUT_E4M3 0
+#define GGML_SIM_FP8_LAYOUT_E3M4 1
+
+#if GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E4M3 && \
+    GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4
+#error "GGML_SIM_FP8_LAYOUT must be 0 (E4M3) or 1 (E3M4)"
 #endif
 
 // block 大小（默认 128，可通过 -DGGML_SIM_FP8E4M3_BLOCK=... 覆盖）
@@ -122,7 +137,7 @@ typedef double ggml_float;
 #endif
 
 // Output simulation mode for GEMM/GEMV results before storing F32:
-//   0 = keep existing FP8(E4M3) block QDQ behavior (gated by GGML_SIM_FP8E4M3)
+//   0 = keep existing FP8 block QDQ behavior (E4M3/E3M4 selected by macros, gated by GGML_SIM_FP8E4M3)
 //   1 = round to BF16 then convert back to F32
 #ifndef GGML_SIM_MATMUL_OUT_MODE
 #define GGML_SIM_MATMUL_OUT_MODE 0
@@ -150,7 +165,7 @@ static inline void ggml_sim_bf16_roundtrip_f32_array(const float * in, float * o
 extern "C" {
 #endif
 
-// 将输入 FP32 做“FP8(E4M3)+scale”的块量化，再解量化回 FP32。
+// 将输入 FP32 做“FP8(+scale)”的块量化，再解量化回 FP32。
 // scales_out 可为 NULL；若非空：
 //   SCALE_TYPE==0 时写出 int8_t k（表示 2^k）；
 //   SCALE_TYPE==1 时写出 ggml_bf16_t scale（精确比值）。

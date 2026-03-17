@@ -16,10 +16,12 @@ STRIDE="${STRIDE:-0}"
 
 # Compile-time simulation switches
 # GGML_SIM_MATMUL_OUT_MODE:
-#   0 => FP8(E4M3) output QDQ (existing behavior, gated by GGML_SIM_FP8E4M3)
+#   0 => FP8 output QDQ (E4M3/E3M4 selected by SIM_FP8_LAYOUT, gated by GGML_SIM_FP8E4M3)
 #   1 => BF16 round-trip output simulation (F32 -> BF16 -> F32)
 SIM_FP8="${SIM_FP8:-1}"
 SIM_FP_FORMAT="${SIM_FP_FORMAT:-8}"
+# FP8 sub-format (effective only when SIM_FP_FORMAT=8): 0=E4M3, 1=E3M4
+SIM_FP8_LAYOUT="${SIM_FP8_LAYOUT:-1}"
 SIM_FP8_APPLY_SRC0="${SIM_FP8_APPLY_SRC0:-1}"
 SIM_FP8_APPLY_SRC1="${SIM_FP8_APPLY_SRC1:-1}"
 # Legacy single switch (kept for compatibility)
@@ -28,7 +30,7 @@ SIM_FP8_SCALE_TYPE="${SIM_FP8_SCALE_TYPE:-0}"
 SIM_FP8_SCALE_TYPE_IN="${SIM_FP8_SCALE_TYPE_IN:-${SIM_FP8_SCALE_TYPE}}"
 SIM_FP8_SCALE_TYPE_OUT="${SIM_FP8_SCALE_TYPE_OUT:-${SIM_FP8_SCALE_TYPE}}"
 SIM_FP8_BLOCK="${SIM_FP8_BLOCK:-16}"
-SIM_MATMUL_OUT_MODE="${SIM_MATMUL_OUT_MODE:-1}"
+SIM_MATMUL_OUT_MODE="${SIM_MATMUL_OUT_MODE:-0}"
 
 # Graph dump switches
 DUMP_DOT="${DUMP_DOT:-0}"
@@ -44,6 +46,11 @@ if [[ "${SIM_FP_FORMAT}" != "8" && "${SIM_FP_FORMAT}" != "9" ]]; then
   exit 1
 fi
 
+if [[ "${SIM_FP8_LAYOUT}" != "0" && "${SIM_FP8_LAYOUT}" != "1" ]]; then
+  echo "invalid SIM_FP8_LAYOUT=${SIM_FP8_LAYOUT} (expected 0 or 1)" >&2
+  exit 1
+fi
+
 if [[ "${SIM_FP8_SCALE_TYPE_IN}" != "0" && "${SIM_FP8_SCALE_TYPE_IN}" != "1" ]]; then
   echo "invalid SIM_FP8_SCALE_TYPE_IN=${SIM_FP8_SCALE_TYPE_IN} (expected 0 or 1)" >&2
   exit 1
@@ -56,6 +63,7 @@ fi
 
 SIM_FLAGS="-DGGML_SIM_FP8E4M3=${SIM_FP8} \
   -DGGML_SIM_FP_FORMAT=${SIM_FP_FORMAT} \
+  -DGGML_SIM_FP8_LAYOUT=${SIM_FP8_LAYOUT} \
   -DGGML_SIM_FP8E4M3_APPLY_SRC0=${SIM_FP8_APPLY_SRC0} \
   -DGGML_SIM_FP8E4M3_APPLY_SRC1=${SIM_FP8_APPLY_SRC1} \
   -DGGML_SIM_FP8E4M3_SCALE_TYPE=${SIM_FP8_SCALE_TYPE_IN} \
