@@ -1138,10 +1138,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
+        // Optional DOT graph export for debugging:
+        //   LLAMA_DUMP_DOT=/path/to/graph.dot
+        // Exports once per process to avoid repeated large file writes.
+        {
+            const char * llama_dump_dot = getenv("LLAMA_DUMP_DOT");
+            if (llama_dump_dot && llama_dump_dot[0] != '\0') {
+                static bool dumped = false;
+                if (!dumped) {
+                    ggml_graph_dump_dot(res->get_gf(), NULL, llama_dump_dot);
+                    LLAMA_LOG_INFO("%s: dumped graph DOT to %s\n", __func__, llama_dump_dot);
+                    dumped = true;
+                }
+            }
+        }
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;

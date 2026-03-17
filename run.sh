@@ -29,6 +29,10 @@ SIM_FP8_SCALE_TYPE_OUT="${SIM_FP8_SCALE_TYPE_OUT:-${SIM_FP8_SCALE_TYPE}}"
 SIM_FP8_BLOCK="${SIM_FP8_BLOCK:-16}"
 SIM_MATMUL_OUT_MODE="${SIM_MATMUL_OUT_MODE:-1}"
 
+# Graph dump switches
+DUMP_DOT="${DUMP_DOT:-0}"
+DOT_FILE="${DOT_FILE:-${OUT_DIR}/llama.dot}"
+
 if [[ "${SIM_MATMUL_OUT_MODE}" != "0" && "${SIM_MATMUL_OUT_MODE}" != "1" ]]; then
   echo "invalid SIM_MATMUL_OUT_MODE=${SIM_MATMUL_OUT_MODE} (expected 0 or 1)" >&2
   exit 1
@@ -71,6 +75,10 @@ export GGML_MATMUL_DIST=1
 export GGML_MATMUL_DIST_SAMPLE=100
 export GGML_MATMUL_DIST_FILE="${OUT_DIR}/matmul.log"
 
+if [[ "${DUMP_DOT}" == "1" ]]; then
+  export LLAMA_DUMP_DOT="${DOT_FILE}"
+fi
+
 SEQ_BIN="${OUT_DIR}/kv_seq_${SEQ_ID}.bin"
 SEQ_TXT="${OUT_DIR}/kv_seq_${SEQ_ID}.txt"
 RUN_LOG="${OUT_DIR}/run.log"
@@ -108,8 +116,21 @@ if [ -f fp8_sim_analysis.log ]; then
   mv -f fp8_sim_analysis.log "${FP8_PPL_LOG}"
 fi
 
+if [[ "${DUMP_DOT}" == "1" && -f "${DOT_FILE}" ]]; then
+  if command -v dot >/dev/null 2>&1; then
+    DOT_PNG="${DOT_FILE%.dot}.png"
+    dot -Tpng "${DOT_FILE}" -o "${DOT_PNG}"
+  fi
+fi
+
 echo "done."
 echo "seq state bin: ${SEQ_BIN}"
 echo "ppl log      : ${PPL_LOG}"
 echo "matmul log   : ${OUT_DIR}/matmul.log"
 echo "fp8 ppl log  : ${FP8_PPL_LOG}"
+if [[ "${DUMP_DOT}" == "1" ]]; then
+  echo "dot graph    : ${DOT_FILE}"
+  if command -v dot >/dev/null 2>&1; then
+    echo "dot png      : ${DOT_FILE%.dot}.png"
+  fi
+fi
