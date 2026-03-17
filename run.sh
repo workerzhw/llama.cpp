@@ -19,6 +19,7 @@ STRIDE="${STRIDE:-0}"
 #   0 => FP8(E4M3) output QDQ (existing behavior, gated by GGML_SIM_FP8E4M3)
 #   1 => BF16 round-trip output simulation (F32 -> BF16 -> F32)
 SIM_FP8="${SIM_FP8:-1}"
+SIM_FP_FORMAT="${SIM_FP_FORMAT:-8}"
 SIM_FP8_APPLY_SRC0="${SIM_FP8_APPLY_SRC0:-1}"
 SIM_FP8_APPLY_SRC1="${SIM_FP8_APPLY_SRC1:-1}"
 # Legacy single switch (kept for compatibility)
@@ -38,6 +39,11 @@ if [[ "${SIM_MATMUL_OUT_MODE}" != "0" && "${SIM_MATMUL_OUT_MODE}" != "1" ]]; the
   exit 1
 fi
 
+if [[ "${SIM_FP_FORMAT}" != "8" && "${SIM_FP_FORMAT}" != "9" ]]; then
+  echo "invalid SIM_FP_FORMAT=${SIM_FP_FORMAT} (expected 8 or 9)" >&2
+  exit 1
+fi
+
 if [[ "${SIM_FP8_SCALE_TYPE_IN}" != "0" && "${SIM_FP8_SCALE_TYPE_IN}" != "1" ]]; then
   echo "invalid SIM_FP8_SCALE_TYPE_IN=${SIM_FP8_SCALE_TYPE_IN} (expected 0 or 1)" >&2
   exit 1
@@ -49,6 +55,7 @@ if [[ "${SIM_FP8_SCALE_TYPE_OUT}" != "0" && "${SIM_FP8_SCALE_TYPE_OUT}" != "1" ]
 fi
 
 SIM_FLAGS="-DGGML_SIM_FP8E4M3=${SIM_FP8} \
+  -DGGML_SIM_FP_FORMAT=${SIM_FP_FORMAT} \
   -DGGML_SIM_FP8E4M3_APPLY_SRC0=${SIM_FP8_APPLY_SRC0} \
   -DGGML_SIM_FP8E4M3_APPLY_SRC1=${SIM_FP8_APPLY_SRC1} \
   -DGGML_SIM_FP8E4M3_SCALE_TYPE=${SIM_FP8_SCALE_TYPE_IN} \

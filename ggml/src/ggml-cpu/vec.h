@@ -32,7 +32,7 @@ typedef double ggml_float;
 #endif
 
 // ---------------------------------------------------------------------------
-// FP8(E4M3) block-quant simulation helpers
+// FP8/FP9(E4M3/E4M4-like) block-quant simulation helpers
 //
 // 目标：模拟实际工程的“每 block 点一个 scale + FP8(E4M3)”。
 //  - FP8: E4M3, 不考虑 NaN/Inf
@@ -47,6 +47,22 @@ typedef double ggml_float;
 // 0=关闭 1=开启
 #ifndef GGML_SIM_FP8E4M3
 #define GGML_SIM_FP8E4M3 0
+#endif
+
+// Simulated floating-point format for block QDQ.
+//   8 => F8  (E4M3, 3 mantissa bits)
+//   9 => F9  (E4M4-like, 4 mantissa bits)
+// This only changes mantissa precision (and derived max finite / min subnormal).
+#ifndef GGML_SIM_FP_FORMAT
+#define GGML_SIM_FP_FORMAT 8
+#endif
+
+#define GGML_SIM_FP_FORMAT_F8 8
+#define GGML_SIM_FP_FORMAT_F9 9
+
+#if GGML_SIM_FP_FORMAT != GGML_SIM_FP_FORMAT_F8 && \
+    GGML_SIM_FP_FORMAT != GGML_SIM_FP_FORMAT_F9
+#error "GGML_SIM_FP_FORMAT must be 8 (F8/E4M3) or 9 (F9/E4M4-like)"
 #endif
 
 // block 大小（默认 128，可通过 -DGGML_SIM_FP8E4M3_BLOCK=... 覆盖）

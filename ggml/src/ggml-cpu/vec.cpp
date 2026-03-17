@@ -1,10 +1,10 @@
 #include "vec.h"
 
 // ---------------------------------------------------------------------------
-// FP8(E4M3) block-quant simulation implementation
+// FP8/FP9(E4M3/E4M4-like) block-quant simulation implementation
 //
 // 约定：
-//  - FP8: 1 sign, 4 exp (bias=7), 3 mantissa
+//  - Format: 1 sign, 4 exp (bias=7), mantissa bits selected by GGML_SIM_FP_FORMAT
 //  - 不生成 NaN/Inf（输入若超范围 -> 饱和到 max finite）
 //  - 支持 subnormal；小于最小 subnormal 才刷 0
 //  - 舍入：RNE (round-to-nearest-even)
@@ -30,11 +30,27 @@ static inline int ggml_rne_int(float x) {
     }
 }
 
+static inline int ggml_sim_mantissa_bits(void) {
+#if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
+    return 4;
+#else
+    return 3;
+#endif
+}
+
+static inline const char * ggml_sim_format_name(void) {
+#if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
+    return "F9(E4M4-like)";
+#else
+    return "F8(E4M3)";
+#endif
+}
+
 static inline float ggml_fp8e4m3_max_finite(void) {
-    // NOTE(按工程约定): 你的工程里 FP8(E4M3) 的最大有限值为 480（无 NaN/Inf）。
-    // 这里将“溢出饱和阈值”设为 480。
-    // （常见标准实现里 e4m3 的 max finite 可能是 240，但这里以工程定义为准。）
-    return 480.0f;
+    // max_finite = (2 - 2^-mant_bits) * 2^8, where mant_bits is 3(F8) or 4(F9).
+    const int mant_bits = ggml_sim_mantissa_bits();
+    const float sig_max = 2.0f - ldexpf(1.0f, -mant_bits);
+    return ldexpf(sig_max, 8);
 }
 
 static inline float ggml_fp8e4m3_handle_non_finite(float x) {
@@ -46,8 +62,8 @@ static inline float ggml_fp8e4m3_handle_non_finite(float x) {
 }
 
 static inline float ggml_fp8e4m3_min_subnormal(void) {
-    // exp=0, mant=1 => 2^(1-bias) * (mant/8) = 2^(-6) * (1/8) = 2^-9
-    return ldexpf(1.0f, -9);
+    // exp=0, mant=1 => 2^(1-bias) * 2^(-mant_bits) = 2^(-6-mant_bits)
+    return ldexpf(1.0f, -(6 + ggml_sim_mantissa_bits()));
 }
 
 static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
@@ -74,6 +90,9 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
         return sign * max_f;
     }
 
+    const int mant_bits = ggml_sim_mantissa_bits();
+    const int mant_levels = 1 << mant_bits;
+
     // normalized threshold: exp==1, mant==0 => 1.0 * 2^(1-bias) = 2^-6
     const float min_norm = ldexpf(1.0f, -6);
     if (ax >= min_norm) {
@@ -88,10 +107,10 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
         if (ef > 15) {
             return sign * max_f;
         }
-        // mantissa bits: 3, represent fractional part of m in [1,2): frac=(m-1) in [0,1)
+        // mantissa quantization for frac=(m-1) in [0,1)
         float frac = m - 1.0f;
-        int q = ggml_rne_int(frac * 8.0f); // 0..8
-        if (q == 8) {
+        int q = ggml_rne_int(frac * (float)mant_levels); // 0..mant_levels
+        if (q == mant_levels) {
             // carry into exponent
             q = 0;
             ef += 1;
@@ -99,23 +118,23 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
                 return sign * max_f;
             }
         }
-        const float dq = 1.0f + (float)q / 8.0f;
+        const float dq = 1.0f + (float)q / (float)mant_levels;
         const int de = ef - 7;
         return sign * ldexpf(dq, de);
     } else {
         // subnormal: exp field=0, value = 2^(1-bias) * (mant/8)
-        // so mant = round(ax / 2^(1-bias) * 8)
-        const float scale = ldexpf(1.0f, 6) * 8.0f; // 2^6*8 = 512
+        // so mant = round(ax / 2^(1-bias) * 2^mant_bits)
+        const float scale = ldexpf(1.0f, 6) * (float)mant_levels;
         int mant = ggml_rne_int(ax * scale);
         if (mant <= 0) {
             return 0.0f;
         }
-        if (mant > 7) {
+        if (mant > (mant_levels - 1)) {
             // rounding carry from subnormal into normalized range:
             // exp=1, mant=0 => min normal = 2^-6
             return sign * min_norm;
         }
-        return sign * ldexpf((float)mant, -9); // mant/512
+        return sign * ldexpf((float)mant, -(6 + mant_bits));
     }
 }
 
@@ -132,14 +151,14 @@ static inline int8_t ggml_choose_k_for_block(const float * in, int n) {
     // Extract the unbiased exponent of amax (i.e. floor(log2(|amax|))):
     //   amax = m * 2^exp_max,  1 <= m < 2
     //
-    // FP8 E4M3 (bias=7, no NaN/Inf) max exponent code = 15 → unbiased = 8.
-    //   max_finite = 1.875 * 2^8 = 480
+    // E4M* (bias=7, no NaN/Inf) max exponent code = 15 -> unbiased = 8.
+    // max_finite is derived from mantissa bits.
     //
     // We align exp_max to the FP8 max exponent:
     //   k = exp_max - fp8_max_exp
     //
     // After scaling by 2^(-k), amax falls into [2^8, 2^9).
-    // Values in (480, 512) will saturate to 480 — this is a small, bounded
+    // Values in (max_finite, 512) may saturate to max_finite - this is a small, bounded
     // clipping that trades negligible saturation for better average precision
     // (avoids wasting a full power-of-2 headroom as the old ceil-ratio method
     // would).
@@ -168,7 +187,7 @@ static inline float ggml_choose_scale_for_block_bf16(const float * in, int n) {
     if (amax == 0.0f) {
         return 0.0f;
     }
-    const float max_f = ggml_fp8e4m3_max_finite(); // 480
+    const float max_f = ggml_fp8e4m3_max_finite();
     float scale = amax / max_f;
     // Round to BF16 precision
     ggml_bf16_t scale_bf16 = GGML_FP32_TO_BF16(scale);
@@ -586,7 +605,7 @@ static void fp8_write_src_section(FILE * f, int src_id, const char * name, const
     fprintf(f, "\n");
 
     fprintf(f, "    Element classification (total classified: %" PRId64 "):\n", classified);
-    fprintf(f, "      Normal FP8 range      : %12" PRId64 " (%.4f%%)\n", s.normal_count,    pct(s.normal_count,    classified));
+    fprintf(f, "      Normal format range   : %12" PRId64 " (%.4f%%)\n", s.normal_count,    pct(s.normal_count,    classified));
     fprintf(f, "      Subnormal (denorm)    : %12" PRId64 " (%.4f%%)\n", s.subnormal_count, pct(s.subnormal_count, classified));
     fprintf(f, "      Underflow (->0)       : %12" PRId64 " (%.4f%%)\n", s.underflow_count, pct(s.underflow_count, classified));
     fprintf(f, "      Overflow (saturated)  : %12" PRId64 " (%.4f%%)\n", s.overflow_count,  pct(s.overflow_count,  classified));
@@ -652,15 +671,16 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
 
         fprintf(f, "\n");
         fprintf(f, "================================================================================\n");
-        fprintf(f, "  FP8(E4M3) + Block Scale Quantization Simulation Analysis Report\n");
+        fprintf(f, "  %s + Block Scale Quantization Simulation Analysis Report\n", ggml_sim_format_name());
         fprintf(f, "================================================================================\n");
 
         // Configuration
         fprintf(f, "\n  Configuration\n");
         fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
-        fprintf(f, "    FP8 format           : E4M3 (1 sign, 4 exp, 3 mantissa, bias=7)\n");
-        fprintf(f, "    Max finite value     : 480.0\n");
-        fprintf(f, "    Min subnormal value  : 2^-9 = %.6f\n", ldexpf(1.0f, -9));
+        fprintf(f, "    Simulated format     : %s\n", ggml_sim_format_name());
+        fprintf(f, "    Mantissa bits        : %d\n", ggml_sim_mantissa_bits());
+        fprintf(f, "    Max finite value     : %.1f\n", ggml_fp8e4m3_max_finite());
+        fprintf(f, "    Min subnormal value  : 2^-%d = %.6f\n", 6 + ggml_sim_mantissa_bits(), ggml_fp8e4m3_min_subnormal());
         fprintf(f, "    Block size           : %d\n", GGML_SIM_FP8E4M3_BLOCK);
     fprintf(f, "    Scale type for src0/src1      : %s\n",
         GGML_SIM_FP8E4M3_SCALE_TYPE_IN == GGML_SIM_FP8E4M3_SCALE_TYPE_INT8_POW2
@@ -673,7 +693,9 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "    Rounding             : RNE (round to nearest even)\n");
         fprintf(f, "    Applied to src0 (weights)     : %s\n", GGML_SIM_FP8E4M3_APPLY_SRC0 ? "YES" : "NO");
         fprintf(f, "    Applied to src1 (activations) : %s\n", GGML_SIM_FP8E4M3_APPLY_SRC1 ? "YES" : "NO");
-        fprintf(f, "    Applied to output QDQ         : %s\n", GGML_SIM_FP8E4M3 ? "YES" : "NO");
+        const bool apply_out_qdq =
+            (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
+        fprintf(f, "    Applied to output QDQ         : %s\n", apply_out_qdq ? "YES" : "NO");
 
         // Per-src sections
         fp8_write_src_section(f, 0, "Weights (src0)", g_fp8_stats[0]);
@@ -1057,7 +1079,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "\n");
         fprintf(f, "    Quantization Error Chain:\n");
         fprintf(f, "\n");
-        fprintf(f, "    FP8(E4M3) block=%d    Per-element SQNR    Matmul output SQNR\n", GGML_SIM_FP8E4M3_BLOCK);
+        fprintf(f, "    %s block=%d    Per-element SQNR    Matmul output SQNR\n", ggml_sim_format_name(), GGML_SIM_FP8E4M3_BLOCK);
         fprintf(f, "    ─────────────────  ─> ─────────────────  ─> ────────────────────\n");
         fprintf(f, "    Weight  : %.2f dB ──┐\n", sqnr_src0);
         fprintf(f, "    Activation: %.2f dB ─┼──> Input-side: %.2f dB\n", sqnr_src1, (eps_mm_in > 0) ? -10.0 * log10(eps_mm_in) : 999.0);
@@ -1084,7 +1106,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
         fprintf(f, "\n");
         fprintf(f, "    If MEASURED DPPL/PPL falls within the predicted range:\n");
-        fprintf(f, "      -> The FP8 quantization error FULLY explains the PPL increase.\n");
+        fprintf(f, "      -> The %s quantization error FULLY explains the PPL increase.\n", ggml_sim_format_name());
         fprintf(f, "      -> No hidden issues; the model is well-characterized.\n");
         fprintf(f, "\n");
         fprintf(f, "    If MEASURED is HIGHER than predicted:\n");
@@ -1094,7 +1116,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "\n");
         fprintf(f, "    If MEASURED is LOWER than predicted:\n");
         fprintf(f, "      -> Model is robust to this quantization noise level\n");
-        fprintf(f, "      -> FP8 quantization is viable for this model\n");
+        fprintf(f, "      -> %s quantization is viable for this model\n", ggml_sim_format_name());
         fprintf(f, "\n");
         fprintf(f, "    For before/after comparison (e.g., scaling fix):\n");
         fprintf(f, "      -> SQNR improvement of X dB reduces noise power by 10^(X/10)\n");
