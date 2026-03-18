@@ -66,18 +66,21 @@ typedef double ggml_float;
 #endif
 
 // FP8 sub-format selection (only used when GGML_SIM_FP_FORMAT == 8):
-//   0 => E4M3
-//   1 => E3M4
+//   0 => E4M3 (with subnormals)
+//   1 => E3M4 (with subnormals)
+//   2 => E3M4_NO_SUBNORM (pure-normal, no subnormals)
 #ifndef GGML_SIM_FP8_LAYOUT
 #define GGML_SIM_FP8_LAYOUT 0
 #endif
 
 #define GGML_SIM_FP8_LAYOUT_E4M3 0
 #define GGML_SIM_FP8_LAYOUT_E3M4 1
+#define GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM 2
 
 #if GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E4M3 && \
-    GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4
-#error "GGML_SIM_FP8_LAYOUT must be 0 (E4M3) or 1 (E3M4)"
+    GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4 && \
+    GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM
+#error "GGML_SIM_FP8_LAYOUT must be 0 (E4M3), 1 (E3M4), or 2 (E3M4_NO_SUBNORM)"
 #endif
 
 // block 大小（默认 128，可通过 -DGGML_SIM_FP8E4M3_BLOCK=... 覆盖）
@@ -137,7 +140,7 @@ typedef double ggml_float;
 #endif
 
 // Output simulation mode for GEMM/GEMV results before storing F32:
-//   0 = keep existing FP8 block QDQ behavior (E4M3/E3M4 selected by macros, gated by GGML_SIM_FP8E4M3)
+//   0 = keep existing FP8 block QDQ behavior (layout selected by macros, gated by GGML_SIM_FP8E4M3)
 //   1 = round to BF16 then convert back to F32
 #ifndef GGML_SIM_MATMUL_OUT_MODE
 #define GGML_SIM_MATMUL_OUT_MODE 0

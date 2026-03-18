@@ -35,7 +35,8 @@ static inline int ggml_sim_mantissa_bits(void) {
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
     return 4;
 #else
-    return GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ? 4 : 3;
+    return (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ||
+            GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM) ? 4 : 3;
 #endif
 }
 
@@ -43,16 +44,36 @@ static inline int ggml_sim_exponent_bits(void) {
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
     return 4;
 #else
-    return GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ? 3 : 4;
+    return (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ||
+            GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM) ? 3 : 4;
+#endif
+}
+
+static inline bool ggml_sim_support_subnormals(void) {
+#if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
+    return true;
+#else
+    return GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM;
 #endif
 }
 
 static inline int ggml_sim_exponent_bias(void) {
-    return (1 << (ggml_sim_exponent_bits() - 1)) - 1;
+    int bias = (1 << (ggml_sim_exponent_bits() - 1)) - 1;
+#if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F8
+    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM) {
+        // Pure-normal E3M4 mode requested by experiment:
+        // reassign former subnormal exponent budget to normal numbers.
+        // For E3M4 this yields bias=7 (old subnormal -6 maps to normal -7 with hidden bit=1).
+        bias += ggml_sim_mantissa_bits();
+    }
+#endif
+    return bias;
 }
 
 static inline int ggml_sim_min_norm_exp_unbiased(void) {
-    return 1 - ggml_sim_exponent_bias();
+    // With subnormals: smallest normal is exp-field=1.
+    // Without subnormals: exp-field=0 is also normal.
+    return ggml_sim_support_subnormals() ? (1 - ggml_sim_exponent_bias()) : (-ggml_sim_exponent_bias());
 }
 
 static inline int ggml_sim_max_exp_field(void) {
@@ -67,6 +88,9 @@ static inline const char * ggml_sim_format_name(void) {
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
     return "F9(E4M4-like)";
 #else
+    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM) {
+        return "F8(E3M4-no-subnorm)";
+    }
     return GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ? "F8(E3M4)" : "F8(E4M3)";
 #endif
 }
@@ -88,6 +112,10 @@ static inline float ggml_fp8e4m3_handle_non_finite(float x) {
 
 static inline float ggml_fp8e4m3_min_subnormal(void) {
     // exp=0, mant=1 => 2^(1-bias) * 2^(-mant_bits)
+    // If subnormals are disabled, return min normal so subnormal bucket becomes empty.
+    if (!ggml_sim_support_subnormals()) {
+        return ldexpf(1.0f, ggml_sim_min_norm_exp_unbiased());
+    }
     return ldexpf(1.0f, ggml_sim_min_norm_exp_unbiased() - ggml_sim_mantissa_bits());
 }
 
@@ -120,6 +148,7 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
 
     const int exp_bias = ggml_sim_exponent_bias();
     const int max_exp_field = ggml_sim_max_exp_field();
+    const int min_exp_field = ggml_sim_support_subnormals() ? 1 : 0;
     const int min_norm_exp = ggml_sim_min_norm_exp_unbiased();
 
     // normalized threshold: exp==1, mant==0 => 1.0 * 2^(1-bias)
@@ -132,7 +161,7 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
         e -= 1;
         // exp field = e + bias
         int ef = e + exp_bias;
-        GGML_ASSERT(ef >= 1 && "ef <= 0 should not happen because ax >= min_norm");
+        GGML_ASSERT(ef >= min_exp_field && "ef is below minimum normal exponent field");
         if (ef > max_exp_field) {
             return sign * max_f;
         }
@@ -151,6 +180,10 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
         const int de = ef - exp_bias;
         return sign * ldexpf(dq, de);
     } else {
+        if (!ggml_sim_support_subnormals()) {
+            // In pure-normal mode, values below min_norm round to either 0 or min_norm.
+            return sign * min_norm;
+        }
         // subnormal: exp field=0, value = 2^(1-bias) * (mant / 2^mant_bits)
         // so mant = round(ax / 2^(1-bias) * 2^mant_bits)
         const float scale = ldexpf(1.0f, -min_norm_exp) * (float)mant_levels;
@@ -713,8 +746,13 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "    Exponent bits        : %d\n", exp_bits);
         fprintf(f, "    Mantissa bits        : %d\n", ggml_sim_mantissa_bits());
         fprintf(f, "    Exponent bias        : %d\n", exp_bias);
+        fprintf(f, "    Subnormal support    : %s\n", ggml_sim_support_subnormals() ? "ON" : "OFF (pure-normal)");
         fprintf(f, "    Max finite value     : %.1f\n", ggml_fp8e4m3_max_finite());
-        fprintf(f, "    Min subnormal value  : 2^(%d) = %.6f\n", min_sub_exp, ggml_fp8e4m3_min_subnormal());
+        if (ggml_sim_support_subnormals()) {
+            fprintf(f, "    Min subnormal value  : 2^(%d) = %.6f\n", min_sub_exp, ggml_fp8e4m3_min_subnormal());
+        } else {
+            fprintf(f, "    Min subnormal value  : N/A (disabled)\n");
+        }
         fprintf(f, "    Block size           : %d\n", GGML_SIM_FP8E4M3_BLOCK);
     fprintf(f, "    Scale type for src0/src1      : %s\n",
         GGML_SIM_FP8E4M3_SCALE_TYPE_IN == GGML_SIM_FP8E4M3_SCALE_TYPE_INT8_POW2
