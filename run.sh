@@ -16,13 +16,13 @@ STRIDE="${STRIDE:-0}"
 
 # Compile-time simulation switches
 # GGML_SIM_MATMUL_OUT_MODE:
-#   0 => FP8 output QDQ (E4M3/E3M4 selected by SIM_FP8_LAYOUT, gated by GGML_SIM_FP8E4M3)
+#   0 => FP8 output QDQ (E4M3/E3M4/E2M5 selected by SIM_FP8_LAYOUT, gated by GGML_SIM_FP8E4M3)
 #   1 => BF16 round-trip output simulation (F32 -> BF16 -> F32)
 SIM_FP8="${SIM_FP8:-1}"
 SIM_FP_FORMAT="${SIM_FP_FORMAT:-8}"
 # FP8 sub-format (effective only when SIM_FP_FORMAT=8):
-#   0=E4M3, 1=E3M4, 2=E3M4_NO_SUBNORM
-SIM_FP8_LAYOUT="${SIM_FP8_LAYOUT:-1}"
+#   0=E4M3, 1=E3M4, 2=E3M4_NO_SUBNORM, 3=E2M5, 4=E2M5_NO_SUBNORM
+SIM_FP8_LAYOUT="${SIM_FP8_LAYOUT:-2}"
 SIM_FP8_APPLY_SRC0="${SIM_FP8_APPLY_SRC0:-1}"
 SIM_FP8_APPLY_SRC1="${SIM_FP8_APPLY_SRC1:-1}"
 # Legacy single switch (kept for compatibility)
@@ -47,8 +47,8 @@ if [[ "${SIM_FP_FORMAT}" != "8" && "${SIM_FP_FORMAT}" != "9" ]]; then
   exit 1
 fi
 
-if [[ "${SIM_FP8_LAYOUT}" != "0" && "${SIM_FP8_LAYOUT}" != "1" && "${SIM_FP8_LAYOUT}" != "2" ]]; then
-  echo "invalid SIM_FP8_LAYOUT=${SIM_FP8_LAYOUT} (expected 0, 1 or 2)" >&2
+if [[ "${SIM_FP8_LAYOUT}" != "0" && "${SIM_FP8_LAYOUT}" != "1" && "${SIM_FP8_LAYOUT}" != "2" && "${SIM_FP8_LAYOUT}" != "3" && "${SIM_FP8_LAYOUT}" != "4" ]]; then
+  echo "invalid SIM_FP8_LAYOUT=${SIM_FP8_LAYOUT} (expected 0, 1, 2, 3 or 4)" >&2
   exit 1
 fi
 

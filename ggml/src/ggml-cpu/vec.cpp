@@ -5,7 +5,8 @@
 //
 // 约定：
 //  - Format由编译期宏选择：
-//      F8(E4M3) / F8(E3M4) / F9(E4M4-like)
+//      F8(E4M3) / F8(E3M4) / F8(E3M4-no-subnorm)
+//      F8(E2M5) / F8(E2M5-no-subnorm) / F9(E4M4-like)
 //  - 不生成 NaN/Inf（输入若超范围 -> 饱和到 max finite）
 //  - 支持 subnormal；小于最小 subnormal 才刷 0
 //  - 舍入：RNE (round-to-nearest-even)
@@ -35,6 +36,10 @@ static inline int ggml_sim_mantissa_bits(void) {
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
     return 4;
 #else
+    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5 ||
+        GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM) {
+        return 5;
+    }
     return (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ||
             GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM) ? 4 : 3;
 #endif
@@ -44,6 +49,10 @@ static inline int ggml_sim_exponent_bits(void) {
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
     return 4;
 #else
+    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5 ||
+        GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM) {
+        return 2;
+    }
     return (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ||
             GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM) ? 3 : 4;
 #endif
@@ -53,17 +62,20 @@ static inline bool ggml_sim_support_subnormals(void) {
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F9
     return true;
 #else
-    return GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM;
+    return GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM &&
+           GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM;
 #endif
 }
 
 static inline int ggml_sim_exponent_bias(void) {
     int bias = (1 << (ggml_sim_exponent_bits() - 1)) - 1;
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F8
-    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM) {
-        // Pure-normal E3M4 mode requested by experiment:
+    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM ||
+        GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM) {
+        // Pure-normal mode requested by experiment:
         // reassign former subnormal exponent budget to normal numbers.
         // For E3M4 this yields bias=7 (old subnormal -6 maps to normal -7 with hidden bit=1).
+        // For E2M5 this yields bias=6 with the same remapping rule.
         bias += ggml_sim_mantissa_bits();
     }
 #endif
@@ -90,6 +102,12 @@ static inline const char * ggml_sim_format_name(void) {
 #else
     if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM) {
         return "F8(E3M4-no-subnorm)";
+    }
+    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM) {
+        return "F8(E2M5-no-subnorm)";
+    }
+    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5) {
+        return "F8(E2M5)";
     }
     return GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4 ? "F8(E3M4)" : "F8(E4M3)";
 #endif

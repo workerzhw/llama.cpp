@@ -35,7 +35,7 @@ typedef double ggml_float;
 // FP8/FP9 block-quant simulation helpers
 //
 // 目标：模拟实际工程的“每 block 点一个 scale + 低比特浮点”。
-//  - FP8: E4M3 / E3M4（可选）
+//  - FP8: E4M3 / E3M4 / E2M5（可选）
 //  - FP9: E4M4-like
 //  - 溢出：饱和到最大有限值（max finite，工程约定为 480）
 //  - 下溢：低于最小非规格数（min subnormal * 0.5）才清零；支持非规格数
@@ -69,6 +69,8 @@ typedef double ggml_float;
 //   0 => E4M3 (with subnormals)
 //   1 => E3M4 (with subnormals)
 //   2 => E3M4_NO_SUBNORM (pure-normal, no subnormals)
+//   3 => E2M5 (with subnormals)
+//   4 => E2M5_NO_SUBNORM (pure-normal, no subnormals)
 #ifndef GGML_SIM_FP8_LAYOUT
 #define GGML_SIM_FP8_LAYOUT 0
 #endif
@@ -76,11 +78,15 @@ typedef double ggml_float;
 #define GGML_SIM_FP8_LAYOUT_E4M3 0
 #define GGML_SIM_FP8_LAYOUT_E3M4 1
 #define GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM 2
+#define GGML_SIM_FP8_LAYOUT_E2M5 3
+#define GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM 4
 
 #if GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E4M3 && \
     GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4 && \
-    GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM
-#error "GGML_SIM_FP8_LAYOUT must be 0 (E4M3), 1 (E3M4), or 2 (E3M4_NO_SUBNORM)"
+    GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM && \
+    GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E2M5 && \
+    GGML_SIM_FP8_LAYOUT != GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM
+#error "GGML_SIM_FP8_LAYOUT must be 0 (E4M3), 1 (E3M4), 2 (E3M4_NO_SUBNORM), 3 (E2M5), or 4 (E2M5_NO_SUBNORM)"
 #endif
 
 // block 大小（默认 128，可通过 -DGGML_SIM_FP8E4M3_BLOCK=... 覆盖）
