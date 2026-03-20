@@ -22,7 +22,7 @@ SIM_FP8="${SIM_FP8:-1}"
 SIM_FP_FORMAT="${SIM_FP_FORMAT:-8}"
 # FP8 sub-format (effective only when SIM_FP_FORMAT=8):
 #   0=E4M3, 1=E3M4, 2=E3M4_NO_SUBNORM, 3=E2M5, 4=E2M5_NO_SUBNORM
-SIM_FP8_LAYOUT="${SIM_FP8_LAYOUT:-2}"
+SIM_FP8_LAYOUT="${SIM_FP8_LAYOUT:-3}"
 SIM_FP8_APPLY_SRC0="${SIM_FP8_APPLY_SRC0:-1}"
 SIM_FP8_APPLY_SRC1="${SIM_FP8_APPLY_SRC1:-1}"
 # Legacy single switch (kept for compatibility)
@@ -87,18 +87,13 @@ cmake -B build \
 cmake --build build --config Release --target llama-perplexity -j "${THREADS}"
 
 export FP8_SIM_STATS_SAMPLE=100
-export GGML_MATMUL_DIST=1
-export GGML_MATMUL_DIST_SAMPLE=100
-export GGML_MATMUL_DIST_FILE="${OUT_DIR}/matmul.log"
+# Disable matmul distribution logging to avoid extra overhead and file output.
+export GGML_MATMUL_DIST=0
 
 if [[ "${DUMP_DOT}" == "1" ]]; then
   export LLAMA_DUMP_DOT="${DOT_FILE}"
 fi
 
-SEQ_BIN="${OUT_DIR}/kv_seq_${SEQ_ID}.bin"
-SEQ_TXT="${OUT_DIR}/kv_seq_${SEQ_ID}.txt"
-RUN_LOG="${OUT_DIR}/run.log"
-PPL_LOG="${OUT_DIR}/ppl.log"
 FP8_CLI_LOG="${OUT_DIR}/fp8_sim_analysis_cli.log"
 FP8_PPL_LOG="${OUT_DIR}/fp8_sim_analysis_ppl.log"
 
@@ -123,10 +118,7 @@ FP8_PPL_LOG="${OUT_DIR}/fp8_sim_analysis_ppl.log"
   -b "${BATCH}" \
   -ub "${UBATCH}" \
   -t "${THREADS}" \
-  --ppl-stride "${STRIDE}" \
-  --seq-state-out "${SEQ_BIN}" \
-  --seq-state-out-id "${SEQ_ID}" \
-  | tee "${PPL_LOG}"
+  --ppl-stride "${STRIDE}"
 
 if [ -f fp8_sim_analysis.log ]; then
   mv -f fp8_sim_analysis.log "${FP8_PPL_LOG}"
@@ -140,9 +132,6 @@ if [[ "${DUMP_DOT}" == "1" && -f "${DOT_FILE}" ]]; then
 fi
 
 echo "done."
-echo "seq state bin: ${SEQ_BIN}"
-echo "ppl log      : ${PPL_LOG}"
-echo "matmul log   : ${OUT_DIR}/matmul.log"
 echo "fp8 ppl log  : ${FP8_PPL_LOG}"
 if [[ "${DUMP_DOT}" == "1" ]]; then
   echo "dot graph    : ${DOT_FILE}"
