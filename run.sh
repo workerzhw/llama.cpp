@@ -18,7 +18,7 @@ STRIDE="${STRIDE:-0}"
 # GGML_SIM_MATMUL_OUT_MODE:
 #   0 => FP8 output QDQ (E4M3/E3M4/E2M5 selected by SIM_FP8_LAYOUT, gated by GGML_SIM_FP8E4M3)
 #   1 => BF16 round-trip output simulation (F32 -> BF16 -> F32)
-SIM_FP8="${SIM_FP8:-1}"
+SIM_FP8="${SIM_FP8:-0}"
 SIM_FP_FORMAT="${SIM_FP_FORMAT:-8}"
 # FP8 sub-format (effective only when SIM_FP_FORMAT=8):
 #   0=E4M3, 1=E3M4, 2=E3M4_NO_SUBNORM, 3=E2M5, 4=E2M5_NO_SUBNORM

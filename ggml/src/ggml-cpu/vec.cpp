@@ -1275,6 +1275,15 @@ static bool g_reduction_prod_atexit_registered = false;
 static ggml_reduction_prod_global_stats g_reduction_prod_stats;
 static std::vector<ggml_reduction_prod_sample> g_reduction_prod_samples;
 
+static inline bool ggml_reduction_prod_should_sample(int64_t * rid_out) {
+    const int sample_rate = GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE > 0 ? GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE : 1;
+    const int64_t rid = g_reduction_prod_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (rid_out) {
+        *rid_out = rid;
+    }
+    return (rid % sample_rate) == 0;
+}
+
 static inline int ggml_reduction_prod_hist_bin(const float abs_p) {
     if (!(abs_p > 0.0f) || !std::isfinite(abs_p)) {
         return 0;
@@ -1391,11 +1400,10 @@ static void ggml_reduction_prod_dump_atexit(void) {
 static ggml_float ggml_reduction_prod_profile_run_bf16(
         const ggml_bf16_t * GGML_RESTRICT x,
         const ggml_bf16_t * GGML_RESTRICT y,
+    const int64_t rid,
         const int n,
         const bool trunc_x,
         const bool trunc_y) {
-    const int64_t rid = g_reduction_prod_counter.fetch_add(1, std::memory_order_relaxed) + 1;
-
     int64_t hist_local[GGML_REDUCTION_PROD_PROFILE_BINS];
     memset(hist_local, 0, sizeof(hist_local));
 
@@ -1470,28 +1478,24 @@ static ggml_float ggml_reduction_prod_profile_run_bf16(
             g_reduction_prod_stats.hist[b] += hist_local[b];
         }
 
-        const int sample_rate = GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE > 0 ? GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE : 1;
-        const bool keep_sample = (rid % sample_rate == 0);
-        if (keep_sample) {
-            if ((int64_t) g_reduction_prod_samples.size() < (int64_t) GGML_REDUCTION_PROD_PROFILE_MAX_SAMPLES) {
-                g_reduction_prod_samples.push_back({
-                    rid,
-                    n,
-                    sum,
-                    sum_abs,
-                    sum_sq,
-                    max_abs,
-                    cancel_ratio,
-                    neff,
-                    neff_ratio,
-                    frac_lt_2p_8,
-                    frac_lt_2p_10,
-                    frac_lt_2p_12,
-                });
-                g_reduction_prod_stats.sampled_kept++;
-            } else {
-                g_reduction_prod_stats.sampled_dropped++;
-            }
+        if ((int64_t) g_reduction_prod_samples.size() < (int64_t) GGML_REDUCTION_PROD_PROFILE_MAX_SAMPLES) {
+            g_reduction_prod_samples.push_back({
+                rid,
+                n,
+                sum,
+                sum_abs,
+                sum_sq,
+                max_abs,
+                cancel_ratio,
+                neff,
+                neff_ratio,
+                frac_lt_2p_8,
+                frac_lt_2p_10,
+                frac_lt_2p_12,
+            });
+            g_reduction_prod_stats.sampled_kept++;
+        } else {
+            g_reduction_prod_stats.sampled_dropped++;
         }
 
         if (!g_reduction_prod_atexit_registered) {
@@ -1646,8 +1650,11 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     GGML_UNUSED(bs);
 
 #if GGML_REDUCTION_PROD_PROFILE
-    *s = (float) ggml_reduction_prod_profile_run_bf16(x, y, n, false, false);
-    return;
+    int64_t rid = 0;
+    if (ggml_reduction_prod_should_sample(&rid)) {
+        *s = (float) ggml_reduction_prod_profile_run_bf16(x, y, rid, n, false, false);
+        return;
+    }
 #endif
 
     int i = 0;
@@ -1729,8 +1736,11 @@ void ggml_vec_dot_bf16_trunc4(
     GGML_UNUSED(bs);
 
 #if GGML_REDUCTION_PROD_PROFILE
-    *s = (float) ggml_reduction_prod_profile_run_bf16(x, y, n, true, GGML_MULMAT_TRUNC4_SRC1);
-    return;
+    int64_t rid = 0;
+    if (ggml_reduction_prod_should_sample(&rid)) {
+        *s = (float) ggml_reduction_prod_profile_run_bf16(x, y, rid, n, true, GGML_MULMAT_TRUNC4_SRC1);
+        return;
+    }
 #endif
 
     int i = 0;
