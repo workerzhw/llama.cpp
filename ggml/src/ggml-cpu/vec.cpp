@@ -1228,6 +1228,282 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
 
 #include <cassert>
 
+#if GGML_REDUCTION_PROD_PROFILE
+#include <atomic>
+#include <cmath>
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <vector>
+
+struct ggml_reduction_prod_sample {
+    int64_t reduction_id;
+    int64_t n;
+    double sum;
+    double sum_abs;
+    double sum_sq;
+    double max_abs;
+    double cancel_ratio;
+    double neff;
+    double neff_ratio;
+    double frac_lt_2p_8;
+    double frac_lt_2p_10;
+    double frac_lt_2p_12;
+};
+
+struct ggml_reduction_prod_global_stats {
+    int64_t reductions;
+    int64_t total_products;
+    double sum_signed_products;
+    double sum_abs_products;
+    double sum_sq_products;
+    double max_abs_product;
+    double sum_cancel_ratio;
+    double sum_neff_ratio;
+    double sum_frac_lt_2p_8;
+    double sum_frac_lt_2p_10;
+    double sum_frac_lt_2p_12;
+    int64_t sampled_kept;
+    int64_t sampled_dropped;
+    int64_t hist[GGML_REDUCTION_PROD_PROFILE_BINS];
+};
+
+static std::mutex g_reduction_prod_mtx;
+static std::atomic<int64_t> g_reduction_prod_counter{0};
+static bool g_reduction_prod_atexit_registered = false;
+static ggml_reduction_prod_global_stats g_reduction_prod_stats;
+static std::vector<ggml_reduction_prod_sample> g_reduction_prod_samples;
+
+static inline int ggml_reduction_prod_hist_bin(const float abs_p) {
+    if (!(abs_p > 0.0f) || !std::isfinite(abs_p)) {
+        return 0;
+    }
+    const float min_lg = (float) GGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2;
+    const float max_lg = (float) GGML_REDUCTION_PROD_PROFILE_HIST_MAX_LOG2;
+    const float w = (max_lg - min_lg) / (float) GGML_REDUCTION_PROD_PROFILE_BINS;
+    const float lg = std::log2(abs_p);
+    int b = (int) std::floor((lg - min_lg) / w);
+    if (b < 0) {
+        b = 0;
+    }
+    if (b >= GGML_REDUCTION_PROD_PROFILE_BINS) {
+        b = GGML_REDUCTION_PROD_PROFILE_BINS - 1;
+    }
+    return b;
+}
+
+static inline float ggml_reduction_prod_mul_bf16(
+        const ggml_bf16_t * GGML_RESTRICT x,
+        const ggml_bf16_t * GGML_RESTRICT y,
+        const int i,
+        const bool trunc_x,
+        const bool trunc_y) {
+    ggml_bf16_t xb = trunc_x ? ggml_bf16_rna_trunc4(x[i]) : x[i];
+    ggml_bf16_t yb = trunc_y ? ggml_bf16_rna_trunc4(y[i]) : y[i];
+    return GGML_BF16_TO_FP32(xb) * GGML_BF16_TO_FP32(yb);
+}
+
+static void ggml_reduction_prod_dump_atexit(void) {
+    char path_summary[512];
+    char path_hist[512];
+    char path_samples[512];
+    snprintf(path_summary, sizeof(path_summary), "%s_summary.log", GGML_REDUCTION_PROD_PROFILE_PREFIX);
+    snprintf(path_hist, sizeof(path_hist), "%s_global_hist.csv", GGML_REDUCTION_PROD_PROFILE_PREFIX);
+    snprintf(path_samples, sizeof(path_samples), "%s_samples.csv", GGML_REDUCTION_PROD_PROFILE_PREFIX);
+
+    std::lock_guard<std::mutex> lock(g_reduction_prod_mtx);
+    if (g_reduction_prod_stats.reductions <= 0) {
+        return;
+    }
+
+    FILE * fs = fopen(path_summary, "w");
+    if (fs) {
+        const double nred = (double) g_reduction_prod_stats.reductions;
+        const double avg_n = (double) g_reduction_prod_stats.total_products / nred;
+        const double avg_cancel = g_reduction_prod_stats.sum_cancel_ratio / nred;
+        const double avg_neff_ratio = g_reduction_prod_stats.sum_neff_ratio / nred;
+        const double avg_frac_lt_2p_8 = g_reduction_prod_stats.sum_frac_lt_2p_8 / nred;
+        const double avg_frac_lt_2p_10 = g_reduction_prod_stats.sum_frac_lt_2p_10 / nred;
+        const double avg_frac_lt_2p_12 = g_reduction_prod_stats.sum_frac_lt_2p_12 / nred;
+        const double mean_abs_p = g_reduction_prod_stats.total_products > 0
+            ? g_reduction_prod_stats.sum_abs_products / (double) g_reduction_prod_stats.total_products
+            : 0.0;
+        const double rms_p = g_reduction_prod_stats.total_products > 0
+            ? std::sqrt(g_reduction_prod_stats.sum_sq_products / (double) g_reduction_prod_stats.total_products)
+            : 0.0;
+
+        fprintf(fs, "Reduction Product Profile Summary\n");
+        fprintf(fs, "================================\n");
+        fprintf(fs, "reductions            : %" PRId64 "\n", g_reduction_prod_stats.reductions);
+        fprintf(fs, "total_products        : %" PRId64 "\n", g_reduction_prod_stats.total_products);
+        fprintf(fs, "avg_n_per_reduction   : %.3f\n", avg_n);
+        fprintf(fs, "mean_abs_product      : %.6e\n", mean_abs_p);
+        fprintf(fs, "rms_product           : %.6e\n", rms_p);
+        fprintf(fs, "max_abs_product       : %.6e\n", g_reduction_prod_stats.max_abs_product);
+        fprintf(fs, "avg_cancel_ratio      : %.6f\n", avg_cancel);
+        fprintf(fs, "avg_neff_ratio        : %.6f\n", avg_neff_ratio);
+        fprintf(fs, "avg_frac_lt_2^-8      : %.6f\n", avg_frac_lt_2p_8);
+        fprintf(fs, "avg_frac_lt_2^-10     : %.6f\n", avg_frac_lt_2p_10);
+        fprintf(fs, "avg_frac_lt_2^-12     : %.6f\n", avg_frac_lt_2p_12);
+        fprintf(fs, "sampled_kept          : %" PRId64 "\n", g_reduction_prod_stats.sampled_kept);
+        fprintf(fs, "sampled_dropped       : %" PRId64 "\n", g_reduction_prod_stats.sampled_dropped);
+        fclose(fs);
+    }
+
+    FILE * fh = fopen(path_hist, "w");
+    if (fh) {
+        const double min_lg = (double) GGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2;
+        const double max_lg = (double) GGML_REDUCTION_PROD_PROFILE_HIST_MAX_LOG2;
+        const double w = (max_lg - min_lg) / (double) GGML_REDUCTION_PROD_PROFILE_BINS;
+        fprintf(fh, "bin,log2_lo,log2_hi,count\n");
+        for (int b = 0; b < GGML_REDUCTION_PROD_PROFILE_BINS; ++b) {
+            const double lo = min_lg + w * (double) b;
+            const double hi = lo + w;
+            fprintf(fh, "%d,%.6f,%.6f,%" PRId64 "\n", b, lo, hi, g_reduction_prod_stats.hist[b]);
+        }
+        fclose(fh);
+    }
+
+    FILE * fp = fopen(path_samples, "w");
+    if (fp) {
+        fprintf(fp, "reduction_id,n,sum,sum_abs,sum_sq,max_abs,cancel_ratio,neff,neff_ratio,frac_lt_2p_8,frac_lt_2p_10,frac_lt_2p_12\n");
+        for (const auto & s : g_reduction_prod_samples) {
+            fprintf(fp,
+                "%" PRId64 ",%" PRId64 ",%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e\n",
+                s.reduction_id,
+                s.n,
+                s.sum,
+                s.sum_abs,
+                s.sum_sq,
+                s.max_abs,
+                s.cancel_ratio,
+                s.neff,
+                s.neff_ratio,
+                s.frac_lt_2p_8,
+                s.frac_lt_2p_10,
+                s.frac_lt_2p_12);
+        }
+        fclose(fp);
+    }
+}
+
+static ggml_float ggml_reduction_prod_profile_run_bf16(
+        const ggml_bf16_t * GGML_RESTRICT x,
+        const ggml_bf16_t * GGML_RESTRICT y,
+        const int n,
+        const bool trunc_x,
+        const bool trunc_y) {
+    const int64_t rid = g_reduction_prod_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    int64_t hist_local[GGML_REDUCTION_PROD_PROFILE_BINS];
+    memset(hist_local, 0, sizeof(hist_local));
+
+    double sum = 0.0;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    double max_abs = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        const float p = ggml_reduction_prod_mul_bf16(x, y, i, trunc_x, trunc_y);
+        const double pd = (double) p;
+        const double ap = std::fabs(pd);
+        sum += pd;
+        sum_abs += ap;
+        sum_sq += pd * pd;
+        if (ap > max_abs) {
+            max_abs = ap;
+        }
+        hist_local[ggml_reduction_prod_hist_bin((float) ap)]++;
+    }
+
+    double frac_lt_2p_8 = 0.0;
+    double frac_lt_2p_10 = 0.0;
+    double frac_lt_2p_12 = 0.0;
+    if (n > 0 && max_abs > 0.0) {
+        int64_t c8 = 0;
+        int64_t c10 = 0;
+        int64_t c12 = 0;
+        const double th8 = max_abs * std::ldexp(1.0, -8);
+        const double th10 = max_abs * std::ldexp(1.0, -10);
+        const double th12 = max_abs * std::ldexp(1.0, -12);
+        for (int i = 0; i < n; ++i) {
+            const float p = ggml_reduction_prod_mul_bf16(x, y, i, trunc_x, trunc_y);
+            const double ap = std::fabs((double) p);
+            if (ap < th8) {
+                c8++;
+            }
+            if (ap < th10) {
+                c10++;
+            }
+            if (ap < th12) {
+                c12++;
+            }
+        }
+        frac_lt_2p_8 = (double) c8 / (double) n;
+        frac_lt_2p_10 = (double) c10 / (double) n;
+        frac_lt_2p_12 = (double) c12 / (double) n;
+    }
+
+    const double cancel_ratio = sum_abs > 0.0 ? std::fabs(sum) / sum_abs : 0.0;
+    const double neff = sum_sq > 0.0 ? (sum_abs * sum_abs) / sum_sq : 0.0;
+    const double neff_ratio = n > 0 ? neff / (double) n : 0.0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_reduction_prod_mtx);
+
+        g_reduction_prod_stats.reductions++;
+        g_reduction_prod_stats.total_products += n;
+        g_reduction_prod_stats.sum_signed_products += sum;
+        g_reduction_prod_stats.sum_abs_products += sum_abs;
+        g_reduction_prod_stats.sum_sq_products += sum_sq;
+        if (max_abs > g_reduction_prod_stats.max_abs_product) {
+            g_reduction_prod_stats.max_abs_product = max_abs;
+        }
+        g_reduction_prod_stats.sum_cancel_ratio += cancel_ratio;
+        g_reduction_prod_stats.sum_neff_ratio += neff_ratio;
+        g_reduction_prod_stats.sum_frac_lt_2p_8 += frac_lt_2p_8;
+        g_reduction_prod_stats.sum_frac_lt_2p_10 += frac_lt_2p_10;
+        g_reduction_prod_stats.sum_frac_lt_2p_12 += frac_lt_2p_12;
+
+        for (int b = 0; b < GGML_REDUCTION_PROD_PROFILE_BINS; ++b) {
+            g_reduction_prod_stats.hist[b] += hist_local[b];
+        }
+
+        const int sample_rate = GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE > 0 ? GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE : 1;
+        const bool keep_sample = (rid % sample_rate == 0);
+        if (keep_sample) {
+            if ((int64_t) g_reduction_prod_samples.size() < (int64_t) GGML_REDUCTION_PROD_PROFILE_MAX_SAMPLES) {
+                g_reduction_prod_samples.push_back({
+                    rid,
+                    n,
+                    sum,
+                    sum_abs,
+                    sum_sq,
+                    max_abs,
+                    cancel_ratio,
+                    neff,
+                    neff_ratio,
+                    frac_lt_2p_8,
+                    frac_lt_2p_10,
+                    frac_lt_2p_12,
+                });
+                g_reduction_prod_stats.sampled_kept++;
+            } else {
+                g_reduction_prod_stats.sampled_dropped++;
+            }
+        }
+
+        if (!g_reduction_prod_atexit_registered) {
+            g_reduction_prod_atexit_registered = true;
+            atexit(ggml_reduction_prod_dump_atexit);
+        }
+    }
+
+    return (ggml_float) sum;
+}
+#endif // GGML_REDUCTION_PROD_PROFILE
+
 // precomputed gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_f16[1 << 16];
 
@@ -1368,6 +1644,12 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
     GGML_UNUSED(bs);
+
+#if GGML_REDUCTION_PROD_PROFILE
+    *s = (float) ggml_reduction_prod_profile_run_bf16(x, y, n, false, false);
+    return;
+#endif
+
     int i = 0;
     ggml_float sumf = 0;
 
@@ -1445,6 +1727,11 @@ void ggml_vec_dot_bf16_trunc4(
     GGML_UNUSED(bx);
     GGML_UNUSED(by);
     GGML_UNUSED(bs);
+
+#if GGML_REDUCTION_PROD_PROFILE
+    *s = (float) ggml_reduction_prod_profile_run_bf16(x, y, n, true, GGML_MULMAT_TRUNC4_SRC1);
+    return;
+#endif
 
     int i = 0;
     ggml_float sumf = 0;

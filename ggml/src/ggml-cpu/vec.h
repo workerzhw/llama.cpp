@@ -242,6 +242,56 @@ void ggml_fp8_sim_stats_report(const char * report_file);
 #define GGML_MMLOG(...) do {} while (0)
 #endif
 
+// ---------------------------------------------------------------------------
+// Reduction-product profiler (dot-kernel online stats)
+//
+// When enabled, ggml_vec_dot_bf16 / ggml_vec_dot_bf16_trunc4 compute per-
+// reduction product statistics for NPU low-power analysis.
+//
+// Notes:
+// - This profiler prioritizes full observability over speed.
+// - Enabling it forces scalar accumulation in these BF16 dot kernels.
+//
+// Output files are emitted at process exit:
+//   reduction_prod_profile_summary.log
+//   reduction_prod_profile_global_hist.csv
+//   reduction_prod_profile_samples.csv
+// ---------------------------------------------------------------------------
+
+// 0=disabled, 1=enabled
+#ifndef GGML_REDUCTION_PROD_PROFILE
+#define GGML_REDUCTION_PROD_PROFILE 0
+#endif
+
+// Number of |p| log2 histogram bins over [GGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2,
+// GGML_REDUCTION_PROD_PROFILE_HIST_MAX_LOG2]
+#ifndef GGML_REDUCTION_PROD_PROFILE_BINS
+#define GGML_REDUCTION_PROD_PROFILE_BINS 128
+#endif
+
+#ifndef GGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2
+#define GGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2 -40
+#endif
+
+#ifndef GGML_REDUCTION_PROD_PROFILE_HIST_MAX_LOG2
+#define GGML_REDUCTION_PROD_PROFILE_HIST_MAX_LOG2 40
+#endif
+
+// Keep 1 out of every N reductions as a sampled record in samples.csv
+#ifndef GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE
+#define GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE 1000
+#endif
+
+// Upper bound for sampled reductions kept in memory for dump
+#ifndef GGML_REDUCTION_PROD_PROFILE_MAX_SAMPLES
+#define GGML_REDUCTION_PROD_PROFILE_MAX_SAMPLES 2000
+#endif
+
+// Output file prefix, can be overridden at compile time
+#ifndef GGML_REDUCTION_PROD_PROFILE_PREFIX
+#define GGML_REDUCTION_PROD_PROFILE_PREFIX "reduction_prod_profile"
+#endif
+
 
 #ifdef __cplusplus
 extern "C" {

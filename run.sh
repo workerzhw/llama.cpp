@@ -31,7 +31,39 @@ SIM_FP8_SCALE_TYPE="${SIM_FP8_SCALE_TYPE:-0}"
 SIM_FP8_SCALE_TYPE_IN="${SIM_FP8_SCALE_TYPE_IN:-${SIM_FP8_SCALE_TYPE}}"
 SIM_FP8_SCALE_TYPE_OUT="${SIM_FP8_SCALE_TYPE_OUT:-${SIM_FP8_SCALE_TYPE}}"
 SIM_FP8_BLOCK="${SIM_FP8_BLOCK:-16}"
-SIM_MATMUL_OUT_MODE="${SIM_MATMUL_OUT_MODE:-0}"
+SIM_MATMUL_OUT_MODE="${SIM_MATMUL_OUT_MODE:-1}"
+
+# Reduction-product profiler switches
+# 0/1: enable online reduction-product profiling in BF16 dot kernels.
+# Maps to: GGML_REDUCTION_PROD_PROFILE
+REDUCTION_PROD_PROFILE="${REDUCTION_PROD_PROFILE:-0}"
+
+# Number of histogram bins for global |x*y| magnitude distribution (log2 domain).
+# Maps to: GGML_REDUCTION_PROD_PROFILE_BINS
+REDUCTION_PROD_PROFILE_BINS="${REDUCTION_PROD_PROFILE_BINS:-128}"
+
+# Lower bound (inclusive bin edge domain) for log2(|x*y|) histogram.
+# Maps to: GGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2
+REDUCTION_PROD_PROFILE_HIST_MIN_LOG2="${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2:--40}"
+
+# Upper bound for log2(|x*y|) histogram. Must be greater than MIN_LOG2.
+# Maps to: GGML_REDUCTION_PROD_PROFILE_HIST_MAX_LOG2
+REDUCTION_PROD_PROFILE_HIST_MAX_LOG2="${REDUCTION_PROD_PROFILE_HIST_MAX_LOG2:-40}"
+
+# Keep 1 sampled reduction record per N reductions in samples.csv.
+# Maps to: GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE
+REDUCTION_PROD_PROFILE_SAMPLE_RATE="${REDUCTION_PROD_PROFILE_SAMPLE_RATE:-1000}"
+
+# Max sampled reduction records retained in memory before dropping extras.
+# Maps to: GGML_REDUCTION_PROD_PROFILE_MAX_SAMPLES
+REDUCTION_PROD_PROFILE_MAX_SAMPLES="${REDUCTION_PROD_PROFILE_MAX_SAMPLES:-2000}"
+
+# Output file prefix for profiler artifacts:
+#   <prefix>_summary.log
+#   <prefix>_global_hist.csv
+#   <prefix>_samples.csv
+# Maps to: GGML_REDUCTION_PROD_PROFILE_PREFIX
+REDUCTION_PROD_PROFILE_PREFIX="${REDUCTION_PROD_PROFILE_PREFIX:-reduction_prod_profile}"
 
 # Graph dump switches
 DUMP_DOT="${DUMP_DOT:-0}"
@@ -47,7 +79,7 @@ if [[ "${SIM_FP_FORMAT}" != "8" && "${SIM_FP_FORMAT}" != "9" ]]; then
   exit 1
 fi
 
-if [[ "${SIM_FP8_LAYOUT}" != "0" && "${SIM_FP8_LAYOUT}" != "1" && "${SIM_FP8_LAYOUT}" != "2" && "${SIM_FP8_LAYOUT}" != "3" && "${SIM_FP8_LAYOUT}" != "4" ]]; then
+if [[ "${SIM_FP8_LAYOUT}" != "0" && "${SIM_FP8_LAYOUT}" != "1" && "${SIM_FP8_LAYOUT}" != "2" && "${SIM_FP8_LAYOUT}"  != "3" && "${SIM_FP8_LAYOUT}" != "4" ]]; then
   echo "invalid SIM_FP8_LAYOUT=${SIM_FP8_LAYOUT} (expected 0, 1, 2, 3 or 4)" >&2
   exit 1
 fi
@@ -62,6 +94,46 @@ if [[ "${SIM_FP8_SCALE_TYPE_OUT}" != "0" && "${SIM_FP8_SCALE_TYPE_OUT}" != "1" ]
   exit 1
 fi
 
+if [[ "${REDUCTION_PROD_PROFILE}" != "0" && "${REDUCTION_PROD_PROFILE}" != "1" ]]; then
+  echo "invalid REDUCTION_PROD_PROFILE=${REDUCTION_PROD_PROFILE} (expected 0 or 1)" >&2
+  exit 1
+fi
+
+if ! [[ "${REDUCTION_PROD_PROFILE_BINS}" =~ ^[0-9]+$ ]] || [[ "${REDUCTION_PROD_PROFILE_BINS}" -le 0 ]]; then
+  echo "invalid REDUCTION_PROD_PROFILE_BINS=${REDUCTION_PROD_PROFILE_BINS} (expected positive integer)" >&2
+  exit 1
+fi
+
+if ! [[ "${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2}" =~ ^-?[0-9]+$ ]]; then
+  echo "invalid REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2} (expected integer)" >&2
+  exit 1
+fi
+
+if ! [[ "${REDUCTION_PROD_PROFILE_HIST_MAX_LOG2}" =~ ^-?[0-9]+$ ]]; then
+  echo "invalid REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=${REDUCTION_PROD_PROFILE_HIST_MAX_LOG2} (expected integer)" >&2
+  exit 1
+fi
+
+if [[ "${REDUCTION_PROD_PROFILE_HIST_MAX_LOG2}" -le "${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2}" ]]; then
+  echo "invalid reduction profile log2 range: min=${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2}, max=${REDUCTION_PROD_PROFILE_HIST_MAX_LOG2} (expected max > min)" >&2
+  exit 1
+fi
+
+if ! [[ "${REDUCTION_PROD_PROFILE_SAMPLE_RATE}" =~ ^[0-9]+$ ]] || [[ "${REDUCTION_PROD_PROFILE_SAMPLE_RATE}" -le 0 ]]; then
+  echo "invalid REDUCTION_PROD_PROFILE_SAMPLE_RATE=${REDUCTION_PROD_PROFILE_SAMPLE_RATE} (expected positive integer)" >&2
+  exit 1
+fi
+
+if ! [[ "${REDUCTION_PROD_PROFILE_MAX_SAMPLES}" =~ ^[0-9]+$ ]] || [[ "${REDUCTION_PROD_PROFILE_MAX_SAMPLES}" -le 0 ]]; then
+  echo "invalid REDUCTION_PROD_PROFILE_MAX_SAMPLES=${REDUCTION_PROD_PROFILE_MAX_SAMPLES} (expected positive integer)" >&2
+  exit 1
+fi
+
+if [[ -z "${REDUCTION_PROD_PROFILE_PREFIX}" ]]; then
+  echo "invalid REDUCTION_PROD_PROFILE_PREFIX: empty string" >&2
+  exit 1
+fi
+
 SIM_FLAGS="-DGGML_SIM_FP8E4M3=${SIM_FP8} \
   -DGGML_SIM_FP_FORMAT=${SIM_FP_FORMAT} \
   -DGGML_SIM_FP8_LAYOUT=${SIM_FP8_LAYOUT} \
@@ -71,7 +143,14 @@ SIM_FLAGS="-DGGML_SIM_FP8E4M3=${SIM_FP8} \
   -DGGML_SIM_FP8E4M3_SCALE_TYPE_IN=${SIM_FP8_SCALE_TYPE_IN} \
   -DGGML_SIM_FP8E4M3_SCALE_TYPE_OUT=${SIM_FP8_SCALE_TYPE_OUT} \
   -DGGML_SIM_FP8E4M3_BLOCK=${SIM_FP8_BLOCK} \
-  -DGGML_SIM_MATMUL_OUT_MODE=${SIM_MATMUL_OUT_MODE}"
+  -DGGML_SIM_MATMUL_OUT_MODE=${SIM_MATMUL_OUT_MODE} \
+  -DGGML_REDUCTION_PROD_PROFILE=${REDUCTION_PROD_PROFILE} \
+  -DGGML_REDUCTION_PROD_PROFILE_BINS=${REDUCTION_PROD_PROFILE_BINS} \
+  -DGGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2} \
+  -DGGML_REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=${REDUCTION_PROD_PROFILE_HIST_MAX_LOG2} \
+  -DGGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE=${REDUCTION_PROD_PROFILE_SAMPLE_RATE} \
+  -DGGML_REDUCTION_PROD_PROFILE_MAX_SAMPLES=${REDUCTION_PROD_PROFILE_MAX_SAMPLES} \
+  -DGGML_REDUCTION_PROD_PROFILE_PREFIX=\"${REDUCTION_PROD_PROFILE_PREFIX}\""
 
 source ~/miniforge3/bin/activate
 rm -rf build
