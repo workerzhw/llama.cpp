@@ -348,7 +348,7 @@ if [[ -f "scripts/make_reduction_drop_compare_table.py" ]]; then
   for out_root in ${unique_out_dirs}; do
     compare_csv="${out_root}/reduction_block_drop_compare.csv"
     compare_md="${out_root}/reduction_block_drop_compare.md"
-    python scripts/make_reduction_drop_compare_table.py \
+    python3 scripts/make_reduction_drop_compare_table.py \
       --root "${out_root}" \
       --out-csv "${compare_csv}" \
       --out-md "${compare_md}" || true

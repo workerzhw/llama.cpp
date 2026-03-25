@@ -1277,6 +1277,7 @@ struct ggml_reduction_prod_global_stats {
 
 static std::mutex g_reduction_prod_mtx;
 static std::atomic<int64_t> g_reduction_prod_counter{0};
+static std::atomic<int64_t> g_reduction_prod_all_block_terms{0};
 static bool g_reduction_prod_atexit_registered = false;
 static ggml_reduction_prod_global_stats g_reduction_prod_stats;
 static std::vector<ggml_reduction_prod_sample> g_reduction_prod_samples;
@@ -1335,16 +1336,20 @@ static void ggml_reduction_prod_dump_atexit(void) {
     FILE * fs = fopen(path_summary, "w");
     if (fs) {
         const double nred = (double) g_reduction_prod_stats.reductions;
+        const int64_t all_reductions = g_reduction_prod_counter.load(std::memory_order_relaxed);
+        const int64_t all_block_terms = g_reduction_prod_all_block_terms.load(std::memory_order_relaxed);
         const double avg_n = (double) g_reduction_prod_stats.total_products / nred;
         const double avg_cancel = g_reduction_prod_stats.sum_cancel_ratio / nred;
         const double avg_neff_ratio = g_reduction_prod_stats.sum_neff_ratio / nred;
         const double avg_frac_lt_2p_8 = g_reduction_prod_stats.sum_frac_lt_2p_8 / nred;
         const double avg_frac_lt_2p_10 = g_reduction_prod_stats.sum_frac_lt_2p_10 / nred;
         const double avg_frac_lt_2p_12 = g_reduction_prod_stats.sum_frac_lt_2p_12 / nred;
-        const double avg_block_drop_ratio = g_reduction_prod_stats.sum_block_drop_ratio / nred;
-        const double global_block_drop_ratio = g_reduction_prod_stats.total_block_terms > 0
+        const double sampled_avg_block_drop_ratio = g_reduction_prod_stats.sum_block_drop_ratio / nred;
+        const double sampled_global_block_drop_ratio = g_reduction_prod_stats.total_block_terms > 0
             ? (double) g_reduction_prod_stats.total_block_dropped / (double) g_reduction_prod_stats.total_block_terms
             : 0.0;
+        const double estimated_global_block_dropped = sampled_global_block_drop_ratio * (double) all_block_terms;
+        const double estimated_global_block_drop_ratio = sampled_global_block_drop_ratio;
         const double mean_abs_p = g_reduction_prod_stats.total_products > 0
             ? g_reduction_prod_stats.sum_abs_products / (double) g_reduction_prod_stats.total_products
             : 0.0;
@@ -1355,6 +1360,7 @@ static void ggml_reduction_prod_dump_atexit(void) {
         fprintf(fs, "Reduction Product Profile Summary\n");
         fprintf(fs, "================================\n");
         fprintf(fs, "reductions            : %" PRId64 "\n", g_reduction_prod_stats.reductions);
+        fprintf(fs, "all_reductions        : %" PRId64 "\n", all_reductions);
         fprintf(fs, "total_products        : %" PRId64 "\n", g_reduction_prod_stats.total_products);
         fprintf(fs, "avg_n_per_reduction   : %.3f\n", avg_n);
         fprintf(fs, "mean_abs_product      : %.6e\n", mean_abs_p);
@@ -1367,10 +1373,13 @@ static void ggml_reduction_prod_dump_atexit(void) {
         fprintf(fs, "avg_frac_lt_2^-8      : %.6f\n", avg_frac_lt_2p_8);
         fprintf(fs, "avg_frac_lt_2^-10     : %.6f\n", avg_frac_lt_2p_10);
         fprintf(fs, "avg_frac_lt_2^-12     : %.6f\n", avg_frac_lt_2p_12);
-        fprintf(fs, "total_block_terms     : %" PRId64 "\n", g_reduction_prod_stats.total_block_terms);
-        fprintf(fs, "total_block_dropped   : %" PRId64 "\n", g_reduction_prod_stats.total_block_dropped);
-        fprintf(fs, "global_block_drop_ratio: %.6f\n", global_block_drop_ratio);
-        fprintf(fs, "avg_block_drop_ratio  : %.6f\n", avg_block_drop_ratio);
+        fprintf(fs, "sampled_block_terms   : %" PRId64 "\n", g_reduction_prod_stats.total_block_terms);
+        fprintf(fs, "sampled_block_dropped : %" PRId64 "\n", g_reduction_prod_stats.total_block_dropped);
+        fprintf(fs, "sampled_global_block_drop_ratio: %.6f\n", sampled_global_block_drop_ratio);
+        fprintf(fs, "sampled_avg_block_drop_ratio   : %.6f\n", sampled_avg_block_drop_ratio);
+        fprintf(fs, "all_block_terms       : %" PRId64 "\n", all_block_terms);
+        fprintf(fs, "estimated_global_block_dropped : %.0f\n", estimated_global_block_dropped);
+        fprintf(fs, "estimated_global_block_drop_ratio: %.6f\n", estimated_global_block_drop_ratio);
         fprintf(fs, "sampled_kept          : %" PRId64 "\n", g_reduction_prod_stats.sampled_kept);
         fprintf(fs, "sampled_dropped       : %" PRId64 "\n", g_reduction_prod_stats.sampled_dropped);
         fclose(fs);
@@ -1700,6 +1709,10 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     GGML_UNUSED(bs);
 
 #if GGML_REDUCTION_PROD_PROFILE
+    const int block_size_all = GGML_SIM_FP8E4M3_BLOCK > 0 ? GGML_SIM_FP8E4M3_BLOCK : 16;
+    const int64_t block_terms_all = (n + block_size_all - 1) / block_size_all;
+    g_reduction_prod_all_block_terms.fetch_add(block_terms_all, std::memory_order_relaxed);
+
     int64_t rid = 0;
     if (ggml_reduction_prod_should_sample(&rid)) {
         *s = (float) ggml_reduction_prod_profile_run_bf16(x, y, rid, n, false, false);
@@ -1786,6 +1799,10 @@ void ggml_vec_dot_bf16_trunc4(
     GGML_UNUSED(bs);
 
 #if GGML_REDUCTION_PROD_PROFILE
+    const int block_size_all = GGML_SIM_FP8E4M3_BLOCK > 0 ? GGML_SIM_FP8E4M3_BLOCK : 16;
+    const int64_t block_terms_all = (n + block_size_all - 1) / block_size_all;
+    g_reduction_prod_all_block_terms.fetch_add(block_terms_all, std::memory_order_relaxed);
+
     int64_t rid = 0;
     if (ggml_reduction_prod_should_sample(&rid)) {
         *s = (float) ggml_reduction_prod_profile_run_bf16(x, y, rid, n, true, GGML_MULMAT_TRUNC4_SRC1);

@@ -18,16 +18,27 @@ KEYS = [
     "block_size",
     "block_drop_log2_n",
     "reductions",
+    "all_reductions",
     "total_products",
-    "total_block_terms",
-    "total_block_dropped",
-    "global_block_drop_ratio",
-    "avg_block_drop_ratio",
+    "sampled_block_terms",
+    "sampled_block_dropped",
+    "sampled_global_block_drop_ratio",
+    "sampled_avg_block_drop_ratio",
+    "all_block_terms",
+    "estimated_global_block_dropped",
+    "estimated_global_block_drop_ratio",
     "avg_cancel_ratio",
     "avg_neff_ratio",
     "sampled_kept",
     "sampled_dropped",
 ]
+
+FALLBACK_KEYS = {
+    "sampled_block_terms": "total_block_terms",
+    "sampled_block_dropped": "total_block_dropped",
+    "sampled_global_block_drop_ratio": "global_block_drop_ratio",
+    "sampled_avg_block_drop_ratio": "avg_block_drop_ratio",
+}
 
 
 def parse_summary(path: Path) -> Dict[str, str]:
@@ -45,7 +56,12 @@ def parse_summary(path: Path) -> Dict[str, str]:
 
     row: Dict[str, str] = {"case": case, "summary_file": str(path)}
     for k in KEYS:
-        row[k] = data.get(k, "")
+        if k in data:
+            row[k] = data[k]
+        elif k in FALLBACK_KEYS and FALLBACK_KEYS[k] in data:
+            row[k] = data[FALLBACK_KEYS[k]]
+        else:
+            row[k] = ""
     return row
 
 
@@ -79,10 +95,12 @@ def write_md(rows: List[Dict[str, str]], out_md: Path) -> None:
         "case",
         "block_drop_log2_n",
         "block_size",
-        "global_block_drop_ratio",
-        "avg_block_drop_ratio",
-        "total_block_terms",
-        "total_block_dropped",
+        "sampled_global_block_drop_ratio",
+        "estimated_global_block_drop_ratio",
+        "sampled_avg_block_drop_ratio",
+        "sampled_block_terms",
+        "sampled_block_dropped",
+        "all_block_terms",
         "avg_cancel_ratio",
         "avg_neff_ratio",
         "sampled_kept",
