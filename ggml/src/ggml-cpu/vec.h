@@ -292,6 +292,13 @@ void ggml_fp8_sim_stats_report(const char * report_file);
 #define GGML_REDUCTION_PROD_PROFILE_PREFIX "reduction_prod_profile"
 #endif
 
+// Simulated block-drop threshold exponent n in:
+//   |block_dot| < |running_sum| * 2^-n  => counted as "dropped" (stats only)
+// Block size is GGML_SIM_FP8E4M3_BLOCK.
+#ifndef GGML_REDUCTION_PROD_BLOCK_DROP_LOG2_N
+#define GGML_REDUCTION_PROD_BLOCK_DROP_LOG2_N 10
+#endif
+
 
 #ifdef __cplusplus
 extern "C" {

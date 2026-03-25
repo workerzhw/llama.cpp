@@ -1,0 +1,1 @@
+case,block_size,block_drop_log2_n,reductions,total_products,total_block_terms,total_block_dropped,global_block_drop_ratio,avg_block_drop_ratio,avg_cancel_ratio,avg_neff_ratio,sampled_kept,sampled_dropped,summary_file
