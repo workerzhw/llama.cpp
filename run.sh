@@ -67,6 +67,7 @@ DEFAULT_REDUCTION_PROD_PROFILE_MAX_SAMPLES="${REDUCTION_PROD_PROFILE_MAX_SAMPLES
 #   <prefix>_summary.log
 #   <prefix>_global_hist.csv
 #   <prefix>_samples.csv
+#   <prefix>_block_samples.csv
 # Maps to: GGML_REDUCTION_PROD_PROFILE_PREFIX
 DEFAULT_REDUCTION_PROD_PROFILE_PREFIX="${REDUCTION_PROD_PROFILE_PREFIX:-reduction_prod_profile}"
 
@@ -77,14 +78,174 @@ RUN_KIND="${RUN_KIND:-perplexity}"
 
 # 在这里维护一组测试用例。
 # 格式: "用例名|KEY=VALUE|KEY=VALUE|..."
-# 未覆盖的参数会继承上面的 DEFAULT_* 值。
+# 这里尽量把所有 case 级配置项都显式写全，避免阅读时再去反推 DEFAULT_*。
+# 例外：
+#   - RUN_KIND 是全局运行模式，不是 case 级字段；
+#   - REDUCTION_PROD_PROFILE_PREFIX 会在运行时按 case_dir/case_slug 自动派生。
+#
+# 每个 case 内部按以下顺序排版：
+#   1. 模型/输入路径
+#   2. 运行参数
+#   3. FP8 仿真参数
+#   4. reduction profiler 参数
+#   5. 其他开关
+# 可在 case 字符串内部使用 "|# ..." 作为分组标题；解析时会自动忽略。
+#
+# 当前 layout 对照：
+#   - SIM_FP8_LAYOUT=0 : E4M3
+#   - SIM_FP8_LAYOUT=1 : E3M4
+#   - SIM_FP8_LAYOUT=2 : E3M4_NO_SUBNORM
+#   - SIM_FP8_LAYOUT=3 : E2M5
+#   - SIM_FP8_LAYOUT=4 : E2M5_NO_SUBNORM
+
+# Case 1: FP8 E4M3 baseline
+# 目的：作为当前 FP8 基线，对比其他 layout 的 PPL / profiler 行为。
+CASE_QWEN_3_8B_F8E4M3=$(cat <<EOF
+Qwen-3-8B-f8e4m3
+|# paths
+|MODEL=models/hf/Qwen3-8B-f16.gguf
+|DATA=models/hf/wiki.test.raw
+|OUT_DIR=kv_dump_logs
+|PROMPT=你好，请简要介绍一下KV cache。
+
+|# runtime
+|CTX=512
+|THREADS=$(nproc)
+|N_PREDICT=-1
+|SEQ_ID=0
+|BATCH=2048
+|UBATCH=512
+|STRIDE=0
+
+|# fp8-sim
+|SIM_FP8=1
+|SIM_FP_FORMAT=8
+|SIM_FP8_LAYOUT=0
+|SIM_FP8_APPLY_SRC0=1
+|SIM_FP8_APPLY_SRC1=1
+|SIM_FP8_SCALE_TYPE=1
+|SIM_FP8_SCALE_TYPE_IN=1
+|SIM_FP8_SCALE_TYPE_OUT=1
+|SIM_FP8_BLOCK=16
+|SIM_MATMUL_OUT_MODE=1
+
+|# reduction-profiler
+|REDUCTION_PROD_PROFILE=0
+|REDUCTION_PROD_PROFILE_BINS=256
+|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
+|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
+|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
+|REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
+|REDUCTION_PROD_PROFILE_MAX_SAMPLES=2000
+
+|# misc
+|DUMP_DOT=0
+EOF
+)
+
+# Case 2: FP8 E3M4
+# 目的：对比 mantissa 更宽、exponent 更窄时的数值行为。
+CASE_QWEN_3_8B_F8E3M4=$(cat <<EOF
+Qwen-3-8B-f8e3m4
+|# paths
+|MODEL=models/hf/Qwen3-8B-f16.gguf
+|DATA=models/hf/wiki.test.raw
+|OUT_DIR=kv_dump_logs
+|PROMPT=你好，请简要介绍一下KV cache。
+
+|# runtime
+|CTX=512
+|THREADS=$(nproc)
+|N_PREDICT=-1
+|SEQ_ID=0
+|BATCH=2048
+|UBATCH=512
+|STRIDE=0
+
+|# fp8-sim
+|SIM_FP8=1
+|SIM_FP_FORMAT=8
+|SIM_FP8_LAYOUT=1
+|SIM_FP8_APPLY_SRC0=1
+|SIM_FP8_APPLY_SRC1=1
+|SIM_FP8_SCALE_TYPE=0
+|SIM_FP8_SCALE_TYPE_IN=0
+|SIM_FP8_SCALE_TYPE_OUT=1
+|SIM_FP8_BLOCK=16
+|SIM_MATMUL_OUT_MODE=1
+
+|# reduction-profiler
+|REDUCTION_PROD_PROFILE=0
+|REDUCTION_PROD_PROFILE_BINS=256
+|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
+|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
+|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
+|REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
+|REDUCTION_PROD_PROFILE_MAX_SAMPLES=2000
+
+|# misc
+|DUMP_DOT=0
+EOF
+)
+
+# Case 3: FP8 E3M4_NO_SUBNORM
+# 目的：观察关闭 subnormal 后，与 E3M4 的差异。
+CASE_QWEN_3_8B_F8E3M4_NORMAL=$(cat <<EOF
+Qwen-3-8B-f8e3m4-normal
+|# paths
+|MODEL=models/hf/Qwen3-8B-f16.gguf
+|DATA=models/hf/wiki.test.raw
+|OUT_DIR=kv_dump_logs
+|PROMPT=你好，请简要介绍一下KV cache。
+
+|# runtime
+|CTX=512
+|THREADS=$(nproc)
+|N_PREDICT=-1
+|SEQ_ID=0
+|BATCH=2048
+|UBATCH=512
+|STRIDE=0
+
+|# fp8-sim
+|SIM_FP8=1
+|SIM_FP_FORMAT=8
+|SIM_FP8_LAYOUT=2
+|SIM_FP8_APPLY_SRC0=1
+|SIM_FP8_APPLY_SRC1=1
+|SIM_FP8_SCALE_TYPE=0
+|SIM_FP8_SCALE_TYPE_IN=0
+|SIM_FP8_SCALE_TYPE_OUT=1
+|SIM_FP8_BLOCK=16
+|SIM_MATMUL_OUT_MODE=1
+
+|# reduction-profiler
+|REDUCTION_PROD_PROFILE=0
+|REDUCTION_PROD_PROFILE_BINS=256
+|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
+|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
+|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
+|REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
+|REDUCTION_PROD_PROFILE_MAX_SAMPLES=2000
+
+|# misc
+|DUMP_DOT=0
+EOF
+)
+
+# 这里只保留执行顺序；新增/删除 case 时优先在上面定义，再在这里引用。
 RUN_CASES=(
-  "llama-3.2-1B-f8e3m4|MODEL=models/hf/unsloth-Llama-3.2-1B-Instruct-f16.gguf|DATA=models/hf/wiki.test.raw|OUT_DIR=kv_dump_logs|PROMPT=你好，请简要介绍一下KV cache。|CTX=512|N_PREDICT=-1|SEQ_ID=0|BATCH=2048|UBATCH=512|STRIDE=0|SIM_FP8=1|SIM_FP_FORMAT=8|SIM_FP8_LAYOUT=1|SIM_FP8_APPLY_SRC0=1|SIM_FP8_APPLY_SRC1=1|SIM_FP8_SCALE_TYPE=0|SIM_FP8_SCALE_TYPE_IN=0|SIM_FP8_SCALE_TYPE_OUT=1|SIM_FP8_BLOCK=16|SIM_MATMUL_OUT_MODE=1|REDUCTION_PROD_PROFILE=0|REDUCTION_PROD_PROFILE_BINS=256|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000|REDUCTION_PROD_PROFILE_MAX_SAMPLES=2000|DUMP_DOT=0"
-  "llama-3.2-1B-f8e3m4-normal|MODEL=models/hf/unsloth-Llama-3.2-1B-Instruct-f16.gguf|DATA=models/hf/wiki.test.raw|OUT_DIR=kv_dump_logs|PROMPT=你好，请简要介绍一下KV cache。|CTX=512|N_PREDICT=-1|SEQ_ID=0|BATCH=2048|UBATCH=512|STRIDE=0|SIM_FP8=1|SIM_FP_FORMAT=8|SIM_FP8_LAYOUT=2|SIM_FP8_APPLY_SRC0=1|SIM_FP8_APPLY_SRC1=1|SIM_FP8_SCALE_TYPE=0|SIM_FP8_SCALE_TYPE_IN=0|SIM_FP8_SCALE_TYPE_OUT=1|SIM_FP8_BLOCK=16|SIM_MATMUL_OUT_MODE=1|REDUCTION_PROD_PROFILE=0|REDUCTION_PROD_PROFILE_BINS=256|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000|REDUCTION_PROD_PROFILE_MAX_SAMPLES=2000|DUMP_DOT=0"
+  "$CASE_QWEN_3_8B_F8E4M3"
+  "$CASE_QWEN_3_8B_F8E3M4"
+  "$CASE_QWEN_3_8B_F8E3M4_NORMAL"
 )
 
 sanitize_name() {
   printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
+}
+
+trim_case_field() {
+  printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
 reset_case_defaults() {
@@ -130,13 +291,15 @@ apply_case_overrides() {
   local IFS='|'
   read -r -a case_fields <<< "${case_spec}"
 
-  CASE_NAME="${case_fields[0]}"
+  CASE_NAME="$(trim_case_field "${case_fields[0]}")"
 
   local field
   for field in "${case_fields[@]:1}"; do
-    if [[ -n "${field}" ]]; then
-      export "${field}"
+    field="$(trim_case_field "${field}")"
+    if [[ -z "${field}" || "${field:0:1}" == "#" ]]; then
+      continue
     fi
+    export "${field}"
   done
 }
 
@@ -338,6 +501,29 @@ for case_spec in "${RUN_CASES[@]}"; do
   echo "default log : ${default_log}"
 
   run_case "${case_slug}" "${case_dir}" "${default_log}" "${profiler_log}"
+
+  relation_prefix="${case_dir}/${case_slug}_reduction_prod_profile"
+  if [[ -f "${relation_prefix}_block_samples.csv" ]] && [[ -f "scripts/analyze_block_psum_relation.py" ]]; then
+    relation_csv="${case_dir}/${case_slug}_block_psum_relation.csv"
+    relation_md="${case_dir}/${case_slug}_block_psum_relation.md"
+    python3 scripts/analyze_block_psum_relation.py \
+      --prefix "${relation_prefix}" \
+      --thresholds 5,10,15 \
+      --out-csv "${relation_csv}" \
+      --out-md "${relation_md}" || true
+    echo "relation csv: ${relation_csv}"
+    echo "relation md : ${relation_md}"
+  fi
+  if [[ -f "${relation_prefix}_block_samples.csv" ]] && [[ -f "scripts/plot_block_psum_relation.py" ]]; then
+    python3 scripts/plot_block_psum_relation.py \
+      --prefix "${relation_prefix}" \
+      --thresholds 5,10,15 \
+      --out-dir "${case_dir}" || true
+    echo "relation hist: ${case_dir}/block_over_psum_hist.png"
+    echo "relation pct : ${case_dir}/block_over_psum_percent.png"
+    echo "relation cdf : ${case_dir}/block_over_psum_cdf.png"
+  fi
+
   finished_cases+=("${CASE_NAME}:${default_log}")
   used_out_dirs+=("${OUT_DIR}")
 done

@@ -1255,6 +1255,20 @@ struct ggml_reduction_prod_sample {
     double block_drop_ratio;
 };
 
+struct ggml_reduction_prod_block_sample {
+    int64_t reduction_id;
+    int64_t block_index;
+    int64_t block_len;
+    double psum_before;
+    double block_dot;
+    double abs_psum_before;
+    double abs_block_dot;
+    int same_sign;
+    int lt_2p_5;
+    int lt_2p_10;
+    int lt_2p_15;
+};
+
 struct ggml_reduction_prod_global_stats {
     int64_t reductions;
     int64_t total_products;
@@ -1270,6 +1284,10 @@ struct ggml_reduction_prod_global_stats {
     int64_t total_block_terms;
     int64_t total_block_dropped;
     double sum_block_drop_ratio;
+    int64_t relation_block_terms;
+    int64_t relation_psum_nonzero_terms;
+    int64_t relation_same_sign_terms;
+    int64_t relation_lt_counts[3];
     int64_t sampled_kept;
     int64_t sampled_dropped;
     int64_t hist[GGML_REDUCTION_PROD_PROFILE_BINS];
@@ -1281,6 +1299,9 @@ static std::atomic<int64_t> g_reduction_prod_all_block_terms{0};
 static bool g_reduction_prod_atexit_registered = false;
 static ggml_reduction_prod_global_stats g_reduction_prod_stats;
 static std::vector<ggml_reduction_prod_sample> g_reduction_prod_samples;
+static std::vector<ggml_reduction_prod_block_sample> g_reduction_prod_block_samples;
+
+static constexpr int g_reduction_prod_relation_thresholds[3] = {5, 10, 15};
 
 static inline bool ggml_reduction_prod_should_sample(int64_t * rid_out) {
     const int sample_rate = GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE > 0 ? GGML_REDUCTION_PROD_PROFILE_SAMPLE_RATE : 1;
@@ -1324,9 +1345,11 @@ static void ggml_reduction_prod_dump_atexit(void) {
     char path_summary[512];
     char path_hist[512];
     char path_samples[512];
+    char path_block_samples[512];
     snprintf(path_summary, sizeof(path_summary), "%s_summary.log", GGML_REDUCTION_PROD_PROFILE_PREFIX);
     snprintf(path_hist, sizeof(path_hist), "%s_global_hist.csv", GGML_REDUCTION_PROD_PROFILE_PREFIX);
     snprintf(path_samples, sizeof(path_samples), "%s_samples.csv", GGML_REDUCTION_PROD_PROFILE_PREFIX);
+    snprintf(path_block_samples, sizeof(path_block_samples), "%s_block_samples.csv", GGML_REDUCTION_PROD_PROFILE_PREFIX);
 
     std::lock_guard<std::mutex> lock(g_reduction_prod_mtx);
     if (g_reduction_prod_stats.reductions <= 0) {
@@ -1350,6 +1373,9 @@ static void ggml_reduction_prod_dump_atexit(void) {
             : 0.0;
         const double estimated_global_block_dropped = sampled_global_block_drop_ratio * (double) all_block_terms;
         const double estimated_global_block_drop_ratio = sampled_global_block_drop_ratio;
+        const double relation_same_sign_ratio = g_reduction_prod_stats.relation_psum_nonzero_terms > 0
+            ? (double) g_reduction_prod_stats.relation_same_sign_terms / (double) g_reduction_prod_stats.relation_psum_nonzero_terms
+            : 0.0;
         const double mean_abs_p = g_reduction_prod_stats.total_products > 0
             ? g_reduction_prod_stats.sum_abs_products / (double) g_reduction_prod_stats.total_products
             : 0.0;
@@ -1380,6 +1406,23 @@ static void ggml_reduction_prod_dump_atexit(void) {
         fprintf(fs, "all_block_terms       : %" PRId64 "\n", all_block_terms);
         fprintf(fs, "estimated_global_block_dropped : %.0f\n", estimated_global_block_dropped);
         fprintf(fs, "estimated_global_block_drop_ratio: %.6f\n", estimated_global_block_drop_ratio);
+        fprintf(fs, "sampled_relation_block_terms      : %" PRId64 "\n", g_reduction_prod_stats.relation_block_terms);
+        fprintf(fs, "sampled_relation_psum_nonzero_terms: %" PRId64 "\n", g_reduction_prod_stats.relation_psum_nonzero_terms);
+        fprintf(fs, "sampled_relation_same_sign_terms  : %" PRId64 "\n", g_reduction_prod_stats.relation_same_sign_terms);
+        fprintf(fs, "sampled_relation_same_sign_ratio  : %.6f\n", relation_same_sign_ratio);
+        for (int t = 0; t < 3; ++t) {
+            const int thr = g_reduction_prod_relation_thresholds[t];
+            const int64_t count = g_reduction_prod_stats.relation_lt_counts[t];
+            const double ratio_all = g_reduction_prod_stats.relation_block_terms > 0
+                ? (double) count / (double) g_reduction_prod_stats.relation_block_terms
+                : 0.0;
+            const double ratio_psum_nonzero = g_reduction_prod_stats.relation_psum_nonzero_terms > 0
+                ? (double) count / (double) g_reduction_prod_stats.relation_psum_nonzero_terms
+                : 0.0;
+            fprintf(fs, "sampled_relation_lt_2^-%d        : %" PRId64 "\n", thr, count);
+            fprintf(fs, "sampled_relation_lt_2^-%d_ratio_all: %.6f\n", thr, ratio_all);
+            fprintf(fs, "sampled_relation_lt_2^-%d_ratio_psum_nonzero: %.6f\n", thr, ratio_psum_nonzero);
+        }
         fprintf(fs, "sampled_kept          : %" PRId64 "\n", g_reduction_prod_stats.sampled_kept);
         fprintf(fs, "sampled_dropped       : %" PRId64 "\n", g_reduction_prod_stats.sampled_dropped);
         fclose(fs);
@@ -1422,6 +1465,27 @@ static void ggml_reduction_prod_dump_atexit(void) {
                 s.block_drop_ratio);
         }
         fclose(fp);
+    }
+
+    FILE * fb = fopen(path_block_samples, "w");
+    if (fb) {
+        fprintf(fb, "reduction_id,block_index,block_len,psum_before,block_dot,abs_psum_before,abs_block_dot,same_sign,lt_2p_5,lt_2p_10,lt_2p_15\n");
+        for (const auto & s : g_reduction_prod_block_samples) {
+            fprintf(fb,
+                "%" PRId64 ",%" PRId64 ",%" PRId64 ",%.9e,%.9e,%.9e,%.9e,%d,%d,%d,%d\n",
+                s.reduction_id,
+                s.block_index,
+                s.block_len,
+                s.psum_before,
+                s.block_dot,
+                s.abs_psum_before,
+                s.abs_block_dot,
+                s.same_sign,
+                s.lt_2p_5,
+                s.lt_2p_10,
+                s.lt_2p_15);
+        }
+        fclose(fb);
     }
 }
 
@@ -1483,10 +1547,20 @@ static ggml_float ggml_reduction_prod_profile_run_bf16(
 
     int64_t block_terms = 0;
     int64_t block_dropped = 0;
+    int64_t relation_block_terms = 0;
+    int64_t relation_psum_nonzero_terms = 0;
+    int64_t relation_same_sign_terms = 0;
+    int64_t relation_lt_counts[3] = {0, 0, 0};
+    std::vector<ggml_reduction_prod_block_sample> block_samples_local;
     const int block_size = GGML_SIM_FP8E4M3_BLOCK > 0 ? GGML_SIM_FP8E4M3_BLOCK : 16;
     const int block_drop_n = GGML_REDUCTION_PROD_BLOCK_DROP_LOG2_N;
     if (n > 0 && block_size > 0 && block_drop_n >= 0) {
-        double running_sum = 0.0;
+        const int64_t n_blocks = (n + block_size - 1) / block_size;
+        if (n_blocks > 0) {
+            block_samples_local.reserve((size_t) n_blocks);
+        }
+        double running_sum_true = 0.0;
+        double running_sum_drop = 0.0;
         for (int i = 0; i < n; i += block_size) {
             const int len = i + block_size <= n ? block_size : (n - i);
             double block_dot = 0.0;
@@ -1495,13 +1569,49 @@ static ggml_float ggml_reduction_prod_profile_run_bf16(
                 block_dot += (double) p;
             }
 
+            const double psum_before = running_sum_true;
+            const double abs_psum_before = std::fabs(psum_before);
+            const double abs_block_dot = std::fabs(block_dot);
+            const bool same_sign = abs_psum_before > 0.0 && abs_block_dot > 0.0 && std::signbit(psum_before) == std::signbit(block_dot);
+            int lt_flags[3] = {0, 0, 0};
+
+            relation_block_terms++;
+            if (abs_psum_before > 0.0) {
+                relation_psum_nonzero_terms++;
+            }
+            if (same_sign) {
+                relation_same_sign_terms++;
+            }
+            for (int t = 0; t < 3; ++t) {
+                const double threshold = abs_psum_before * std::ldexp(1.0, -g_reduction_prod_relation_thresholds[t]);
+                if (abs_block_dot < threshold) {
+                    relation_lt_counts[t]++;
+                    lt_flags[t] = 1;
+                }
+            }
+
+            block_samples_local.push_back({
+                rid,
+                i / block_size,
+                len,
+                psum_before,
+                block_dot,
+                abs_psum_before,
+                abs_block_dot,
+                same_sign ? 1 : 0,
+                lt_flags[0],
+                lt_flags[1],
+                lt_flags[2],
+            });
+
+            running_sum_true += block_dot;
             block_terms++;
-            const double th = std::fabs(running_sum) * std::ldexp(1.0, -block_drop_n);
+            const double th = std::fabs(running_sum_drop) * std::ldexp(1.0, -block_drop_n);
             if (std::fabs(block_dot) < th) {
                 block_dropped++;
                 continue;
             }
-            running_sum += block_dot;
+            running_sum_drop += block_dot;
         }
     }
     const double block_drop_ratio = block_terms > 0 ? (double) block_dropped / (double) block_terms : 0.0;
@@ -1529,6 +1639,12 @@ static ggml_float ggml_reduction_prod_profile_run_bf16(
         g_reduction_prod_stats.total_block_terms += block_terms;
         g_reduction_prod_stats.total_block_dropped += block_dropped;
         g_reduction_prod_stats.sum_block_drop_ratio += block_drop_ratio;
+        g_reduction_prod_stats.relation_block_terms += relation_block_terms;
+        g_reduction_prod_stats.relation_psum_nonzero_terms += relation_psum_nonzero_terms;
+        g_reduction_prod_stats.relation_same_sign_terms += relation_same_sign_terms;
+        for (int t = 0; t < 3; ++t) {
+            g_reduction_prod_stats.relation_lt_counts[t] += relation_lt_counts[t];
+        }
 
         for (int b = 0; b < GGML_REDUCTION_PROD_PROFILE_BINS; ++b) {
             g_reduction_prod_stats.hist[b] += hist_local[b];
@@ -1552,6 +1668,10 @@ static ggml_float ggml_reduction_prod_profile_run_bf16(
                 block_dropped,
                 block_drop_ratio,
             });
+            g_reduction_prod_block_samples.insert(
+                g_reduction_prod_block_samples.end(),
+                block_samples_local.begin(),
+                block_samples_local.end());
             g_reduction_prod_stats.sampled_kept++;
         } else {
             g_reduction_prod_stats.sampled_dropped++;

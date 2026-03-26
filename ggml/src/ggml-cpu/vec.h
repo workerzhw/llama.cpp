@@ -256,6 +256,7 @@ void ggml_fp8_sim_stats_report(const char * report_file);
 //   reduction_prod_profile_summary.log
 //   reduction_prod_profile_global_hist.csv
 //   reduction_prod_profile_samples.csv
+//   reduction_prod_profile_block_samples.csv
 // ---------------------------------------------------------------------------
 
 // 0=disabled, 1=enabled
