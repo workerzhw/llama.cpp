@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_MODEL="${MODEL:-models/hf/unsloth-Llama-3.2-1B-Instruct-f16.gguf}"
+DEFAULT_MODEL="${MODEL:-models/Qwen/Qwen3-1.7B-Base-f16.gguf}"
 DEFAULT_DATA="${DATA:-models/hf/wiki.test.raw}"
 DEFAULT_OUT_DIR="${OUT_DIR:-kv_dump_logs}"
 DEFAULT_PROMPT="${PROMPT:-你好，请简要介绍一下KV cache。}"
@@ -100,100 +100,55 @@ RUN_KIND="${RUN_KIND:-perplexity}"
 
 # Case 1: FP8 E4M3 baseline
 # 目的：作为当前 FP8 基线，对比其他 layout 的 PPL / profiler 行为。
-CASE_QWEN_3_8B_F8E4M3=$(cat <<EOF
-Qwen-3-8B-f8e4m3
-|# paths
-|MODEL=models/hf/Qwen3-8B-f16.gguf
-|DATA=models/hf/wiki.test.raw
-|OUT_DIR=kv_dump_logs
-|PROMPT=你好，请简要介绍一下KV cache。
+# CASE_QWEN_3_8B_F8E3M4_NORMAL=$(cat <<EOF
+# Qwen-3-1.7B-f8e3m4-normal
+# |# paths
+# |MODEL=models/Qwen/Qwen3-1.7B-Base-f16.gguf
+# |DATA=models/hf/wiki.test.raw
+# |OUT_DIR=kv_dump_logs
+# |PROMPT=你好，请简要介绍一下KV cache。
 
-|# runtime
-|CTX=512
-|THREADS=$(nproc)
-|N_PREDICT=-1
-|SEQ_ID=0
-|BATCH=2048
-|UBATCH=512
-|STRIDE=0
+# |# runtime
+# |CTX=512
+# |THREADS=$(nproc)
+# |N_PREDICT=-1
+# |SEQ_ID=0
+# |BATCH=2048
+# |UBATCH=512
+# |STRIDE=0
 
-|# fp8-sim
-|SIM_FP8=1
-|SIM_FP_FORMAT=8
-|SIM_FP8_LAYOUT=0
-|SIM_FP8_APPLY_SRC0=1
-|SIM_FP8_APPLY_SRC1=1
-|SIM_FP8_SCALE_TYPE=1
-|SIM_FP8_SCALE_TYPE_IN=1
-|SIM_FP8_SCALE_TYPE_OUT=1
-|SIM_FP8_BLOCK=16
-|SIM_MATMUL_OUT_MODE=1
+# |# fp8-sim
+# |SIM_FP8=1
+# |SIM_FP_FORMAT=8
+# |SIM_FP8_LAYOUT=2
+# |SIM_FP8_APPLY_SRC0=1
+# |SIM_FP8_APPLY_SRC1=1
+# |SIM_FP8_SCALE_TYPE=0
+# |SIM_FP8_SCALE_TYPE_IN=0
+# |SIM_FP8_SCALE_TYPE_OUT=1
+# |SIM_FP8_BLOCK=16
+# |SIM_MATMUL_OUT_MODE=1
 
-|# reduction-profiler
-|REDUCTION_PROD_PROFILE=0
-|REDUCTION_PROD_PROFILE_BINS=256
-|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
-|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
-|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
-|REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
-|REDUCTION_PROD_PROFILE_MAX_SAMPLES=2000
+# |# reduction-profiler
+# |REDUCTION_PROD_PROFILE=1
+# |REDUCTION_PROD_PROFILE_BINS=256
+# |REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
+# |REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
+# |REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
+# |REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
+# |REDUCTION_PROD_PROFILE_MAX_SAMPLES=10000
 
-|# misc
-|DUMP_DOT=0
-EOF
-)
+# |# misc
+# |DUMP_DOT=0
+# EOF
+# )
 
 # Case 2: FP8 E3M4
 # 目的：对比 mantissa 更宽、exponent 更窄时的数值行为。
-CASE_QWEN_3_8B_F8E3M4=$(cat <<EOF
-Qwen-3-8B-f8e3m4
+CASE_LLAMA_3___2_1B_F8E3M4_NORMAL=$(cat <<EOF
+Llama-3.2-1B-f8e3m4-normal
 |# paths
-|MODEL=models/hf/Qwen3-8B-f16.gguf
-|DATA=models/hf/wiki.test.raw
-|OUT_DIR=kv_dump_logs
-|PROMPT=你好，请简要介绍一下KV cache。
-
-|# runtime
-|CTX=512
-|THREADS=$(nproc)
-|N_PREDICT=-1
-|SEQ_ID=0
-|BATCH=2048
-|UBATCH=512
-|STRIDE=0
-
-|# fp8-sim
-|SIM_FP8=1
-|SIM_FP_FORMAT=8
-|SIM_FP8_LAYOUT=1
-|SIM_FP8_APPLY_SRC0=1
-|SIM_FP8_APPLY_SRC1=1
-|SIM_FP8_SCALE_TYPE=0
-|SIM_FP8_SCALE_TYPE_IN=0
-|SIM_FP8_SCALE_TYPE_OUT=1
-|SIM_FP8_BLOCK=16
-|SIM_MATMUL_OUT_MODE=1
-
-|# reduction-profiler
-|REDUCTION_PROD_PROFILE=0
-|REDUCTION_PROD_PROFILE_BINS=256
-|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
-|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
-|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
-|REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
-|REDUCTION_PROD_PROFILE_MAX_SAMPLES=2000
-
-|# misc
-|DUMP_DOT=0
-EOF
-)
-
-# Case 3: FP8 E3M4_NO_SUBNORM
-# 目的：观察关闭 subnormal 后，与 E3M4 的差异。
-CASE_QWEN_3_8B_F8E3M4_NORMAL=$(cat <<EOF
-Qwen-3-8B-f8e3m4-normal
-|# paths
-|MODEL=models/hf/Qwen3-8B-f16.gguf
+|MODEL=models/hf/Llama-3.2-1B-Instruct-f16.gguf
 |DATA=models/hf/wiki.test.raw
 |OUT_DIR=kv_dump_logs
 |PROMPT=你好，请简要介绍一下KV cache。
@@ -220,13 +175,101 @@ Qwen-3-8B-f8e3m4-normal
 |SIM_MATMUL_OUT_MODE=1
 
 |# reduction-profiler
-|REDUCTION_PROD_PROFILE=0
+|REDUCTION_PROD_PROFILE=1
 |REDUCTION_PROD_PROFILE_BINS=256
 |REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
 |REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
 |REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
 |REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
-|REDUCTION_PROD_PROFILE_MAX_SAMPLES=2000
+|REDUCTION_PROD_PROFILE_MAX_SAMPLES=10000
+
+|# misc
+|DUMP_DOT=0
+EOF
+)
+
+# Case 3: FP8 E3M4_NO_SUBNORM
+# 目的：观察关闭 subnormal 后，与 E3M4 的差异。
+CASE_LLAMA_3___2_3B_F8E3M4_NORMAL=$(cat <<EOF
+Llama-3.2-3B-f8e3m4-normal
+|# paths
+|MODEL=models/hf/Llama-3___2-3B-Instruct-f16.gguf
+|DATA=models/hf/wiki.test.raw
+|OUT_DIR=kv_dump_logs
+|PROMPT=你好，请简要介绍一下KV cache。
+
+|# runtime
+|CTX=512
+|THREADS=$(nproc)
+|N_PREDICT=-1
+|SEQ_ID=0
+|BATCH=2048
+|UBATCH=512
+|STRIDE=0
+
+|# fp8-sim
+|SIM_FP8=1
+|SIM_FP_FORMAT=8
+|SIM_FP8_LAYOUT=2
+|SIM_FP8_APPLY_SRC0=1
+|SIM_FP8_APPLY_SRC1=1
+|SIM_FP8_SCALE_TYPE=0
+|SIM_FP8_SCALE_TYPE_IN=0
+|SIM_FP8_SCALE_TYPE_OUT=1
+|SIM_FP8_BLOCK=16
+|SIM_MATMUL_OUT_MODE=1
+
+|# reduction-profiler
+|REDUCTION_PROD_PROFILE=1
+|REDUCTION_PROD_PROFILE_BINS=256
+|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
+|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
+|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
+|REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
+|REDUCTION_PROD_PROFILE_MAX_SAMPLES=10000
+
+|# misc
+|DUMP_DOT=0
+EOF
+)
+
+CASE_LLAMA_2_7B_F8E3M4_NORMAL=$(cat <<EOF
+Llama-2-7B-f8e3m4-normal
+|# paths
+|MODEL=models/hf/llama-2-7B-F16.gguf
+|DATA=models/hf/wiki.test.raw
+|OUT_DIR=kv_dump_logs
+|PROMPT=你好，请简要介绍一下KV cache。
+
+|# runtime
+|CTX=512
+|THREADS=$(nproc)
+|N_PREDICT=-1
+|SEQ_ID=0
+|BATCH=2048
+|UBATCH=512
+|STRIDE=0
+
+|# fp8-sim
+|SIM_FP8=1
+|SIM_FP_FORMAT=8
+|SIM_FP8_LAYOUT=2
+|SIM_FP8_APPLY_SRC0=1
+|SIM_FP8_APPLY_SRC1=1
+|SIM_FP8_SCALE_TYPE=0
+|SIM_FP8_SCALE_TYPE_IN=0
+|SIM_FP8_SCALE_TYPE_OUT=1
+|SIM_FP8_BLOCK=16
+|SIM_MATMUL_OUT_MODE=1
+
+|# reduction-profiler
+|REDUCTION_PROD_PROFILE=1
+|REDUCTION_PROD_PROFILE_BINS=256
+|REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=-128
+|REDUCTION_PROD_PROFILE_HIST_MAX_LOG2=128
+|REDUCTION_PROD_PROFILE_SAMPLE_RATE=1000
+|REDUCTION_PROD_BLOCK_DROP_LOG2_N=10
+|REDUCTION_PROD_PROFILE_MAX_SAMPLES=10000
 
 |# misc
 |DUMP_DOT=0
@@ -235,9 +278,9 @@ EOF
 
 # 这里只保留执行顺序；新增/删除 case 时优先在上面定义，再在这里引用。
 RUN_CASES=(
-  "$CASE_QWEN_3_8B_F8E4M3"
-  "$CASE_QWEN_3_8B_F8E3M4"
-  "$CASE_QWEN_3_8B_F8E3M4_NORMAL"
+  "$CASE_LLAMA_3___2_1B_F8E3M4_NORMAL"
+  "$CASE_LLAMA_3___2_3B_F8E3M4_NORMAL"
+  "$CASE_LLAMA_2_7B_F8E3M4_NORMAL"
 )
 
 sanitize_name() {
@@ -288,6 +331,7 @@ reset_case_defaults() {
 
 apply_case_overrides() {
   local case_spec="$1"
+  case_spec="${case_spec//$'\n'/|}"
   local IFS='|'
   read -r -a case_fields <<< "${case_spec}"
 
@@ -413,8 +457,6 @@ run_case() {
   mkdir -p "${OUT_DIR}" "${case_dir}"
 
   cmake -B build \
-    -DCMAKE_C_COMPILER=x86_64-conda-linux-gnu-gcc \
-    -DCMAKE_CXX_COMPILER=x86_64-conda-linux-gnu-g++ \
     -DCMAKE_C_FLAGS="${SIM_FLAGS}" \
     -DCMAKE_CXX_FLAGS="${SIM_FLAGS}" \
     -DLLAMA_CURL=OFF
@@ -463,7 +505,7 @@ run_case() {
   fi
 }
 
-source ~/miniforge3/bin/activate
+# source ~/miniforge3/bin/activate
 mkdir -p "${DEFAULT_OUT_DIR}"
 
 if [[ "${#RUN_CASES[@]}" -eq 0 ]]; then

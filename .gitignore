@@ -93,6 +93,7 @@ zig-cache/
 ppl-*.txt
 qnt-*.txt
 perf-*.txt
+kv_dump_logs/
 
 # Examples
 
