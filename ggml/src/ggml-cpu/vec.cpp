@@ -137,6 +137,35 @@ static inline float ggml_fp8e4m3_min_subnormal(void) {
     return ldexpf(1.0f, ggml_sim_min_norm_exp_unbiased() - ggml_sim_mantissa_bits());
 }
 
+static inline bool ggml_sim_small_exp_zero_config_enabled(void) {
+#if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F8
+    return GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE != 0;
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_sim_small_exp_zero_active_for_current_format(void) {
+#if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F8
+    return GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE != 0 &&
+           GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM;
+#else
+    return false;
+#endif
+}
+
+static inline bool ggml_sim_should_zero_small_exp_scaled(float ax_scaled) {
+    if (!ggml_sim_small_exp_zero_active_for_current_format()) {
+        return false;
+    }
+    if (!(ax_scaled > 0.0f) || !isfinite(ax_scaled)) {
+        return false;
+    }
+    const int exp_unbiased = ilogbf(ax_scaled);
+    return exp_unbiased >= GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP &&
+           exp_unbiased <= GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP;
+}
+
 static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
     // Applies: saturate, subnormal support, RNE. No NaN/Inf handling.
     if (!isfinite(x)) {
@@ -159,6 +188,10 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
     const float max_f = ggml_fp8e4m3_max_finite();
     if (ax > max_f) {
         return sign * max_f;
+    }
+
+    if (ggml_sim_should_zero_small_exp_scaled(ax)) {
+        return 0.0f;
     }
 
     const int mant_bits = ggml_sim_mantissa_bits();
@@ -329,6 +362,8 @@ struct FP8SimSrcStats {
     int64_t underflow_count;    // quantized=0 but original!=0
     int64_t subnormal_count;    // in subnormal range after quant
     int64_t zero_count;         // original was exactly 0
+    int64_t dequant_zero_count; // dequantized output is 0
+    int64_t small_exp_zero_count; // explicitly erased to 0 by small-exp experiment
     int64_t normal_count;       // normal FP8 range
     int64_t scale_hist[256];    // k from -128..127, index = k+128
     int64_t sum_row_len;        // sum of n (row length) across function calls
@@ -341,6 +376,10 @@ static std::mutex     g_fp8_stats_mtx;
 static bool           g_fp8_atexit_registered = false;
 static std::atomic<int64_t> g_fp8_call_counter{0}; // global call counter for sampling
 static std::atomic<int> g_fp8_sample_rate{-1}; // -1 = uninitialized; 0 = disabled; N = collect every Nth call
+static std::atomic<int64_t> g_fp8_all_input_total[2];
+static std::atomic<int64_t> g_fp8_all_input_zero_after[2];
+static std::atomic<int64_t> g_fp8_all_input_original_zero[2];
+static std::atomic<int64_t> g_fp8_all_input_small_exp_zero[2];
 
 static int fp8_get_sample_rate(void) {
     int rate = g_fp8_sample_rate.load(std::memory_order_relaxed);
@@ -362,6 +401,40 @@ static inline int fp8_src_slot(int src_id) {
         return src_id;
     }
     return src_id & 1;
+}
+
+static inline void fp8_update_exact_gemm_input_zero_stats(
+        int src_id,
+        const float * original,
+        const float * dequant,
+        int len,
+        float inv_scale) {
+    const int sid = fp8_src_slot(src_id);
+    if (sid < 0 || sid > 1) {
+        return;
+    }
+
+    int64_t zero_after = 0;
+    int64_t original_zero = 0;
+    int64_t small_exp_zero = 0;
+    for (int j = 0; j < len; ++j) {
+        const float x = original[j];
+        const float qx = dequant[j];
+        if (x == 0.0f) {
+            original_zero++;
+        }
+        if (qx == 0.0f) {
+            zero_after++;
+            if (x != 0.0f && ggml_sim_should_zero_small_exp_scaled(fabsf(x * inv_scale))) {
+                small_exp_zero++;
+            }
+        }
+    }
+
+    g_fp8_all_input_total[sid].fetch_add(len, std::memory_order_relaxed);
+    g_fp8_all_input_zero_after[sid].fetch_add(zero_after, std::memory_order_relaxed);
+    g_fp8_all_input_original_zero[sid].fetch_add(original_zero, std::memory_order_relaxed);
+    g_fp8_all_input_small_exp_zero[sid].fetch_add(small_exp_zero, std::memory_order_relaxed);
 }
 
 static void fp8_stats_atexit_handler(void) {
@@ -399,6 +472,10 @@ static inline void fp8_accumulate_block_stats_local(
         const float qx = dequant[j];
         const float err = qx - x;
 
+        if (qx == 0.0f) {
+            local.dequant_zero_count++;
+        }
+
         local.sum_sq_input += (double)x * (double)x;
         local.sum_sq_error += (double)err * (double)err;
 
@@ -417,10 +494,15 @@ static inline void fp8_accumulate_block_stats_local(
             local.zero_count++;
         } else {
             const float ax_scaled = fabsf(x * inv);
+            if (qx == 0.0f && ggml_sim_should_zero_small_exp_scaled(ax_scaled)) {
+                local.small_exp_zero_count++;
+            }
             if (ax_scaled > max_f) {
                 local.overflow_count++;
             } else if (qx == 0.0f) {
-                local.underflow_count++;
+                if (!ggml_sim_should_zero_small_exp_scaled(ax_scaled)) {
+                    local.underflow_count++;
+                }
             } else if (ax_scaled < min_norm && ax_scaled >= min_sub) {
                 local.subnormal_count++;
             } else {
@@ -453,6 +535,8 @@ static void fp8_merge_stats(
     g.underflow_count   += local.underflow_count;
     g.subnormal_count   += local.subnormal_count;
     g.zero_count        += local.zero_count;
+    g.dequant_zero_count += local.dequant_zero_count;
+    g.small_exp_zero_count += local.small_exp_zero_count;
     g.normal_count      += local.normal_count;
     for (int i = 0; i < 256; ++i) g.scale_hist[i] += local.scale_hist[i];
     g.sum_row_len += n;
@@ -474,6 +558,8 @@ static void fp8_merge_stats(
         ls.underflow_count   += local.underflow_count;
         ls.subnormal_count   += local.subnormal_count;
         ls.zero_count        += local.zero_count;
+        ls.dequant_zero_count += local.dequant_zero_count;
+        ls.small_exp_zero_count += local.small_exp_zero_count;
         ls.normal_count      += local.normal_count;
         for (int i = 0; i < 256; ++i) ls.scale_hist[i] += local.scale_hist[i];
         ls.sum_row_len += n;
@@ -544,6 +630,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
             const float q = ggml_fp8e4m3_quant_dequant_one(in[i + j] * inv);
             out[i + j] = q * mul;
         }
+        fp8_update_exact_gemm_input_zero_stats(src_id, in + i, out + i, len, inv);
         if (collect) {
             fp8_accumulate_block_stats_local(local, in + i, out + i, len, inv, k_hist);
         }
@@ -622,6 +709,23 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
             }
         }
         if (collect) {
+            fp8_update_exact_gemm_input_zero_stats(src_id, in + i, dq_buf + i, len, inv);
+        } else {
+            float tmp_block[256];
+            float * block_buf = tmp_block;
+            if (len > (int) (sizeof(tmp_block) / sizeof(tmp_block[0]))) {
+                block_buf = (float *) malloc((size_t) len * sizeof(float));
+                GGML_ASSERT(block_buf != nullptr);
+            }
+            for (int j = 0; j < len; ++j) {
+                block_buf[j] = GGML_BF16_TO_FP32(out[i + j]);
+            }
+            fp8_update_exact_gemm_input_zero_stats(src_id, in + i, block_buf, len, inv);
+            if (block_buf != tmp_block) {
+                free(block_buf);
+            }
+        }
+        if (collect) {
             fp8_accumulate_block_stats_local(local, in + i, dq_buf + i, len, inv, k_hist);
         }
     }
@@ -644,6 +748,12 @@ extern "C" void ggml_fp8_sim_stats_reset(void) {
     g_fp8_layer_stats[0].clear();
     g_fp8_layer_stats[1].clear();
     g_fp8_layer_stats[2].clear();
+    for (int sid = 0; sid < 2; ++sid) {
+        g_fp8_all_input_total[sid].store(0, std::memory_order_relaxed);
+        g_fp8_all_input_zero_after[sid].store(0, std::memory_order_relaxed);
+        g_fp8_all_input_original_zero[sid].store(0, std::memory_order_relaxed);
+        g_fp8_all_input_small_exp_zero[sid].store(0, std::memory_order_relaxed);
+    }
 }
 
 // Helper: write one src stats section
@@ -690,6 +800,8 @@ static void fp8_write_src_section(FILE * f, int src_id, const char * name, const
     fprintf(f, "      Underflow (->0)       : %12" PRId64 " (%.4f%%)\n", s.underflow_count, pct(s.underflow_count, classified));
     fprintf(f, "      Overflow (saturated)  : %12" PRId64 " (%.4f%%)\n", s.overflow_count,  pct(s.overflow_count,  classified));
     fprintf(f, "      Zero input            : %12" PRId64 " (%.4f%%)\n", s.zero_count,      pct(s.zero_count,      classified));
+    fprintf(f, "      Zero after simulation : %12" PRId64 " (%.4f%% of total)\n", s.dequant_zero_count, pct(s.dequant_zero_count, s.total_elements));
+    fprintf(f, "      Small-exp erased->0   : %12" PRId64 " (%.4f%% of total)\n", s.small_exp_zero_count, pct(s.small_exp_zero_count, s.total_elements));
     fprintf(f, "\n");
 
     // Scale histogram – show nonzero bins grouped
@@ -765,6 +877,13 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "    Mantissa bits        : %d\n", ggml_sim_mantissa_bits());
         fprintf(f, "    Exponent bias        : %d\n", exp_bias);
         fprintf(f, "    Subnormal support    : %s\n", ggml_sim_support_subnormals() ? "ON" : "OFF (pure-normal)");
+        fprintf(f, "    Small-exp erase cfg  : %s\n", ggml_sim_small_exp_zero_config_enabled() ? "ON" : "OFF");
+        fprintf(f, "    Small-exp erase active: %s\n", ggml_sim_small_exp_zero_active_for_current_format() ? "YES" : "NO");
+        if (ggml_sim_small_exp_zero_config_enabled()) {
+            fprintf(f, "    Erased exponent range: [%d, %d] (unbiased exponent after block scaling)\n",
+                GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP,
+                GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP);
+        }
         fprintf(f, "    Max finite value     : %.1f\n", ggml_fp8e4m3_max_finite());
         if (ggml_sim_support_subnormals()) {
             fprintf(f, "    Min subnormal value  : 2^(%d) = %.6f\n", min_sub_exp, ggml_fp8e4m3_min_subnormal());
@@ -786,6 +905,31 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         const bool apply_out_qdq =
             (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
         fprintf(f, "    Applied to output QDQ         : %s\n", apply_out_qdq ? "YES" : "NO");
+
+        const int64_t src0_total = g_fp8_all_input_total[0].load(std::memory_order_relaxed);
+        const int64_t src1_total = g_fp8_all_input_total[1].load(std::memory_order_relaxed);
+        const int64_t src0_zero = g_fp8_all_input_zero_after[0].load(std::memory_order_relaxed);
+        const int64_t src1_zero = g_fp8_all_input_zero_after[1].load(std::memory_order_relaxed);
+        const int64_t src0_orig_zero = g_fp8_all_input_original_zero[0].load(std::memory_order_relaxed);
+        const int64_t src1_orig_zero = g_fp8_all_input_original_zero[1].load(std::memory_order_relaxed);
+        const int64_t src0_small_zero = g_fp8_all_input_small_exp_zero[0].load(std::memory_order_relaxed);
+        const int64_t src1_small_zero = g_fp8_all_input_small_exp_zero[1].load(std::memory_order_relaxed);
+        const int64_t total_inputs = src0_total + src1_total;
+        const int64_t total_zero = src0_zero + src1_zero;
+        const int64_t total_orig_zero = src0_orig_zero + src1_orig_zero;
+        const int64_t total_small_zero = src0_small_zero + src1_small_zero;
+        const int64_t total_other_zero = total_zero - total_orig_zero - total_small_zero;
+        fprintf(f, "\n  Exact GEMM Input Zero Ratio (all processed inputs, unsampled)\n");
+        fprintf(f, "  %.*s\n", 60, "────────────────────────────────────────────────────────────");
+        auto pct_exact = [](int64_t count, int64_t total) -> double {
+            return total > 0 ? 100.0 * (double) count / (double) total : 0.0;
+        };
+        fprintf(f, "    Weights (src0) zero after sim : %12" PRId64 " / %-12" PRId64 " (%.4f%%)\n", src0_zero, src0_total, pct_exact(src0_zero, src0_total));
+        fprintf(f, "    Activations (src1) zero after sim: %9" PRId64 " / %-12" PRId64 " (%.4f%%)\n", src1_zero, src1_total, pct_exact(src1_zero, src1_total));
+        fprintf(f, "    Combined GEMM inputs zero ratio : %11" PRId64 " / %-12" PRId64 " (%.4f%%)\n", total_zero, total_inputs, pct_exact(total_zero, total_inputs));
+        fprintf(f, "    Combined original zeros         : %11" PRId64 " / %-12" PRId64 " (%.4f%%)\n", total_orig_zero, total_inputs, pct_exact(total_orig_zero, total_inputs));
+        fprintf(f, "    Combined small-exp erased zeros : %11" PRId64 " / %-12" PRId64 " (%.4f%%)\n", total_small_zero, total_inputs, pct_exact(total_small_zero, total_inputs));
+        fprintf(f, "    Combined other ->0 zeros        : %11" PRId64 " / %-12" PRId64 " (%.4f%%)\n", total_other_zero > 0 ? total_other_zero : 0, total_inputs, pct_exact(total_other_zero > 0 ? total_other_zero : 0, total_inputs));
 
         // Per-src sections
         fp8_write_src_section(f, 0, "Weights (src0)", g_fp8_stats[0]);

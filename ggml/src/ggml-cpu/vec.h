@@ -160,6 +160,34 @@ typedef double ggml_float;
 #error "GGML_SIM_MATMUL_OUT_MODE must be 0 (FP8E4M3) or 1 (BF16)"
 #endif
 
+// Optional small-value erasure experiment for F8(E3M4-no-subnorm):
+// after block scaling, values whose unbiased exponent is inside
+// [MIN_EXP, MAX_EXP] are forced to zero before mantissa rounding.
+// This only takes effect when:
+//   GGML_SIM_FP_FORMAT == 8
+//   GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM
+#ifndef GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE
+#define GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE 0
+#endif
+
+#ifndef GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP
+#define GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP -3
+#endif
+
+#ifndef GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP
+#define GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP -1
+#endif
+
+#if GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE != 0 && \
+    GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE != 1
+#error "GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE must be 0 or 1"
+#endif
+
+#if GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE && \
+    (GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP > GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP)
+#error "GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP must be <= GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP"
+#endif
+
 static inline float ggml_sim_bf16_roundtrip_f32(float x) {
     return GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x));
 }

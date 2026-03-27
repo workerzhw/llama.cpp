@@ -28,10 +28,13 @@ DEFAULT_SIM_FP8_APPLY_SRC1="${SIM_FP8_APPLY_SRC1:-1}"
 # Legacy single switch (kept for compatibility)
 DEFAULT_SIM_FP8_SCALE_TYPE="${SIM_FP8_SCALE_TYPE:-1}"
 # New split switches
-DEFAULT_SIM_FP8_SCALE_TYPE_IN="${SIM_FP8_SCALE_TYPE_IN:-${DEFAULT_SIM_FP8_SCALE_TYPE}}"
+DEFAULT_SIM_FP8_SCALE_TYPE_IN="${SIM_FP8_SCALE_TYPE_IN:-${DEFAULT_SIM_FP8_SCALE_TYPE}}" 
 DEFAULT_SIM_FP8_SCALE_TYPE_OUT="${SIM_FP8_SCALE_TYPE_OUT:-${DEFAULT_SIM_FP8_SCALE_TYPE}}"
 DEFAULT_SIM_FP8_BLOCK="${SIM_FP8_BLOCK:-16}"
 DEFAULT_SIM_MATMUL_OUT_MODE="${SIM_MATMUL_OUT_MODE:-1}"
+DEFAULT_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE="${SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE:-0}"
+DEFAULT_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP="${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP:--3}"
+DEFAULT_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP="${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP:--1}"
 
 # Reduction-product profiler switches
 # 0/1: enable online reduction-product profiling in BF16 dot kernels.
@@ -44,7 +47,7 @@ DEFAULT_REDUCTION_PROD_PROFILE_BINS="${REDUCTION_PROD_PROFILE_BINS:-256}"
 
 # Lower bound (inclusive bin edge domain) for log2(|x*y|) histogram.
 # Maps to: GGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2
-DEFAULT_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2="${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2:--128}"
+DEFAULT_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2="${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2:--128}" 
 
 # Upper bound for log2(|x*y|) histogram. Must be greater than MIN_LOG2.
 # Maps to: GGML_REDUCTION_PROD_PROFILE_HIST_MAX_LOG2
@@ -173,6 +176,9 @@ Llama-3.2-1B-f8e3m4-normal
 |SIM_FP8_SCALE_TYPE_OUT=1
 |SIM_FP8_BLOCK=16
 |SIM_MATMUL_OUT_MODE=1
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE=0
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP=-3
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP=-1
 
 |# reduction-profiler
 |REDUCTION_PROD_PROFILE=1
@@ -218,6 +224,9 @@ Llama-3.2-3B-f8e3m4-normal
 |SIM_FP8_SCALE_TYPE_OUT=1
 |SIM_FP8_BLOCK=16
 |SIM_MATMUL_OUT_MODE=1
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE=0
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP=-3
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP=-1
 
 |# reduction-profiler
 |REDUCTION_PROD_PROFILE=1
@@ -261,6 +270,9 @@ Llama-2-7B-f8e3m4-normal
 |SIM_FP8_SCALE_TYPE_OUT=1
 |SIM_FP8_BLOCK=16
 |SIM_MATMUL_OUT_MODE=1
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE=0
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP=-3
+|SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP=-1
 
 |# reduction-profiler
 |REDUCTION_PROD_PROFILE=1
@@ -315,6 +327,9 @@ reset_case_defaults() {
   SIM_FP8_SCALE_TYPE_OUT="${DEFAULT_SIM_FP8_SCALE_TYPE_OUT}"
   SIM_FP8_BLOCK="${DEFAULT_SIM_FP8_BLOCK}"
   SIM_MATMUL_OUT_MODE="${DEFAULT_SIM_MATMUL_OUT_MODE}"
+  SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE="${DEFAULT_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE}"
+  SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP="${DEFAULT_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP}"
+  SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP="${DEFAULT_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP}"
 
   REDUCTION_PROD_PROFILE="${DEFAULT_REDUCTION_PROD_PROFILE}"
   REDUCTION_PROD_PROFILE_BINS="${DEFAULT_REDUCTION_PROD_PROFILE_BINS}"
@@ -370,6 +385,26 @@ validate_case() {
 
   if [[ "${SIM_FP8_SCALE_TYPE_OUT}" != "0" && "${SIM_FP8_SCALE_TYPE_OUT}" != "1" ]]; then
     echo "invalid SIM_FP8_SCALE_TYPE_OUT=${SIM_FP8_SCALE_TYPE_OUT} (expected 0 or 1)" >&2
+    exit 1
+  fi
+
+  if [[ "${SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE}" != "0" && "${SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE}" != "1" ]]; then
+    echo "invalid SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE=${SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE} (expected 0 or 1)" >&2
+    exit 1
+  fi
+
+  if ! [[ "${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP}" =~ ^-?[0-9]+$ ]]; then
+    echo "invalid SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP=${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP} (expected integer)" >&2
+    exit 1
+  fi
+
+  if ! [[ "${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP}" =~ ^-?[0-9]+$ ]]; then
+    echo "invalid SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP=${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP} (expected integer)" >&2
+    exit 1
+  fi
+
+  if [[ "${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP}" -gt "${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP}" ]]; then
+    echo "invalid small-exp erase range: min=${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP}, max=${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP} (expected min <= max)" >&2
     exit 1
   fi
 
@@ -435,6 +470,9 @@ build_case_flags() {
   -DGGML_SIM_FP8E4M3_SCALE_TYPE_OUT=${SIM_FP8_SCALE_TYPE_OUT} \
   -DGGML_SIM_FP8E4M3_BLOCK=${SIM_FP8_BLOCK} \
   -DGGML_SIM_MATMUL_OUT_MODE=${SIM_MATMUL_OUT_MODE} \
+  -DGGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE=${SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE} \
+  -DGGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP=${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP} \
+  -DGGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP=${SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP} \
   -DGGML_REDUCTION_PROD_PROFILE=${REDUCTION_PROD_PROFILE} \
   -DGGML_REDUCTION_PROD_PROFILE_BINS=${REDUCTION_PROD_PROFILE_BINS} \
   -DGGML_REDUCTION_PROD_PROFILE_HIST_MIN_LOG2=${REDUCTION_PROD_PROFILE_HIST_MIN_LOG2} \
@@ -450,8 +488,13 @@ run_case() {
   local case_dir="$2"
   local default_log="$3"
   local profiler_log="$4"
+  local build_target="llama-perplexity"
 
   build_case_flags
+
+  if [[ "${RUN_KIND}" == "cli" ]]; then
+    build_target="llama-cli"
+  fi
 
   rm -rf build
   mkdir -p "${OUT_DIR}" "${case_dir}"
@@ -461,7 +504,7 @@ run_case() {
     -DCMAKE_CXX_FLAGS="${SIM_FLAGS}" \
     -DLLAMA_CURL=OFF
 
-  cmake --build build --config Release --target llama-perplexity -j "${THREADS}"
+  cmake --build build --config Release --target "${build_target}" -j "${THREADS}"
 
   export FP8_SIM_STATS_SAMPLE=100
   export GGML_MATMUL_DIST=0
@@ -498,6 +541,9 @@ run_case() {
 
   if [[ -f fp8_sim_analysis.log ]]; then
     mv -f fp8_sim_analysis.log "${profiler_log}"
+    echo "profiler log: ${profiler_log}"
+  else
+    echo "profiler log: not generated"
   fi
 
   if [[ "${DUMP_DOT}" == "1" && -f "${DOT_FILE}" ]] && command -v dot >/dev/null 2>&1; then
@@ -552,18 +598,38 @@ for case_spec in "${RUN_CASES[@]}"; do
       --prefix "${relation_prefix}" \
       --thresholds 5,10,15 \
       --out-csv "${relation_csv}" \
-      --out-md "${relation_md}" || true
-    echo "relation csv: ${relation_csv}"
-    echo "relation md : ${relation_md}"
+      --out-md "${relation_md}" || echo "relation analysis: failed"
+    if [[ -f "${relation_csv}" ]]; then
+      echo "relation csv: ${relation_csv}"
+    else
+      echo "relation csv: not generated"
+    fi
+    if [[ -f "${relation_md}" ]]; then
+      echo "relation md : ${relation_md}"
+    else
+      echo "relation md : not generated"
+    fi
   fi
   if [[ -f "${relation_prefix}_block_samples.csv" ]] && [[ -f "scripts/plot_block_psum_relation.py" ]]; then
     python3 scripts/plot_block_psum_relation.py \
       --prefix "${relation_prefix}" \
       --thresholds 5,10,15 \
-      --out-dir "${case_dir}" || true
-    echo "relation hist: ${case_dir}/block_over_psum_hist.png"
-    echo "relation pct : ${case_dir}/block_over_psum_percent.png"
-    echo "relation cdf : ${case_dir}/block_over_psum_cdf.png"
+      --out-dir "${case_dir}" || echo "relation plots: failed"
+    if [[ -f "${case_dir}/block_over_psum_hist.png" ]]; then
+      echo "relation hist: ${case_dir}/block_over_psum_hist.png"
+    else
+      echo "relation hist: not generated"
+    fi
+    if [[ -f "${case_dir}/block_over_psum_percent.png" ]]; then
+      echo "relation pct : ${case_dir}/block_over_psum_percent.png"
+    else
+      echo "relation pct : not generated"
+    fi
+    if [[ -f "${case_dir}/block_over_psum_cdf.png" ]]; then
+      echo "relation cdf : ${case_dir}/block_over_psum_cdf.png"
+    else
+      echo "relation cdf : not generated"
+    fi
   fi
 
   finished_cases+=("${CASE_NAME}:${default_log}")
@@ -579,9 +645,17 @@ if [[ -f "scripts/make_reduction_drop_compare_table.py" ]]; then
     python3 scripts/make_reduction_drop_compare_table.py \
       --root "${out_root}" \
       --out-csv "${compare_csv}" \
-      --out-md "${compare_md}" || true
-    echo "compare csv : ${compare_csv}"
-    echo "compare md  : ${compare_md}"
+      --out-md "${compare_md}" || echo "compare table: failed for ${out_root}"
+    if [[ -f "${compare_csv}" ]]; then
+      echo "compare csv : ${compare_csv}"
+    else
+      echo "compare csv : not generated"
+    fi
+    if [[ -f "${compare_md}" ]]; then
+      echo "compare md  : ${compare_md}"
+    else
+      echo "compare md  : not generated"
+    fi
   done
 fi
 
