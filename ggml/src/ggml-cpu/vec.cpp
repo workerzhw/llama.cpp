@@ -70,12 +70,8 @@ static inline bool ggml_sim_support_subnormals(void) {
 static inline int ggml_sim_exponent_bias(void) {
     int bias = (1 << (ggml_sim_exponent_bits() - 1)) - 1;
 #if GGML_SIM_FP_FORMAT == GGML_SIM_FP_FORMAT_F8
-    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM ||
-        GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM) {
-        // Pure-normal mode requested by experiment:
-        // reassign former subnormal exponent budget to normal numbers.
-        // For E3M4 this yields bias=7 (old subnormal -6 maps to normal -7 with hidden bit=1).
-        // For E2M5 this yields bias=6 with the same remapping rule.
+    if (GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E2M5_NO_SUBNORM) {
+        // Legacy E2M5-no-subnorm mode keeps the older experiment semantics.
         bias += ggml_sim_mantissa_bits();
     }
 #endif
@@ -84,7 +80,9 @@ static inline int ggml_sim_exponent_bias(void) {
 
 static inline int ggml_sim_min_norm_exp_unbiased(void) {
     // With subnormals: smallest normal is exp-field=1.
-    // Without subnormals: exp-field=0 is also normal.
+    // Without subnormals: exp-field=0 is also interpreted as normal.
+    // For E3M4-no-subnorm this means we keep the original E3M4 bias and simply
+    // reinterpret the former subnormal encoding with hidden bit = 1.
     return ggml_sim_support_subnormals() ? (1 - ggml_sim_exponent_bias()) : (-ggml_sim_exponent_bias());
 }
 
@@ -380,6 +378,18 @@ static std::atomic<int64_t> g_fp8_all_input_total[2];
 static std::atomic<int64_t> g_fp8_all_input_zero_after[2];
 static std::atomic<int64_t> g_fp8_all_input_original_zero[2];
 static std::atomic<int64_t> g_fp8_all_input_small_exp_zero[2];
+static std::atomic<int64_t> g_fp8_all_input_interval_hist[2][256];
+
+static inline int fp8_interval_hist_bin_from_exp(int exp_unbiased) {
+    int bin = exp_unbiased + 128;
+    if (bin < 0) {
+        bin = 0;
+    }
+    if (bin > 255) {
+        bin = 255;
+    }
+    return bin;
+}
 
 static int fp8_get_sample_rate(void) {
     int rate = g_fp8_sample_rate.load(std::memory_order_relaxed);
@@ -427,6 +437,13 @@ static inline void fp8_update_exact_gemm_input_zero_stats(
             zero_after++;
             if (x != 0.0f && ggml_sim_should_zero_small_exp_scaled(fabsf(x * inv_scale))) {
                 small_exp_zero++;
+            }
+        } else {
+            const float aq_scaled = fabsf(qx * inv_scale);
+            if (aq_scaled > 0.0f && isfinite(aq_scaled)) {
+                const int exp_unbiased = ilogbf(aq_scaled);
+                const int bin = fp8_interval_hist_bin_from_exp(exp_unbiased);
+                g_fp8_all_input_interval_hist[sid][bin].fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -753,7 +770,67 @@ extern "C" void ggml_fp8_sim_stats_reset(void) {
         g_fp8_all_input_zero_after[sid].store(0, std::memory_order_relaxed);
         g_fp8_all_input_original_zero[sid].store(0, std::memory_order_relaxed);
         g_fp8_all_input_small_exp_zero[sid].store(0, std::memory_order_relaxed);
+        for (int bin = 0; bin < 256; ++bin) {
+            g_fp8_all_input_interval_hist[sid][bin].store(0, std::memory_order_relaxed);
+        }
     }
+}
+
+static void fp8_write_exact_interval_hist_csv(const char * csv_file) {
+    if (!csv_file) {
+        return;
+    }
+
+    FILE * f = fopen(csv_file, "w");
+    if (!f) {
+        fprintf(stderr, "[FP8-SIM] WARNING: cannot open interval histogram csv '%s'\n", csv_file);
+        return;
+    }
+
+    const int64_t src_total[2] = {
+        g_fp8_all_input_total[0].load(std::memory_order_relaxed),
+        g_fp8_all_input_total[1].load(std::memory_order_relaxed),
+    };
+    const int64_t src_zero[2] = {
+        g_fp8_all_input_zero_after[0].load(std::memory_order_relaxed),
+        g_fp8_all_input_zero_after[1].load(std::memory_order_relaxed),
+    };
+
+    int64_t combined_total = src_total[0] + src_total[1];
+    int64_t combined_zero = src_zero[0] + src_zero[1];
+
+    fprintf(f, "scope,bucket_kind,exp_unbiased,count,ratio_of_total\n");
+    const char * scopes[2] = {"src0", "src1"};
+    for (int sid = 0; sid < 2; ++sid) {
+        const int64_t total = src_total[sid];
+        const double zero_ratio = total > 0 ? (double) src_zero[sid] / (double) total : 0.0;
+        fprintf(f, "%s,zero,,%" PRId64 ",%.9f\n", scopes[sid], src_zero[sid], zero_ratio);
+        for (int bin = 0; bin < 256; ++bin) {
+            const int64_t count = g_fp8_all_input_interval_hist[sid][bin].load(std::memory_order_relaxed);
+            if (count <= 0) {
+                continue;
+            }
+            const int exp_unbiased = bin - 128;
+            const double ratio = total > 0 ? (double) count / (double) total : 0.0;
+            fprintf(f, "%s,exp,%d,%" PRId64 ",%.9f\n", scopes[sid], exp_unbiased, count, ratio);
+        }
+    }
+
+    const double combined_zero_ratio = combined_total > 0 ? (double) combined_zero / (double) combined_total : 0.0;
+    fprintf(f, "combined,zero,,%" PRId64 ",%.9f\n", combined_zero, combined_zero_ratio);
+    for (int bin = 0; bin < 256; ++bin) {
+        const int64_t count =
+            g_fp8_all_input_interval_hist[0][bin].load(std::memory_order_relaxed) +
+            g_fp8_all_input_interval_hist[1][bin].load(std::memory_order_relaxed);
+        if (count <= 0) {
+            continue;
+        }
+        const int exp_unbiased = bin - 128;
+        const double ratio = combined_total > 0 ? (double) count / (double) combined_total : 0.0;
+        fprintf(f, "combined,exp,%d,%" PRId64 ",%.9f\n", exp_unbiased, count, ratio);
+    }
+
+    fclose(f);
 }
 
 // Helper: write one src stats section
@@ -849,6 +926,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
     // We write to two outputs: stderr and optionally a file
     FILE * outputs[2] = { stderr, nullptr };
     int nout = 1;
+    char interval_hist_csv[512] = {0};
     if (report_file) {
         FILE * ff = fopen(report_file, "w");
         if (ff) {
@@ -856,6 +934,20 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         } else {
             fprintf(stderr, "[FP8-SIM] WARNING: cannot open report file '%s'\n", report_file);
         }
+
+        const size_t n = strlen(report_file);
+        if (n + 32 < sizeof(interval_hist_csv)) {
+            strcpy(interval_hist_csv, report_file);
+            char * dot = strrchr(interval_hist_csv, '.');
+            if (dot && strcmp(dot, ".log") == 0) {
+                *dot = '\0';
+            }
+            strcat(interval_hist_csv, "_interval_hist.csv");
+        }
+    }
+
+    if (interval_hist_csv[0] != '\0') {
+        fp8_write_exact_interval_hist_csv(interval_hist_csv);
     }
 
     for (int oi = 0; oi < nout; ++oi) {

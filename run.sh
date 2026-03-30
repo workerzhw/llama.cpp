@@ -533,6 +533,7 @@ run_case() {
   local case_dir="$2"
   local default_log="$3"
   local profiler_log="$4"
+  local profiler_interval_hist_csv="$5"
   local build_target="llama-perplexity"
 
   build_case_flags
@@ -561,7 +562,7 @@ run_case() {
     unset LLAMA_DUMP_DOT || true
   fi
 
-  rm -f fp8_sim_analysis.log
+  rm -f fp8_sim_analysis.log fp8_sim_analysis_interval_hist.csv
 
   if [[ "${RUN_KIND}" == "cli" ]]; then
     ./build/bin/llama-cli \
@@ -589,6 +590,13 @@ run_case() {
     echo "profiler log: ${profiler_log}"
   else
     echo "profiler log: not generated"
+  fi
+
+  if [[ -f fp8_sim_analysis_interval_hist.csv ]]; then
+    mv -f fp8_sim_analysis_interval_hist.csv "${profiler_interval_hist_csv}"
+    echo "fp8 interval csv: ${profiler_interval_hist_csv}"
+  else
+    echo "fp8 interval csv: not generated"
   fi
 
   if [[ "${DUMP_DOT}" == "1" && -f "${DOT_FILE}" ]] && command -v dot >/dev/null 2>&1; then
@@ -621,6 +629,8 @@ for case_spec in "${RUN_CASES[@]}"; do
   case_dir="${OUT_DIR}/${case_slug}"
   default_log="${case_dir}/${case_slug}_${RUN_KIND}.log"
   profiler_log="${case_dir}/${case_slug}_fp8_sim_analysis.log"
+  profiler_interval_hist_csv="${case_dir}/${case_slug}_fp8_interval_hist.csv"
+  profiler_interval_hist_png="${case_dir}/${case_slug}_fp8_interval_hist.png"
 
   REDUCTION_PROD_PROFILE_PREFIX="${case_dir}/${case_slug}_reduction_prod_profile"
 
@@ -633,7 +643,18 @@ for case_spec in "${RUN_CASES[@]}"; do
   echo "scale in/out: ${SIM_FP8_SCALE_TYPE_IN}/${SIM_FP8_SCALE_TYPE_OUT}"
   echo "default log : ${default_log}"
 
-  run_case "${case_slug}" "${case_dir}" "${default_log}" "${profiler_log}"
+  run_case "${case_slug}" "${case_dir}" "${default_log}" "${profiler_log}" "${profiler_interval_hist_csv}"
+
+  if [[ -f "${profiler_interval_hist_csv}" ]] && [[ -f "scripts/plot_fp8_interval_hist.py" ]]; then
+    python3 scripts/plot_fp8_interval_hist.py \
+      --csv "${profiler_interval_hist_csv}" \
+      --out "${profiler_interval_hist_png}" || echo "fp8 interval plot: failed"
+    if [[ -f "${profiler_interval_hist_png}" ]]; then
+      echo "fp8 interval png: ${profiler_interval_hist_png}"
+    else
+      echo "fp8 interval png: not generated"
+    fi
+  fi
 
   relation_prefix="${case_dir}/${case_slug}_reduction_prod_profile"
   if [[ -f "${relation_prefix}_block_samples.csv" ]] && [[ -f "scripts/analyze_block_psum_relation.py" ]]; then
