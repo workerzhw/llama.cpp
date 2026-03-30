@@ -161,8 +161,9 @@ typedef double ggml_float;
 #endif
 
 // Optional small-value erasure experiment for F8(E3M4-no-subnorm):
-// after block scaling, values whose unbiased exponent is inside
-// [MIN_EXP, MAX_EXP] are forced to zero before mantissa rounding.
+// after block scaling and quantization to the target F8 value,
+// values whose quantized unbiased exponent is inside
+// [MIN_EXP, MAX_EXP] are forced to zero.
 // This only takes effect when:
 //   GGML_SIM_FP_FORMAT == 8
 //   GGML_SIM_FP8_LAYOUT == GGML_SIM_FP8_LAYOUT_E3M4_NO_SUBNORM

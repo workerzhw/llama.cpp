@@ -152,22 +152,30 @@ static inline bool ggml_sim_small_exp_zero_active_for_current_format(void) {
 #endif
 }
 
-static inline bool ggml_sim_should_zero_small_exp_scaled(float ax_scaled) {
+static inline bool ggml_sim_should_zero_small_exp_quantized(float ax_quantized) {
     if (!ggml_sim_small_exp_zero_active_for_current_format()) {
         return false;
     }
-    if (!(ax_scaled > 0.0f) || !isfinite(ax_scaled)) {
+    if (!(ax_quantized > 0.0f) || !isfinite(ax_quantized)) {
         return false;
     }
-    const int exp_unbiased = ilogbf(ax_scaled);
+    const int exp_unbiased = ilogbf(ax_quantized);
     return exp_unbiased >= GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP &&
            exp_unbiased <= GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP;
 }
 
-static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
+static inline float ggml_sim_apply_small_exp_zero_post_quant(float qx) {
+    if (ggml_sim_should_zero_small_exp_quantized(fabsf(qx))) {
+        return 0.0f;
+    }
+    return qx;
+}
+
+static inline float ggml_fp8e4m3_quant_dequant_one_impl(float x, bool apply_small_exp_zero) {
     // Applies: saturate, subnormal support, RNE. No NaN/Inf handling.
     if (!isfinite(x)) {
-        return ggml_fp8e4m3_handle_non_finite(x);
+        const float qx = ggml_fp8e4m3_handle_non_finite(x);
+        return apply_small_exp_zero ? ggml_sim_apply_small_exp_zero_post_quant(qx) : qx;
     }
 
     if (x == 0.0f) {
@@ -185,11 +193,8 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
     // saturate overflow
     const float max_f = ggml_fp8e4m3_max_finite();
     if (ax > max_f) {
-        return sign * max_f;
-    }
-
-    if (ggml_sim_should_zero_small_exp_scaled(ax)) {
-        return 0.0f;
+        const float qx = sign * max_f;
+        return apply_small_exp_zero ? ggml_sim_apply_small_exp_zero_post_quant(qx) : qx;
     }
 
     const int mant_bits = ggml_sim_mantissa_bits();
@@ -222,16 +227,19 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
             q = 0;
             ef += 1;
             if (ef > max_exp_field) {
-                return sign * max_f;
+                const float qx = sign * max_f;
+                return apply_small_exp_zero ? ggml_sim_apply_small_exp_zero_post_quant(qx) : qx;
             }
         }
         const float dq = 1.0f + (float)q / (float)mant_levels;
         const int de = ef - exp_bias;
-        return sign * ldexpf(dq, de);
+        const float qx = sign * ldexpf(dq, de);
+        return apply_small_exp_zero ? ggml_sim_apply_small_exp_zero_post_quant(qx) : qx;
     } else {
         if (!ggml_sim_support_subnormals()) {
             // In pure-normal mode, values below min_norm round to either 0 or min_norm.
-            return sign * min_norm;
+            const float qx = sign * min_norm;
+            return apply_small_exp_zero ? ggml_sim_apply_small_exp_zero_post_quant(qx) : qx;
         }
         // subnormal: exp field=0, value = 2^(1-bias) * (mant / 2^mant_bits)
         // so mant = round(ax / 2^(1-bias) * 2^mant_bits)
@@ -243,10 +251,20 @@ static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
         if (mant > (mant_levels - 1)) {
             // rounding carry from subnormal into normalized range:
             // exp=1, mant=0 => min normal = 2^(1-bias)
-            return sign * min_norm;
+            const float qx = sign * min_norm;
+            return apply_small_exp_zero ? ggml_sim_apply_small_exp_zero_post_quant(qx) : qx;
         }
-        return sign * ldexpf((float)mant, min_norm_exp - mant_bits);
+        const float qx = sign * ldexpf((float)mant, min_norm_exp - mant_bits);
+        return apply_small_exp_zero ? ggml_sim_apply_small_exp_zero_post_quant(qx) : qx;
     }
+}
+
+static inline float ggml_fp8e4m3_quant_dequant_one(float x) {
+    return ggml_fp8e4m3_quant_dequant_one_impl(x, true);
+}
+
+static inline float ggml_fp8e4m3_quant_dequant_one_no_post_zero(float x) {
+    return ggml_fp8e4m3_quant_dequant_one_impl(x, false);
 }
 
 static inline int8_t ggml_choose_k_for_block(const float * in, int n) {
@@ -378,7 +396,9 @@ static std::atomic<int64_t> g_fp8_all_input_total[2];
 static std::atomic<int64_t> g_fp8_all_input_zero_after[2];
 static std::atomic<int64_t> g_fp8_all_input_original_zero[2];
 static std::atomic<int64_t> g_fp8_all_input_small_exp_zero[2];
-static std::atomic<int64_t> g_fp8_all_input_interval_hist[2][256];
+static std::atomic<int64_t> g_fp8_sampled_input_total[2];
+static std::atomic<int64_t> g_fp8_sampled_input_zero_after[2];
+static std::atomic<int64_t> g_fp8_sampled_input_interval_hist[2][256];
 
 static inline int fp8_interval_hist_bin_from_exp(int exp_unbiased) {
     int bin = exp_unbiased + 128;
@@ -435,15 +455,11 @@ static inline void fp8_update_exact_gemm_input_zero_stats(
         }
         if (qx == 0.0f) {
             zero_after++;
-            if (x != 0.0f && ggml_sim_should_zero_small_exp_scaled(fabsf(x * inv_scale))) {
-                small_exp_zero++;
-            }
-        } else {
-            const float aq_scaled = fabsf(qx * inv_scale);
-            if (aq_scaled > 0.0f && isfinite(aq_scaled)) {
-                const int exp_unbiased = ilogbf(aq_scaled);
-                const int bin = fp8_interval_hist_bin_from_exp(exp_unbiased);
-                g_fp8_all_input_interval_hist[sid][bin].fetch_add(1, std::memory_order_relaxed);
+            if (x != 0.0f) {
+                const float qx_pre_erase = ggml_fp8e4m3_quant_dequant_one_no_post_zero(x * inv_scale);
+                if (qx_pre_erase != 0.0f && ggml_sim_should_zero_small_exp_quantized(fabsf(qx_pre_erase))) {
+                    small_exp_zero++;
+                }
             }
         }
     }
@@ -452,6 +468,42 @@ static inline void fp8_update_exact_gemm_input_zero_stats(
     g_fp8_all_input_zero_after[sid].fetch_add(zero_after, std::memory_order_relaxed);
     g_fp8_all_input_original_zero[sid].fetch_add(original_zero, std::memory_order_relaxed);
     g_fp8_all_input_small_exp_zero[sid].fetch_add(small_exp_zero, std::memory_order_relaxed);
+}
+
+static inline void fp8_update_sampled_interval_hist(
+        int src_id,
+        const float * dequant,
+        int len,
+        float inv_scale) {
+    const int sid = fp8_src_slot(src_id);
+    if (sid < 0 || sid > 1) {
+        return;
+    }
+
+    int64_t zero_after = 0;
+    int64_t local_hist[256] = {0};
+    for (int j = 0; j < len; ++j) {
+        const float qx = dequant[j];
+        if (qx == 0.0f) {
+            zero_after++;
+            continue;
+        }
+
+        const float aq_scaled = fabsf(qx * inv_scale);
+        if (aq_scaled > 0.0f && isfinite(aq_scaled)) {
+            const int exp_unbiased = ilogbf(aq_scaled);
+            const int bin = fp8_interval_hist_bin_from_exp(exp_unbiased);
+            local_hist[bin] += 1;
+        }
+    }
+
+    g_fp8_sampled_input_total[sid].fetch_add(len, std::memory_order_relaxed);
+    g_fp8_sampled_input_zero_after[sid].fetch_add(zero_after, std::memory_order_relaxed);
+    for (int bin = 0; bin < 256; ++bin) {
+        if (local_hist[bin] > 0) {
+            g_fp8_sampled_input_interval_hist[sid][bin].fetch_add(local_hist[bin], std::memory_order_relaxed);
+        }
+    }
 }
 
 static void fp8_stats_atexit_handler(void) {
@@ -511,16 +563,23 @@ static inline void fp8_accumulate_block_stats_local(
             local.zero_count++;
         } else {
             const float ax_scaled = fabsf(x * inv);
-            if (qx == 0.0f && ggml_sim_should_zero_small_exp_scaled(ax_scaled)) {
+            const float qx_scaled = fabsf(qx * inv);
+            const float qx_pre_erase = (qx == 0.0f) ? ggml_fp8e4m3_quant_dequant_one_no_post_zero(x * inv) : qx_scaled;
+            const bool small_exp_erased =
+                (qx == 0.0f) &&
+                (qx_pre_erase != 0.0f) &&
+                ggml_sim_should_zero_small_exp_quantized(fabsf(qx_pre_erase));
+
+            if (small_exp_erased) {
                 local.small_exp_zero_count++;
             }
             if (ax_scaled > max_f) {
                 local.overflow_count++;
             } else if (qx == 0.0f) {
-                if (!ggml_sim_should_zero_small_exp_scaled(ax_scaled)) {
+                if (!small_exp_erased) {
                     local.underflow_count++;
                 }
-            } else if (ax_scaled < min_norm && ax_scaled >= min_sub) {
+            } else if (qx_scaled < min_norm && qx_scaled >= min_sub) {
                 local.subnormal_count++;
             } else {
                 local.normal_count++;
@@ -649,6 +708,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32(
         }
         fp8_update_exact_gemm_input_zero_stats(src_id, in + i, out + i, len, inv);
         if (collect) {
+            fp8_update_sampled_interval_hist(src_id, out + i, len, inv);
             fp8_accumulate_block_stats_local(local, in + i, out + i, len, inv, k_hist);
         }
     }
@@ -727,6 +787,7 @@ extern "C" void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         }
         if (collect) {
             fp8_update_exact_gemm_input_zero_stats(src_id, in + i, dq_buf + i, len, inv);
+            fp8_update_sampled_interval_hist(src_id, dq_buf + i, len, inv);
         } else {
             float tmp_block[256];
             float * block_buf = tmp_block;
@@ -770,13 +831,15 @@ extern "C" void ggml_fp8_sim_stats_reset(void) {
         g_fp8_all_input_zero_after[sid].store(0, std::memory_order_relaxed);
         g_fp8_all_input_original_zero[sid].store(0, std::memory_order_relaxed);
         g_fp8_all_input_small_exp_zero[sid].store(0, std::memory_order_relaxed);
+        g_fp8_sampled_input_total[sid].store(0, std::memory_order_relaxed);
+        g_fp8_sampled_input_zero_after[sid].store(0, std::memory_order_relaxed);
         for (int bin = 0; bin < 256; ++bin) {
-            g_fp8_all_input_interval_hist[sid][bin].store(0, std::memory_order_relaxed);
+            g_fp8_sampled_input_interval_hist[sid][bin].store(0, std::memory_order_relaxed);
         }
     }
 }
 
-static void fp8_write_exact_interval_hist_csv(const char * csv_file) {
+static void fp8_write_sampled_interval_hist_csv(const char * csv_file) {
     if (!csv_file) {
         return;
     }
@@ -788,25 +851,25 @@ static void fp8_write_exact_interval_hist_csv(const char * csv_file) {
     }
 
     const int64_t src_total[2] = {
-        g_fp8_all_input_total[0].load(std::memory_order_relaxed),
-        g_fp8_all_input_total[1].load(std::memory_order_relaxed),
+        g_fp8_sampled_input_total[0].load(std::memory_order_relaxed),
+        g_fp8_sampled_input_total[1].load(std::memory_order_relaxed),
     };
     const int64_t src_zero[2] = {
-        g_fp8_all_input_zero_after[0].load(std::memory_order_relaxed),
-        g_fp8_all_input_zero_after[1].load(std::memory_order_relaxed),
+        g_fp8_sampled_input_zero_after[0].load(std::memory_order_relaxed),
+        g_fp8_sampled_input_zero_after[1].load(std::memory_order_relaxed),
     };
 
     int64_t combined_total = src_total[0] + src_total[1];
     int64_t combined_zero = src_zero[0] + src_zero[1];
 
-    fprintf(f, "scope,bucket_kind,exp_unbiased,count,ratio_of_total\n");
+    fprintf(f, "scope,bucket_kind,exp_unbiased,count,ratio_of_sampled_total\n");
     const char * scopes[2] = {"src0", "src1"};
     for (int sid = 0; sid < 2; ++sid) {
         const int64_t total = src_total[sid];
         const double zero_ratio = total > 0 ? (double) src_zero[sid] / (double) total : 0.0;
         fprintf(f, "%s,zero,,%" PRId64 ",%.9f\n", scopes[sid], src_zero[sid], zero_ratio);
         for (int bin = 0; bin < 256; ++bin) {
-            const int64_t count = g_fp8_all_input_interval_hist[sid][bin].load(std::memory_order_relaxed);
+            const int64_t count = g_fp8_sampled_input_interval_hist[sid][bin].load(std::memory_order_relaxed);
             if (count <= 0) {
                 continue;
             }
@@ -820,8 +883,8 @@ static void fp8_write_exact_interval_hist_csv(const char * csv_file) {
     fprintf(f, "combined,zero,,%" PRId64 ",%.9f\n", combined_zero, combined_zero_ratio);
     for (int bin = 0; bin < 256; ++bin) {
         const int64_t count =
-            g_fp8_all_input_interval_hist[0][bin].load(std::memory_order_relaxed) +
-            g_fp8_all_input_interval_hist[1][bin].load(std::memory_order_relaxed);
+            g_fp8_sampled_input_interval_hist[0][bin].load(std::memory_order_relaxed) +
+            g_fp8_sampled_input_interval_hist[1][bin].load(std::memory_order_relaxed);
         if (count <= 0) {
             continue;
         }
@@ -947,7 +1010,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
     }
 
     if (interval_hist_csv[0] != '\0') {
-        fp8_write_exact_interval_hist_csv(interval_hist_csv);
+        fp8_write_sampled_interval_hist_csv(interval_hist_csv);
     }
 
     for (int oi = 0; oi < nout; ++oi) {
@@ -972,7 +1035,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
         fprintf(f, "    Small-exp erase cfg  : %s\n", ggml_sim_small_exp_zero_config_enabled() ? "ON" : "OFF");
         fprintf(f, "    Small-exp erase active: %s\n", ggml_sim_small_exp_zero_active_for_current_format() ? "YES" : "NO");
         if (ggml_sim_small_exp_zero_config_enabled()) {
-            fprintf(f, "    Erased exponent range: [%d, %d] (unbiased exponent after block scaling)\n",
+            fprintf(f, "    Erased exponent range: [%d, %d] (unbiased exponent of quantized scaled value)\n",
                 GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP,
                 GGML_SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP);
         }

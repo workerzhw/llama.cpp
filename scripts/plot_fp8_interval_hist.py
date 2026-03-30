@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
-"""Plot F8 interval histogram from exact GEMM-input histogram CSV."""
+"""Plot F8 interval histogram from sampled GEMM-input histogram CSV."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def read_hist(path: Path) -> Dict[str, Tuple[List[str], List[float]]]:
             else:
                 label = row["exp_unbiased"]
             buckets[scope].append(label)
-            ratios[scope].append(float(row["ratio_of_total"]) * 100.0)
+            ratios[scope].append(float(row["ratio_of_sampled_total"]) * 100.0)
 
     for scope in buckets:
         data[scope] = (buckets[scope], ratios[scope])
@@ -57,10 +57,10 @@ def main() -> None:
     data = read_hist(Path(args.csv))
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
-    plot_scope(axes[0], "Weights (src0) F8 Interval Histogram", *data["src0"])
-    plot_scope(axes[1], "Activations (src1) F8 Interval Histogram", *data["src1"])
-    plot_scope(axes[2], "Combined GEMM Inputs F8 Interval Histogram", *data["combined"])
-    axes[2].set_xlabel("F8 interval bucket (unbiased exponent of quantized scaled value)")
+    plot_scope(axes[0], "Weights (src0) F8 Interval Histogram, sampled", *data["src0"])
+    plot_scope(axes[1], "Activations (src1) F8 Interval Histogram, sampled", *data["src1"])
+    plot_scope(axes[2], "Combined GEMM Inputs F8 Interval Histogram, sampled", *data["combined"])
+    axes[2].set_xlabel("F8 interval bucket (unbiased exponent of quantized scaled value, sampled)")
     fig.tight_layout()
     fig.savefig(args.out, dpi=180)
     plt.close(fig)
