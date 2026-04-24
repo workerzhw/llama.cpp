@@ -2,6 +2,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "swiglu-threshold.h"
 
 #include <chrono>
 #include <algorithm>
@@ -34,6 +35,19 @@ struct results_log_softmax {
     float  logit;
     float  prob;
 };
+
+static common_swiglu_threshold_runtime * g_swiglu_threshold_runtime = nullptr;
+
+static int llama_decode_with_swiglu_threshold(
+        llama_context * ctx,
+        llama_batch batch,
+        common_swiglu_threshold_runtime * swiglu_threshold_runtime,
+        common_swiglu_threshold_stage stage) {
+    common_swiglu_threshold_begin(swiglu_threshold_runtime, stage, batch.n_tokens);
+    const int result = llama_decode(ctx, batch);
+    common_swiglu_threshold_end(swiglu_threshold_runtime);
+    return result;
+}
 
 static std::vector<float> softmax(const std::vector<float>& logits) {
     std::vector<float> probs(logits.size());
@@ -375,7 +389,7 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
             }
 
             //LOG_DBG("    Batch %d: starts at %d, size is %d, n_past is %d\n",j,batch_start,batch_size,j * n_batch);
-            if (llama_decode(ctx, batch)) {
+            if (llama_decode_with_swiglu_threshold(ctx, batch, g_swiglu_threshold_runtime, common_swiglu_threshold_stage::ppl)) {
                 //LOG_ERR("%s : failed to eval\n", __func__);
                 llama_batch_free(batch);
                 return {tokens, -1, logit_history, prob_history};
@@ -583,7 +597,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                 tokens[seq_start] = token_org;
             }
 
-            if (llama_decode(ctx, batch)) {
+            if (llama_decode_with_swiglu_threshold(ctx, batch, g_swiglu_threshold_runtime, common_swiglu_threshold_stage::ppl)) {
                 LOG_INF("%s : failed to decode\n", __func__);
                 return {tokens, -1, logit_history, prob_history};
             }
@@ -2001,13 +2015,29 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
 int main(int argc, char ** argv) {
     common_params params;
+    common_swiglu_threshold_options swiglu_threshold_options;
+    std::vector<char *> filtered_argv;
 
     params.n_ctx = 512;
     params.escape = false;
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
+    if (!common_swiglu_threshold_preprocess_args(argc, argv, swiglu_threshold_options, filtered_argv)) {
         return 1;
     }
+
+    if (!common_params_parse(static_cast<int>(filtered_argv.size()), filtered_argv.data(), params, LLAMA_EXAMPLE_PERPLEXITY)) {
+        return 1;
+    }
+
+    std::string swiglu_threshold_error;
+    auto swiglu_threshold_runtime = common_swiglu_threshold_init(swiglu_threshold_options, swiglu_threshold_error);
+    if (common_swiglu_threshold_requested(swiglu_threshold_options) && !swiglu_threshold_runtime) {
+        LOG_ERR("%s: %s\n", __func__, swiglu_threshold_error.c_str());
+        return 1;
+    }
+
+    g_swiglu_threshold_runtime = swiglu_threshold_runtime.get();
+    common_swiglu_threshold_attach(params, swiglu_threshold_runtime.get());
 
     common_init();
 
@@ -2088,7 +2118,9 @@ int main(int argc, char ** argv) {
     llama_perf_context_print(ctx);
     llama_memory_breakdown_print(ctx);
 
+    const bool swiglu_threshold_report_ok = common_swiglu_threshold_write_report(swiglu_threshold_runtime.get(), "llama-perplexity");
+
     llama_backend_free();
 
-    return 0;
+    return swiglu_threshold_report_ok ? 0 : 1;
 }

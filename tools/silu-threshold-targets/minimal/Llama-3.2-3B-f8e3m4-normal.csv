@@ -1,0 +1,6 @@
+# Minimal group prior for distribution-driven SiLU calibration
+group,layers,prefill_target,decode_target
+front,0-6,0.010,0.010
+early,7-13,0.018,0.020
+mid,14-20,0.022,0.024
+tail,21-27,0.016,0.018

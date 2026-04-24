@@ -1526,6 +1526,401 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
 #endif // GGML_SIM_FP8E4M3
 
 #include <cassert>
+#include <cfloat>
+
+#if GGML_SIM_Q4Q6
+
+struct ggml_sim_q6_affine_params {
+    float scale;
+    uint8_t zp;
+};
+
+static inline int ggml_sim_q4q6_rne_int(float x) {
+    const float f = floorf(x);
+    const float r = x - f;
+    int i = (int) f;
+    if (r > 0.5f) {
+        return i + 1;
+    } else if (r < 0.5f) {
+        return i;
+    }
+    return (i & 1) ? (i + 1) : i;
+}
+
+static inline float ggml_sim_q4q6_sanitize_input(float x) {
+    if (isnan(x)) {
+        return 0.0f;
+    }
+    if (isinf(x)) {
+        return copysignf(FLT_MAX, x);
+    }
+    return x;
+}
+
+static inline float ggml_sim_q4q6_round_scale_to_bf16(double scale) {
+    if (!(scale > 0.0) || !isfinite(scale)) {
+        return 0.0f;
+    }
+
+    return GGML_BF16_TO_FP32(GGML_FP32_TO_BF16((float) scale));
+}
+
+static inline float ggml_sim_q4q6_choose_scale_bf16(const float * in, int n, int qmax) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float v = ggml_sim_q4q6_sanitize_input(in[i]);
+        const float ax = fabsf(v);
+        if (ax > amax) {
+            amax = ax;
+        }
+    }
+
+    if (amax == 0.0f) {
+        return 0.0f;
+    }
+
+    return ggml_sim_q4q6_round_scale_to_bf16((double) amax / (double) qmax);
+}
+
+static inline float ggml_sim_q4q6_choose_absmax_bf16(const float * in, int n) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float v = ggml_sim_q4q6_sanitize_input(in[i]);
+        const float ax = fabsf(v);
+        if (ax > amax) {
+            amax = ax;
+        }
+    }
+
+    if (amax == 0.0f) {
+        return 0.0f;
+    }
+
+    return ggml_sim_q4q6_round_scale_to_bf16((double) amax);
+}
+
+static inline float ggml_sim_q4q6_quant_dequant_one(float x, float inv, float mul, int qmax) {
+    const float v = ggml_sim_q4q6_sanitize_input(x);
+    if (v == 0.0f || mul == 0.0f) {
+        return 0.0f;
+    }
+
+    int q = ggml_sim_q4q6_rne_int(fabsf(v) * inv);
+    if (q > qmax) {
+        q = qmax;
+    }
+
+    const float dq = (float) q * mul;
+    return v < 0.0f ? -dq : dq;
+}
+
+static inline int ggml_sim_q4q6_src1_qmode(int src_id) {
+    return src_id == 1 ? GGML_SIM_Q4Q6_SRC1_QMODE : GGML_SIM_Q4Q6_SRC1_QMODE_SYM;
+}
+
+static inline bool ggml_sim_q4q6_src1_use_asym_zp(int src_id) {
+    return ggml_sim_q4q6_src1_qmode(src_id) == GGML_SIM_Q4Q6_SRC1_QMODE_ASYM_ZP;
+}
+
+static inline bool ggml_sim_q4q6_src1_use_log_exp(int src_id) {
+    return ggml_sim_q4q6_src1_qmode(src_id) == GGML_SIM_Q4Q6_SRC1_QMODE_LOG_EXP;
+}
+
+static inline ggml_sim_q6_affine_params ggml_sim_q6_choose_affine_params_bf16(const float * in, int n) {
+    enum { QMIN = 0, QMAX = 63 };
+
+    float xmin = 0.0f;
+    float xmax = 0.0f;
+    bool initialized = false;
+
+    for (int i = 0; i < n; ++i) {
+        const float v = ggml_sim_q4q6_sanitize_input(in[i]);
+        if (!initialized) {
+            xmin = v;
+            xmax = v;
+            initialized = true;
+        } else {
+            if (v < xmin) xmin = v;
+            if (v > xmax) xmax = v;
+        }
+    }
+
+    if (!initialized || (xmin == 0.0f && xmax == 0.0f)) {
+        return { 0.0f, 0 };
+    }
+
+    if (xmin == xmax) {
+        const float value = xmax;
+        const float scale = ggml_sim_q4q6_round_scale_to_bf16(fabs((double) value) / (double) QMAX);
+        if (!(scale > 0.0f)) {
+            return { 0.0f, 0 };
+        }
+
+        return { scale, (uint8_t) (value > 0.0f ? QMIN : QMAX) };
+    }
+
+    const float scale = ggml_sim_q4q6_round_scale_to_bf16(((double) xmax - (double) xmin) / (double) (QMAX - QMIN));
+    if (!(scale > 0.0f)) {
+        return { 0.0f, 0 };
+    }
+
+    int zp = ggml_sim_q4q6_rne_int(-xmin / scale);
+    if (zp < QMIN) zp = QMIN;
+    if (zp > QMAX) zp = QMAX;
+
+    return { scale, (uint8_t) zp };
+}
+
+static inline float ggml_sim_q6_affine_quant_dequant_one(float x, float scale, uint8_t zp) {
+    enum { QMIN = 0, QMAX = 63 };
+
+    if (!(scale > 0.0f)) {
+        return 0.0f;
+    }
+
+    const float v = ggml_sim_q4q6_sanitize_input(x);
+    int q = ggml_sim_q4q6_rne_int(v / scale) + (int) zp;
+    if (q < QMIN) q = QMIN;
+    if (q > QMAX) q = QMAX;
+
+    return ((float) q - (float) zp) * scale;
+}
+
+static inline float ggml_sim_q6_log_quant_dequant_one(float x, float scale) {
+    enum { QMAX = 31 };
+
+    if (!(scale > 0.0f)) {
+        return 0.0f;
+    }
+
+    const float v = ggml_sim_q4q6_sanitize_input(x);
+    const float av = fabsf(v);
+    const float step = (float) GGML_SIM_Q4Q6_SRC1_LOG_STEP;
+    const float min_nonzero = scale * exp2f(-((float) (QMAX - 1)) / step);
+    const float zero_threshold = 0.5f * min_nonzero;
+
+    if (!(av > zero_threshold)) {
+        return 0.0f;
+    }
+
+    int qmag = ggml_sim_q4q6_rne_int((float) QMAX + step * log2f(av / scale));
+    if (qmag < 1) {
+        qmag = 1;
+    }
+    if (qmag > QMAX) {
+        qmag = QMAX;
+    }
+
+    const float dq = scale * exp2f(((float) qmag - (float) QMAX) / step);
+    return copysignf(dq, v);
+}
+
+static void ggml_sim_q6_log_block_quant_dequant_f32_impl(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out) {
+    if (block <= 0) {
+        block = 16;
+    }
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const float scale = ggml_sim_q4q6_choose_absmax_bf16(in + i, len);
+
+        if (scales_out) {
+            ((ggml_bf16_t *) scales_out)[i / block] = GGML_FP32_TO_BF16(scale);
+        }
+
+        for (int j = 0; j < len; ++j) {
+            out[i + j] = ggml_sim_q6_log_quant_dequant_one(in[i + j], scale);
+        }
+    }
+}
+
+static void ggml_sim_q6_log_block_quant_dequant_f32_to_bf16_impl(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out) {
+    if (block <= 0) {
+        block = 16;
+    }
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const float scale = ggml_sim_q4q6_choose_absmax_bf16(in + i, len);
+
+        if (scales_out) {
+            ((ggml_bf16_t *) scales_out)[i / block] = GGML_FP32_TO_BF16(scale);
+        }
+
+        for (int j = 0; j < len; ++j) {
+            const float dq = ggml_sim_q6_log_quant_dequant_one(in[i + j], scale);
+            out[i + j] = GGML_FP32_TO_BF16(dq);
+        }
+    }
+}
+
+static void ggml_sim_q4q6_block_quant_dequant_f32_impl(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out,
+        int           qmax) {
+    if (block <= 0) {
+        block = 16;
+    }
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const float scale = ggml_sim_q4q6_choose_scale_bf16(in + i, len, qmax);
+        const float inv = scale > 0.0f ? (1.0f / scale) : 0.0f;
+
+        if (scales_out) {
+            ((ggml_bf16_t *) scales_out)[i / block] = GGML_FP32_TO_BF16(scale);
+        }
+
+        for (int j = 0; j < len; ++j) {
+            out[i + j] = ggml_sim_q4q6_quant_dequant_one(in[i + j], inv, scale, qmax);
+        }
+    }
+}
+
+static void ggml_sim_q4q6_block_quant_dequant_f32_to_bf16_impl(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out,
+        int               qmax) {
+    if (block <= 0) {
+        block = 16;
+    }
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const float scale = ggml_sim_q4q6_choose_scale_bf16(in + i, len, qmax);
+        const float inv = scale > 0.0f ? (1.0f / scale) : 0.0f;
+
+        if (scales_out) {
+            ((ggml_bf16_t *) scales_out)[i / block] = GGML_FP32_TO_BF16(scale);
+        }
+
+        for (int j = 0; j < len; ++j) {
+            const float dq = ggml_sim_q4q6_quant_dequant_one(in[i + j], inv, scale, qmax);
+            out[i + j] = GGML_FP32_TO_BF16(dq);
+        }
+    }
+}
+
+extern "C" void ggml_sim_q4_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out,
+        int           src_id,
+        const char  * layer_name) {
+    (void) src_id;
+    (void) layer_name;
+    ggml_sim_q4q6_block_quant_dequant_f32_impl(in, out, n, block, scales_out, 7);
+}
+
+extern "C" void ggml_sim_q6_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out,
+        int           src_id,
+        const char  * layer_name) {
+    (void) layer_name;
+
+    if (ggml_sim_q4q6_src1_use_log_exp(src_id)) {
+        ggml_sim_q6_log_block_quant_dequant_f32_impl(in, out, n, block, scales_out);
+        return;
+    }
+
+    if (!ggml_sim_q4q6_src1_use_asym_zp(src_id)) {
+        ggml_sim_q4q6_block_quant_dequant_f32_impl(in, out, n, block, scales_out, 31);
+        return;
+    }
+
+    if (block <= 0) {
+        block = 16;
+    }
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const ggml_sim_q6_affine_params params = ggml_sim_q6_choose_affine_params_bf16(in + i, len);
+
+        if (scales_out) {
+            ((ggml_bf16_t *) scales_out)[i / block] = GGML_FP32_TO_BF16(params.scale);
+        }
+
+        for (int j = 0; j < len; ++j) {
+            out[i + j] = ggml_sim_q6_affine_quant_dequant_one(in[i + j], params.scale, params.zp);
+        }
+    }
+}
+
+extern "C" void ggml_sim_q4_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out,
+        int               src_id,
+        const char      * layer_name) {
+    (void) src_id;
+    (void) layer_name;
+    ggml_sim_q4q6_block_quant_dequant_f32_to_bf16_impl(in, out, n, block, scales_out, 7);
+}
+
+extern "C" void ggml_sim_q6_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out,
+        int               src_id,
+        const char      * layer_name) {
+    (void) layer_name;
+
+    if (ggml_sim_q4q6_src1_use_log_exp(src_id)) {
+        ggml_sim_q6_log_block_quant_dequant_f32_to_bf16_impl(in, out, n, block, scales_out);
+        return;
+    }
+
+    if (!ggml_sim_q4q6_src1_use_asym_zp(src_id)) {
+        ggml_sim_q4q6_block_quant_dequant_f32_to_bf16_impl(in, out, n, block, scales_out, 31);
+        return;
+    }
+
+    if (block <= 0) {
+        block = 16;
+    }
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const ggml_sim_q6_affine_params params = ggml_sim_q6_choose_affine_params_bf16(in + i, len);
+
+        if (scales_out) {
+            ((ggml_bf16_t *) scales_out)[i / block] = GGML_FP32_TO_BF16(params.scale);
+        }
+
+        for (int j = 0; j < len; ++j) {
+            const float dq = ggml_sim_q6_affine_quant_dequant_one(in[i + j], params.scale, params.zp);
+            out[i + j] = GGML_FP32_TO_BF16(dq);
+        }
+    }
+}
+
+#endif // GGML_SIM_Q4Q6
 
 #if GGML_REDUCTION_PROD_PROFILE
 #include <atomic>

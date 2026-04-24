@@ -839,6 +839,8 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(cur, "ffn_down_s", il);
     }
 
+    cb(cur, "ffn_out_pre_res", il);
+
     return cur;
 }
 

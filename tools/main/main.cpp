@@ -3,6 +3,7 @@
 #include "console.h"
 #include "log.h"
 #include "sampling.h"
+#include "swiglu-threshold.h"
 #include "llama.h"
 #include "chat.h"
 
@@ -38,6 +39,17 @@ static common_params            * g_params;
 static std::vector<llama_token> * g_input_tokens;
 static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
+
+static int llama_decode_with_swiglu_threshold(
+        llama_context * ctx,
+        llama_batch batch,
+        common_swiglu_threshold_runtime * swiglu_threshold_runtime,
+        common_swiglu_threshold_stage stage) {
+    common_swiglu_threshold_begin(swiglu_threshold_runtime, stage, batch.n_tokens);
+    const int result = llama_decode(ctx, batch);
+    common_swiglu_threshold_end(swiglu_threshold_runtime);
+    return result;
+}
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
 
@@ -85,10 +97,26 @@ static void sigint_handler(int signo) {
 
 int main(int argc, char ** argv) {
     common_params params;
+    common_swiglu_threshold_options swiglu_threshold_options;
+    std::vector<char *> filtered_argv;
     g_params = &params;
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
+
+    if (!common_swiglu_threshold_preprocess_args(argc, argv, swiglu_threshold_options, filtered_argv)) {
         return 1;
     }
+
+    if (!common_params_parse(static_cast<int>(filtered_argv.size()), filtered_argv.data(), params, LLAMA_EXAMPLE_MAIN, print_usage)) {
+        return 1;
+    }
+
+    std::string swiglu_threshold_error;
+    auto swiglu_threshold_runtime = common_swiglu_threshold_init(swiglu_threshold_options, swiglu_threshold_error);
+    if (common_swiglu_threshold_requested(swiglu_threshold_options) && !swiglu_threshold_runtime) {
+        LOG_ERR("%s: %s\n", __func__, swiglu_threshold_error.c_str());
+        return 1;
+    }
+
+    common_swiglu_threshold_attach(params, swiglu_threshold_runtime.get());
 
     common_init();
 
@@ -568,6 +596,7 @@ int main(int argc, char ** argv) {
     display = params.display_prompt;
 
     std::vector<llama_token> embd;
+    common_swiglu_threshold_stage next_eval_stage = common_swiglu_threshold_stage::inactive;
 
     // single-token antiprompts
     std::vector<llama_token> antiprompt_token;
@@ -703,7 +732,7 @@ int main(int argc, char ** argv) {
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
-                if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
+                if (llama_decode_with_swiglu_threshold(ctx, llama_batch_get_one(&embd[i], n_eval), swiglu_threshold_runtime.get(), next_eval_stage)) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
                 }
@@ -741,6 +770,7 @@ int main(int argc, char ** argv) {
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
             embd.push_back(id);
+            next_eval_stage = common_swiglu_threshold_stage::decode;
 
             if (params.conversation_mode && !waiting_for_first_input && !llama_vocab_is_eog(vocab, id)) {
                 assistant_ss << common_token_to_piece(ctx, id, false);
@@ -767,6 +797,9 @@ int main(int argc, char ** argv) {
                 if ((int) embd.size() >= params.n_batch) {
                     break;
                 }
+            }
+            if (!embd.empty()) {
+                next_eval_stage = common_swiglu_threshold_stage::prefill;
             }
         }
 
@@ -1037,6 +1070,8 @@ int main(int argc, char ** argv) {
     LOG("\n\n");
     common_perf_print(ctx, smpl);
 
+    const bool swiglu_threshold_report_ok = common_swiglu_threshold_write_report(swiglu_threshold_runtime.get(), "llama-cli");
+
     common_sampler_free(smpl);
 
     llama_backend_free();
@@ -1044,5 +1079,5 @@ int main(int argc, char ** argv) {
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
 
-    return 0;
+    return swiglu_threshold_report_ok ? 0 : 1;
 }

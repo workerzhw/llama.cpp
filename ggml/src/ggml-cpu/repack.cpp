@@ -2143,10 +2143,9 @@ static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buf
 namespace ggml::cpu::repack {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
-#if GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0
-    // Repack kernels currently simulate FP8 for src1/output only.
-    // When src0 simulation is requested, use the generic CPU path to keep
-    // FP8 semantics consistent across all MUL_MAT/MUL_MAT_ID executions.
+#if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) || GGML_SIM_Q4Q6
+    // Repack kernels do not implement src0 FP8 replay or standalone SIM_Q4Q6 low-bit replay.
+    // Use the generic CPU path to keep MUL_MAT/MUL_MAT_ID semantics consistent.
     GGML_UNUSED(op);
     return false;
 #endif

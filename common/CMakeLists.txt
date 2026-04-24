@@ -71,6 +71,8 @@ add_library(${TARGET} STATIC
     regex-partial.h
     sampling.cpp
     sampling.h
+    swiglu-threshold.cpp
+    swiglu-threshold.h
     speculative.cpp
     speculative.h
     )

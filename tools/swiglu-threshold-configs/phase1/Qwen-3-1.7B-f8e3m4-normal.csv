@@ -1,0 +1,12 @@
+# Phase-1 static SwiGLU output thresholds
+layer,threshold
+0,1e-2
+1,1e-2
+2,5e-3
+3,5e-3
+4,5e-3
+5,5e-3
+22,5e-3
+23,5e-3
+24,5e-3
+27,5e-3

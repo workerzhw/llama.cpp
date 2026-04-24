@@ -1,0 +1,6 @@
+# Minimal group prior for distribution-driven calibration
+group,layers,prefill_target,decode_target
+front,0-7,0.010,0.010
+early,8-15,0.018,0.020
+mid,16-23,0.022,0.024
+tail,24-31,0.016,0.018

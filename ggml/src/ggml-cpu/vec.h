@@ -145,6 +145,83 @@ typedef double ggml_float;
 #define GGML_SIM_FP8E4M3_APPLY_SRC1 1
 #endif
 
+// ---------------------------------------------------------------------------
+// Low-bit block-quant simulation helpers
+//
+// Standalone integer QDQ modeled after fp8-sim input replay:
+//   - src0 uses symmetric Q6  in [-31, 31]
+//   - src1 uses symmetric Q6 in [-31, 31] by default, optionally affine Q6+zp in [0, 63]
+//     or logarithmic Q6-exp with one BF16 absmax scale per block and exponent step divisor
+//   - one BF16 scale per block
+//   - src2/output uses BF16 round-trip in ggml-cpu.c when enabled
+// ---------------------------------------------------------------------------
+
+#ifndef GGML_SIM_Q4Q6
+#define GGML_SIM_Q4Q6 0
+#endif
+
+#ifndef GGML_SIM_Q4Q6_APPLY_SRC0
+#define GGML_SIM_Q4Q6_APPLY_SRC0 1
+#endif
+
+#ifndef GGML_SIM_Q4Q6_APPLY_SRC1
+#define GGML_SIM_Q4Q6_APPLY_SRC1 1
+#endif
+
+#ifndef GGML_SIM_Q4Q6_SRC0_BLOCK
+#define GGML_SIM_Q4Q6_SRC0_BLOCK 16
+#endif
+
+#ifndef GGML_SIM_Q4Q6_SRC1_BLOCK
+#define GGML_SIM_Q4Q6_SRC1_BLOCK 16
+#endif
+
+#define GGML_SIM_Q4Q6_SRC1_QMODE_SYM      0
+#define GGML_SIM_Q4Q6_SRC1_QMODE_ASYM_ZP  1
+#define GGML_SIM_Q4Q6_SRC1_QMODE_LOG_EXP  2
+
+#ifndef GGML_SIM_Q4Q6_SRC1_QMODE
+#define GGML_SIM_Q4Q6_SRC1_QMODE GGML_SIM_Q4Q6_SRC1_QMODE_SYM
+#endif
+
+#ifndef GGML_SIM_Q4Q6_SRC1_LOG_STEP
+#define GGML_SIM_Q4Q6_SRC1_LOG_STEP 1
+#endif
+
+#if GGML_SIM_Q4Q6 != 0 && GGML_SIM_Q4Q6 != 1
+#error "GGML_SIM_Q4Q6 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q4Q6_APPLY_SRC0 != 0 && GGML_SIM_Q4Q6_APPLY_SRC0 != 1
+#error "GGML_SIM_Q4Q6_APPLY_SRC0 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q4Q6_APPLY_SRC1 != 0 && GGML_SIM_Q4Q6_APPLY_SRC1 != 1
+#error "GGML_SIM_Q4Q6_APPLY_SRC1 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q4Q6_SRC0_BLOCK <= 0
+#error "GGML_SIM_Q4Q6_SRC0_BLOCK must be > 0"
+#endif
+
+#if GGML_SIM_Q4Q6_SRC1_BLOCK <= 0
+#error "GGML_SIM_Q4Q6_SRC1_BLOCK must be > 0"
+#endif
+
+#if GGML_SIM_Q4Q6_SRC1_LOG_STEP <= 0
+#error "GGML_SIM_Q4Q6_SRC1_LOG_STEP must be > 0"
+#endif
+
+#if GGML_SIM_Q4Q6_SRC1_QMODE != GGML_SIM_Q4Q6_SRC1_QMODE_SYM && \
+    GGML_SIM_Q4Q6_SRC1_QMODE != GGML_SIM_Q4Q6_SRC1_QMODE_ASYM_ZP && \
+    GGML_SIM_Q4Q6_SRC1_QMODE != GGML_SIM_Q4Q6_SRC1_QMODE_LOG_EXP
+#error "GGML_SIM_Q4Q6_SRC1_QMODE must be 0 (symmetric), 1 (asymmetric_zp), or 2 (log_exp)"
+#endif
+
+#if GGML_SIM_Q4Q6 && GGML_SIM_FP8E4M3
+#error "GGML_SIM_Q4Q6 and GGML_SIM_FP8E4M3 cannot be enabled together"
+#endif
+
 // Output simulation mode for GEMM/GEMV results before storing F32:
 //   0 = keep existing FP8 block QDQ behavior (layout selected by macros, gated by GGML_SIM_FP8E4M3)
 //   1 = round to BF16 then convert back to F32
@@ -218,6 +295,42 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32(
 
 // FP32 -> (FP8+scale 回放后) -> BF16
 void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out,
+        int               src_id,
+        const char      * layer_name);
+
+    void ggml_sim_q4_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out,
+        int           src_id,
+        const char  * layer_name);
+
+    void ggml_sim_q6_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out,
+        int           src_id,
+        const char  * layer_name);
+
+    void ggml_sim_q4_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out,
+        int               src_id,
+        const char      * layer_name);
+
+    void ggml_sim_q6_block_quant_dequant_f32_to_bf16(
         const float     * in,
         ggml_bf16_t     * out,
         int               n,
