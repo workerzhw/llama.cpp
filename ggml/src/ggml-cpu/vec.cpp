@@ -1528,7 +1528,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
 #include <cassert>
 #include <cfloat>
 
-#if GGML_SIM_Q4Q6
+#if GGML_SIM_Q4Q6 || GGML_SIM_Q8Q8
 
 struct ggml_sim_q6_affine_params {
     float scale;
@@ -1817,6 +1817,79 @@ static void ggml_sim_q4q6_block_quant_dequant_f32_to_bf16_impl(
     }
 }
 
+static inline int8_t ggml_sim_q8q8_choose_k_for_block(const float * in, int n) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float v = ggml_sim_q4q6_sanitize_input(in[i]);
+        const float ax = fabsf(v);
+        if (ax > amax) {
+            amax = ax;
+        }
+    }
+
+    if (!(amax > 0.0f)) {
+        return 0;
+    }
+
+    int k = ilogbf(amax) - 6;
+    if (k < -128) k = -128;
+    if (k > 127)  k = 127;
+    return (int8_t) k;
+}
+
+static void ggml_sim_q8q8_block_quant_dequant_f32_impl(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out) {
+    if (block <= 0) {
+        block = 16;
+    }
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const int8_t k = ggml_sim_q8q8_choose_k_for_block(in + i, len);
+        const float inv = ldexpf(1.0f, -(int) k);
+        const float mul = ldexpf(1.0f,  (int) k);
+
+        if (scales_out) {
+            ((int8_t *) scales_out)[i / block] = k;
+        }
+
+        for (int j = 0; j < len; ++j) {
+            out[i + j] = ggml_sim_q4q6_quant_dequant_one(in[i + j], inv, mul, 127);
+        }
+    }
+}
+
+static void ggml_sim_q8q8_block_quant_dequant_f32_to_bf16_impl(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out) {
+    if (block <= 0) {
+        block = 16;
+    }
+
+    for (int i = 0; i < n; i += block) {
+        const int len = (i + block <= n) ? block : (n - i);
+        const int8_t k = ggml_sim_q8q8_choose_k_for_block(in + i, len);
+        const float inv = ldexpf(1.0f, -(int) k);
+        const float mul = ldexpf(1.0f,  (int) k);
+
+        if (scales_out) {
+            ((int8_t *) scales_out)[i / block] = k;
+        }
+
+        for (int j = 0; j < len; ++j) {
+            const float dq = ggml_sim_q4q6_quant_dequant_one(in[i + j], inv, mul, 127);
+            out[i + j] = GGML_FP32_TO_BF16(dq);
+        }
+    }
+}
+
 extern "C" void ggml_sim_q4_block_quant_dequant_f32(
         const float * in,
         float       * out,
@@ -1920,7 +1993,33 @@ extern "C" void ggml_sim_q6_block_quant_dequant_f32_to_bf16(
     }
 }
 
-#endif // GGML_SIM_Q4Q6
+extern "C" void ggml_sim_q8_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out,
+        int           src_id,
+        const char  * layer_name) {
+    (void) src_id;
+    (void) layer_name;
+    ggml_sim_q8q8_block_quant_dequant_f32_impl(in, out, n, block, scales_out);
+}
+
+extern "C" void ggml_sim_q8_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out,
+        int               src_id,
+        const char      * layer_name) {
+    (void) src_id;
+    (void) layer_name;
+    ggml_sim_q8q8_block_quant_dequant_f32_to_bf16_impl(in, out, n, block, scales_out);
+}
+
+#endif // GGML_SIM_Q4Q6 || GGML_SIM_Q8Q8
 
 #if GGML_REDUCTION_PROD_PROFILE
 #include <atomic>

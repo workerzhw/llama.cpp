@@ -222,6 +222,63 @@ typedef double ggml_float;
 #error "GGML_SIM_Q4Q6 and GGML_SIM_FP8E4M3 cannot be enabled together"
 #endif
 
+// ---------------------------------------------------------------------------
+// Standalone Q8/Q8 symmetric uniform replay with int8 power-of-2 block scale.
+//
+//   - src0 uses symmetric Q8 in [-127, 127]
+//   - src1 uses symmetric Q8 in [-127, 127]
+//   - one int8_t exponent k per block, scale = 2^k
+//   - src2/output uses BF16 round-trip in ggml-cpu.c when enabled
+// ---------------------------------------------------------------------------
+
+#ifndef GGML_SIM_Q8Q8
+#define GGML_SIM_Q8Q8 0
+#endif
+
+#ifndef GGML_SIM_Q8Q8_APPLY_SRC0
+#define GGML_SIM_Q8Q8_APPLY_SRC0 1
+#endif
+
+#ifndef GGML_SIM_Q8Q8_APPLY_SRC1
+#define GGML_SIM_Q8Q8_APPLY_SRC1 1
+#endif
+
+#ifndef GGML_SIM_Q8Q8_SRC0_BLOCK
+#define GGML_SIM_Q8Q8_SRC0_BLOCK 16
+#endif
+
+#ifndef GGML_SIM_Q8Q8_SRC1_BLOCK
+#define GGML_SIM_Q8Q8_SRC1_BLOCK 16
+#endif
+
+#if GGML_SIM_Q8Q8 != 0 && GGML_SIM_Q8Q8 != 1
+#error "GGML_SIM_Q8Q8 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q8Q8_APPLY_SRC0 != 0 && GGML_SIM_Q8Q8_APPLY_SRC0 != 1
+#error "GGML_SIM_Q8Q8_APPLY_SRC0 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q8Q8_APPLY_SRC1 != 0 && GGML_SIM_Q8Q8_APPLY_SRC1 != 1
+#error "GGML_SIM_Q8Q8_APPLY_SRC1 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q8Q8_SRC0_BLOCK <= 0
+#error "GGML_SIM_Q8Q8_SRC0_BLOCK must be > 0"
+#endif
+
+#if GGML_SIM_Q8Q8_SRC1_BLOCK <= 0
+#error "GGML_SIM_Q8Q8_SRC1_BLOCK must be > 0"
+#endif
+
+#if GGML_SIM_Q8Q8 && GGML_SIM_FP8E4M3
+#error "GGML_SIM_Q8Q8 and GGML_SIM_FP8E4M3 cannot be enabled together"
+#endif
+
+#if GGML_SIM_Q8Q8 && GGML_SIM_Q4Q6
+#error "GGML_SIM_Q8Q8 and GGML_SIM_Q4Q6 cannot be enabled together"
+#endif
+
 // Output simulation mode for GEMM/GEMV results before storing F32:
 //   0 = keep existing FP8 block QDQ behavior (layout selected by macros, gated by GGML_SIM_FP8E4M3)
 //   1 = round to BF16 then convert back to F32
@@ -331,6 +388,24 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         const char      * layer_name);
 
     void ggml_sim_q6_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out,
+        int               src_id,
+        const char      * layer_name);
+
+    void ggml_sim_q8_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out,
+        int           src_id,
+        const char  * layer_name);
+
+    void ggml_sim_q8_block_quant_dequant_f32_to_bf16(
         const float     * in,
         ggml_bf16_t     * out,
         int               n,

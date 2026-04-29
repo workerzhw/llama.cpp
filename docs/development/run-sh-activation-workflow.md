@@ -48,6 +48,23 @@ Run one case in `cli` mode using the current defaults:
 bash run.sh
 ```
 
+Run a native perplexity measurement with all replay modes disabled.
+Set `SIM_MATMUL_OUT_MODE=0` as well, otherwise the output path still does a BF16 round-trip even when `SIM_Q4Q6`, `SIM_Q8Q8`, and `SIM_FP8` are all off:
+the command also pins `MODEL` explicitly, so you can replace it with the exact `gguf` you want to test.
+
+```bash
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
+RUN_KIND=perplexity \
+SIM_Q4Q6=0 \
+SIM_Q8Q8=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=0 \
+SWIGLU_THRESHOLD_ENABLE=0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
 Run a pure `SIM_Q4Q6` perplexity measurement without mixing in activation-threshold
 truncation from the FFN sparsity experiments.
 The key switch is `SWIGLU_THRESHOLD_ENABLE=0`; otherwise `perplexity` and `cli`
@@ -60,7 +77,8 @@ For the logarithmic mode, `SIM_Q4Q6_SRC1_LOG_STEP` controls the exponent divisor
 `2^(q/step)` spacing; the default is `1`:
 
 ```bash
-CASE_FILTER=Qwen-3-8B \
+CASE_FILTER=Llama-2-7B \
+MODEL=models/hf/llama-2-7B-Q5_K_M.gguf \
 RUN_KIND=perplexity \
 SIM_Q4Q6=1 \
 SIM_Q4Q6_SRC1_QMODE=2 \
@@ -68,6 +86,52 @@ SIM_Q4Q6_SRC1_LOG_STEP=4 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=1 \
 SWIGLU_THRESHOLD_ENABLE=0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+Run the same style of replay experiment with symmetric `Q8/Q8` blocks on both
+weights and activations.
+`SIM_Q8Q8` is a standalone mode and cannot be combined with `SIM_Q4Q6` or `SIM_FP8`.
+Both `src0` and `src1` use symmetric uniform `Q8` replay, with one `int8` power-of-2
+block scale per block (`scale = 2^k`).
+As with `SIM_Q4Q6`, keep `SWIGLU_THRESHOLD_ENABLE=0` to avoid mixing threshold experiments
+into the perplexity result, and keep `SIM_MATMUL_OUT_MODE=1` so the output path still
+uses the BF16 round-trip:
+
+```bash
+CASE_FILTER=Qwen-3-1.7B \
+MODEL=models/Qwen/Qwen3-1___7B-Q6_K.gguf \
+RUN_KIND=perplexity \
+SIM_Q8Q8=1 \
+SIM_Q8Q8_SRC0_BLOCK=32 \
+SIM_Q8Q8_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
+SWIGLU_THRESHOLD_ENABLE=0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+Run `Q8/Q8` replay together with FFN sparsity.
+The example below uses the generated dual-threshold `silu/swiglu` profile, so it assumes
+both `kv_dump_logs/<case>/<case>_silu_threshold_generated.csv` and
+`kv_dump_logs/<case>/<case>_swiglu_threshold_generated.csv` already exist.
+
+```bash
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-f16.gguf \
+RUN_KIND=perplexity \
+SIM_Q8Q8=1 \
+SIM_Q8Q8_SRC0_BLOCK=32 \
+SIM_Q8Q8_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
+SWIGLU_THRESHOLD_ENABLE=1 \
+SWIGLU_THRESHOLD_KIND=swiglu+silu \
+SWIGLU_THRESHOLD_PROFILE=generated \
 SKIP_BUILD=0 \
 bash run.sh
 ```
@@ -253,6 +317,141 @@ This reuse form assumes that `BUILD_DIR/bin` already contains every binary neede
 by the remaining flow steps. With the default `collect,generate,perplexity,cli`
 sequence, that means the same build tree must contain both `llama-perplexity`
 and `llama-cli`.
+
+### Prepare Q4_K_M models for local runs
+
+Many `run.sh` examples pin `MODEL` explicitly.
+If your local tree currently contains only `f16` GGUF files and you want a smaller
+model for repeated `perplexity` or `cli` runs, build `llama-quantize` once and
+quantize directly from the repository root.
+
+This section intentionally documents the direct non-`imatrix` path.
+It is the fastest local workflow when you want smaller test models and do not want
+to spend additional time generating an importance matrix first.
+
+Build the quantizer once:
+
+```bash
+cmake --build build --target llama-quantize -j$(nproc)
+```
+
+If the model is still stored as a local Hugging Face directory with `safetensors`
+weights, convert it to an `f16` GGUF file first.
+The current workspace includes `./models/Qwen/Qwen3-1___7B/`, so the direct local
+conversion flow is:
+
+```bash
+python3 -m pip install -r requirements.txt
+
+python3 convert_hf_to_gguf.py \
+  ./models/Qwen/Qwen3-1___7B \
+  --outfile ./models/Qwen/Qwen3-1___7B-f16.gguf \
+  --outtype f16
+
+./build/bin/llama-quantize \
+  ./models/Qwen/Qwen3-1___7B-f16.gguf \
+  ./models/Qwen/Qwen3-1___7B-Q6_K.gguf \
+  Q6_K \
+  $(nproc)
+```
+
+Important detail: run `convert_hf_to_gguf.py` against the unpacked directory
+`./models/Qwen/Qwen3-1___7B/`, not the archive file `./models/Qwen/Qwen3-1___7B.tar`.
+
+Current direct `Q4_K_M` conversions for the `models/` tree in this workspace:
+
+```bash
+./build/bin/llama-quantize \
+  ./models/Llama-3.2-1B-Instruct-f16.gguf \
+  ./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  Q4_K_M \
+  $(nproc)
+
+./build/bin/llama-quantize \
+  ./models/Qwen/Qwen3-1.7B-Base-f16.gguf \
+  ./models/Qwen/Qwen3-1.7B-Base-Q4_K_M.gguf \
+  Q4_K_M \
+  $(nproc)
+
+./build/bin/llama-quantize \
+  ./models/Qwen/Qwen3-8B-f16.gguf \
+  ./models/Qwen/Qwen3-8B-Q5_K_M.gguf \
+  Q5_K_M \
+  $(nproc)
+
+./build/bin/llama-quantize \
+  ./models/hf/Llama-3.2-1B-Instruct-f16.gguf \
+  ./models/hf/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+  Q4_K_M \
+  $(nproc)
+
+./build/bin/llama-quantize \
+  ./models/hf/Llama-3___2-3B-Instruct-f16.gguf \
+  ./models/hf/Llama-3___2-3B-Instruct-Q5_K_M.gguf \
+  Q5_K_M \
+  $(nproc)
+
+./build/bin/llama-quantize \
+  ./models/hf/llama-2-7B-F16.gguf \
+  ./models/hf/llama-2-7B-Q5_K_M.gguf \
+  Q5_K_M \
+  $(nproc)
+```
+
+If you want to quantize the whole current set in one pass, use the same inputs in
+this loop:
+
+```bash
+for f in \
+  ./models/Llama-3.2-1B-Instruct-f16.gguf \
+  ./models/Qwen/Qwen3-1.7B-Base-f16.gguf \
+  ./models/Qwen/Qwen3-8B-f16.gguf \
+  ./models/hf/Llama-3.2-1B-Instruct-f16.gguf \
+  ./models/hf/Llama-3___2-3B-Instruct-f16.gguf \
+  ./models/hf/llama-2-7B-F16.gguf
+do
+  out="${f%.gguf}-Q4_K_M.gguf"
+  out="${out/-f16-Q4_K_M/-Q4_K_M}"
+  out="${out/-F16-Q4_K_M/-Q4_K_M}"
+  ./build/bin/llama-quantize "$f" "$out" Q4_K_M $(nproc)
+done
+```
+
+After quantization, point any `run.sh` experiment at the new file by overriding
+`MODEL`, for example:
+
+```bash
+CASE_FILTER=Llama-3.2-1B \
+MODEL=models/hf/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+RUN_KIND=perplexity \
+SIM_Q4Q6=0 \
+SIM_Q8Q8=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=0 \
+SWIGLU_THRESHOLD_ENABLE=0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+If you want a different quantization level, keep the same input/output pattern and
+replace both the output suffix and the quant type argument, for example `Q5_K_M`
+or `Q6_K`.
+
+After converting the local `Qwen3-1___7B` directory this way, you can point
+`run.sh` at the generated quantized model directly:
+
+```bash
+CASE_FILTER=Qwen-3-1.7B \
+MODEL=models/Qwen/Qwen3-1___7B-Q4_K_M.gguf \
+RUN_KIND=perplexity \
+SIM_Q4Q6=0 \
+SIM_Q8Q8=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=0 \
+SWIGLU_THRESHOLD_ENABLE=0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
 
 ## 3. Supported run modes
 
