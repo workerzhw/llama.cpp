@@ -100,8 +100,8 @@ into the perplexity result, and keep `SIM_MATMUL_OUT_MODE=1` so the output path 
 uses the BF16 round-trip:
 
 ```bash
-CASE_FILTER=Qwen-3-1.7B \
-MODEL=models/Qwen/Qwen3-1___7B-Q6_K.gguf \
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
 RUN_KIND=perplexity \
 SIM_Q8Q8=1 \
 SIM_Q8Q8_SRC0_BLOCK=32 \
@@ -114,14 +114,59 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-Run `Q8/Q8` replay together with FFN sparsity.
-The example below uses the generated dual-threshold `silu/swiglu` profile, so it assumes
-both `kv_dump_logs/<case>/<case>_silu_threshold_generated.csv` and
-`kv_dump_logs/<case>/<case>_swiglu_threshold_generated.csv` already exist.
+Split `Q8/Q8` replay + FFN sparsity into two commands when you only care about `ppl`.
+Use the first command to do `collect -> generate` only, so you can inspect the generated
+threshold reports and decide whether the selected thresholds already achieve the sparsity
+you want before paying for the final `perplexity` run.
+Keep `MODEL` on the `f16` GGUF here: `SIM_Q8Q8=1` injects the runtime `Q8/Q8` replay,
+and the generated `silu/swiglu` thresholds are then applied back onto that same runtime path.
+
+Start with this first command:
 
 ```bash
 CASE_FILTER=Qwen-3-8B \
-MODEL=models/Qwen/Qwen3-8B-f16.gguf \
+MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
+RUN_KIND=activation-flow \
+FLOW_STEPS=collect,generate \
+SIM_Q8Q8=1 \
+SIM_Q8Q8_SRC0_BLOCK=32 \
+SIM_Q8Q8_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
+SWIGLU_THRESHOLD_KIND=swiglu+silu \
+SWIGLU_TARGET_PROFILE_KIND=minimal \
+SWIGLU_TARGET_SCALE=50.0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+This first command writes both generated threshold files:
+
+- `kv_dump_logs/<case>/<case>_silu_threshold_generated.csv`
+- `kv_dump_logs/<case>/<case>_swiglu_threshold_generated.csv`
+
+and both generated summary reports:
+
+- `kv_dump_logs/<case>/<case>_silu_threshold_generated_summary.csv`
+- `kv_dump_logs/<case>/<case>_swiglu_threshold_generated_summary.csv`
+
+Use those `*_threshold_generated_summary.csv` files to judge whether the chosen thresholds
+already hit your target sparsity. The key columns are:
+
+- `final_threshold`: the threshold that will actually be written into the generated config
+- `prefill_final_estimated_added_zero_ratio`: estimated added-zero ratio on `prefill`
+- `decode_final_estimated_added_zero_ratio`: estimated added-zero ratio on `decode`
+
+If the estimated sparsity is still too low or too high, adjust `SWIGLU_TARGET_SCALE`
+and rerun this first command until the generated report reaches the range you want.
+
+Once you are satisfied with the generated thresholds, run the final `perplexity` step as a
+second command:
+
+```bash
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
 RUN_KIND=perplexity \
 SIM_Q8Q8=1 \
 SIM_Q8Q8_SRC0_BLOCK=32 \
@@ -135,6 +180,9 @@ SWIGLU_THRESHOLD_PROFILE=generated \
 SKIP_BUILD=0 \
 bash run.sh
 ```
+
+If those generated dual-threshold files already exist and you only want to rerun the final
+`ppl` apply step later, reuse the same second command.
 
 Run a full SiLU threshold pipeline in one command.
 For a first run, use `SKIP_BUILD=0` so the script can build every required binary:
@@ -847,7 +895,51 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-### 11.8 Reuse dual artifacts and rerun only apply steps
+### 11.8 Select thresholds first, then run ppl for `Q8/Q8` + FFN sparsity
+
+Use the first command to run `collect,generate` only.
+Inspect `*_threshold_generated_summary.csv` to see whether the estimated added-zero ratios
+already match the sparsity you want; if not, change `SWIGLU_TARGET_SCALE` and rerun only
+this first command.
+
+```bash
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-f16.gguf \
+RUN_KIND=activation-flow \
+FLOW_STEPS=collect,generate \
+SIM_Q8Q8=1 \
+SIM_Q8Q8_SRC0_BLOCK=32 \
+SIM_Q8Q8_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
+SWIGLU_THRESHOLD_KIND=swiglu+silu \
+SWIGLU_TARGET_PROFILE_KIND=minimal \
+SWIGLU_TARGET_SCALE=1.0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+Then run `ppl` only after you are happy with the generated thresholds:
+
+```bash
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-f16.gguf \
+RUN_KIND=perplexity \
+SIM_Q8Q8=1 \
+SIM_Q8Q8_SRC0_BLOCK=32 \
+SIM_Q8Q8_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
+SWIGLU_THRESHOLD_ENABLE=1 \
+SWIGLU_THRESHOLD_KIND=swiglu+silu \
+SWIGLU_THRESHOLD_PROFILE=generated \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+### 11.9 Reuse dual artifacts and rerun only apply steps
 
 ```bash
 CASE_FILTER=Qwen-3-1.7B \
@@ -859,7 +951,7 @@ BUILD_DIR=build \
 bash run.sh
 ```
 
-### 11.9 Run dual SwiGLU + SiLU workflow manually, step by step
+### 11.10 Run dual SwiGLU + SiLU workflow manually, step by step
 
 ```bash
 CASE_FILTER=Qwen-3-1.7B \
