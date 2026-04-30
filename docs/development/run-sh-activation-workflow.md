@@ -485,6 +485,77 @@ If you want a different quantization level, keep the same input/output pattern a
 replace both the output suffix and the quant type argument, for example `Q5_K_M`
 or `Q6_K`.
 
+### Prepare models with FFN gate/up in IQ2_S and FFN down left native
+
+Use `llama-quantize --tensor-type` when you want only selected FFN parameter
+matrices to use `IQ2_S` while every other tensor keeps the native assignment of
+the base quantization type.
+
+Do not use `--pure` for this workflow. The base quantization type, such as
+`Q4_K_M`, is still the native mixed-quantization policy for all tensors that are
+not matched by `--tensor-type`. The override below matches only `ffn_gate` and
+`ffn_up`; `ffn_down` is intentionally not matched, so it keeps the base policy.
+
+`IQ2_S` is a very low-bit type, so an importance matrix is required. The imatrix
+file must contain entries for the matched FFN gate/up tensors. If you generated
+or filtered the imatrix with `--include-weights` or `--exclude-weights`, make sure
+those FFN tensors are still included.
+
+Dense Transformer FFN override:
+
+```bash
+cmake --build build --target llama-quantize -j$(nproc)
+
+./build/bin/llama-quantize \
+  --imatrix ./imatrix.dat \
+  --tensor-type '^blk\.[0-9]+\.ffn_(gate|up)\.weight$=iq2_s' \
+  ./models/Qwen/Qwen3-8B-f16.gguf \
+  ./models/Qwen/Qwen3-8B-Q4_K_M-ffn-gate-up-IQ2_S.gguf \
+  Q4_K_M \
+  $(nproc)
+```
+
+MoE FFN override, including expert, shared-expert, and chunk-expert FFN gate/up
+matrices while still leaving `ffn_down*` native:
+
+```bash
+cmake --build build --target llama-quantize -j$(nproc)
+
+./build/bin/llama-quantize \
+  --imatrix ./imatrix.dat \
+  --tensor-type '^blk\.[0-9]+\.ffn_(gate|up)(_exps|_shexp|_chexps)?\.weight$=iq2_s' \
+  ./models/Qwen/Qwen3-MoE-f16.gguf \
+  ./models/Qwen/Qwen3-MoE-Q4_K_M-ffn-gate-up-IQ2_S.gguf \
+  Q4_K_M \
+  $(nproc)
+```
+
+Keep `ffn_gate_inp` out of the regex. It is the MoE router/gate-input tensor,
+not the ordinary FFN gate projection, and should normally remain under the base
+quantization policy.
+
+To use the generated model in a `run.sh` experiment, point `MODEL` at the new
+GGUF file as usual:
+
+```bash
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-Q4_K_M-ffn-gate-up-IQ2_S.gguf \
+RUN_KIND=perplexity \
+SIM_Q4Q6=0 \
+SIM_Q8Q8=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=0 \
+SWIGLU_THRESHOLD_ENABLE=0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+You can replace `Q4_K_M` with another base type, such as `Q5_K_M`, `IQ3_M`, or
+`IQ2_M`. For `IQ2_M`, this override is less useful because the base policy already
+uses `IQ2_S` for many ordinary matrices; the main purpose of this workflow is to
+start from a higher-quality native baseline and selectively compress only the FFN
+gate/up matrices.
+
 After converting the local `Qwen3-1___7B` directory this way, you can point
 `run.sh` at the generated quantized model directly:
 
