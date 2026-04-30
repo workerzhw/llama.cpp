@@ -496,18 +496,41 @@ Do not use `--pure` for this workflow. The base quantization type, such as
 not matched by `--tensor-type`. The override below matches only `ffn_gate` and
 `ffn_up`; `ffn_down` is intentionally not matched, so it keeps the base policy.
 
-`IQ2_S` is a very low-bit type, so an importance matrix is required. The imatrix
-file must contain entries for the matched FFN gate/up tensors. If you generated
-or filtered the imatrix with `--include-weights` or `--exclude-weights`, make sure
-those FFN tensors are still included.
+`IQ2_S` is a very low-bit type, so an importance matrix is required. Generate it
+with `llama-imatrix` from the original `f16`/`bf16` GGUF model and a representative
+calibration text file before running `llama-quantize`. You can use the same text
+file that you normally pass to `run.sh` as `DATA`; the local default is
+`models/hf/wiki.test.raw`, but replace it with any calibration corpus that exists
+in your workspace and is representative of the target workload.
+
+Build both tools once:
+
+```bash
+cmake --build build --target llama-imatrix llama-quantize -j$(nproc)
+```
+
+Generate the imatrix for the source model. The example below writes the current
+GGUF imatrix format, which `llama-quantize --imatrix` can read directly:
+
+```bash
+./build/bin/llama-imatrix \
+  --model ./models/Qwen/Qwen3-8B-f16.gguf \
+  -f ./models/hf/wiki.test.raw \
+  -o ./models/Qwen/Qwen3-8B-imatrix.gguf \
+  -c 1024 \
+  -b 512 \
+  --chunks 16
+```
+
+The imatrix file must contain entries for the matched FFN gate/up tensors. If you
+generated or filtered the imatrix with `--include-weights` or `--exclude-weights`,
+make sure those FFN tensors are still included.
 
 Dense Transformer FFN override:
 
 ```bash
-cmake --build build --target llama-quantize -j$(nproc)
-
 ./build/bin/llama-quantize \
-  --imatrix ./imatrix.dat \
+  --imatrix ./models/Qwen/Qwen3-8B-imatrix.gguf \
   --tensor-type '^blk\.[0-9]+\.ffn_(gate|up)\.weight$=iq2_s' \
   ./models/Qwen/Qwen3-8B-f16.gguf \
   ./models/Qwen/Qwen3-8B-Q4_K_M-ffn-gate-up-IQ2_S.gguf \
@@ -519,10 +542,8 @@ MoE FFN override, including expert, shared-expert, and chunk-expert FFN gate/up
 matrices while still leaving `ffn_down*` native:
 
 ```bash
-cmake --build build --target llama-quantize -j$(nproc)
-
 ./build/bin/llama-quantize \
-  --imatrix ./imatrix.dat \
+  --imatrix ./models/Qwen/Qwen3-MoE-imatrix.gguf \
   --tensor-type '^blk\.[0-9]+\.ffn_(gate|up)(_exps|_shexp|_chexps)?\.weight$=iq2_s' \
   ./models/Qwen/Qwen3-MoE-f16.gguf \
   ./models/Qwen/Qwen3-MoE-Q4_K_M-ffn-gate-up-IQ2_S.gguf \
