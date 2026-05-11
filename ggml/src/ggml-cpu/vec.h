@@ -223,6 +223,63 @@ typedef double ggml_float;
 #endif
 
 // ---------------------------------------------------------------------------
+// 独立的 Q6/Q6 对称 uniform replay，使用 int8 power-of-2 block scale。
+//
+//   - src0 使用对称 Q6，范围为 [-31, 31]
+//   - src1 使用对称 Q6，范围为 [-31, 31]
+//   - 每个 block 保存一个 int8_t exponent k，scale = 2^k
+//   - 启用后，src2/output 在 ggml-cpu.c 里走 BF16 round-trip
+// ---------------------------------------------------------------------------
+
+#ifndef GGML_SIM_Q6Q6
+#define GGML_SIM_Q6Q6 0
+#endif
+
+#ifndef GGML_SIM_Q6Q6_APPLY_SRC0
+#define GGML_SIM_Q6Q6_APPLY_SRC0 1
+#endif
+
+#ifndef GGML_SIM_Q6Q6_APPLY_SRC1
+#define GGML_SIM_Q6Q6_APPLY_SRC1 1
+#endif
+
+#ifndef GGML_SIM_Q6Q6_SRC0_BLOCK
+#define GGML_SIM_Q6Q6_SRC0_BLOCK 16
+#endif
+
+#ifndef GGML_SIM_Q6Q6_SRC1_BLOCK
+#define GGML_SIM_Q6Q6_SRC1_BLOCK 16
+#endif
+
+#if GGML_SIM_Q6Q6 != 0 && GGML_SIM_Q6Q6 != 1
+#error "GGML_SIM_Q6Q6 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q6Q6_APPLY_SRC0 != 0 && GGML_SIM_Q6Q6_APPLY_SRC0 != 1
+#error "GGML_SIM_Q6Q6_APPLY_SRC0 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q6Q6_APPLY_SRC1 != 0 && GGML_SIM_Q6Q6_APPLY_SRC1 != 1
+#error "GGML_SIM_Q6Q6_APPLY_SRC1 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q6Q6_SRC0_BLOCK <= 0
+#error "GGML_SIM_Q6Q6_SRC0_BLOCK must be > 0"
+#endif
+
+#if GGML_SIM_Q6Q6_SRC1_BLOCK <= 0
+#error "GGML_SIM_Q6Q6_SRC1_BLOCK must be > 0"
+#endif
+
+#if GGML_SIM_Q6Q6 && GGML_SIM_FP8E4M3
+#error "GGML_SIM_Q6Q6 and GGML_SIM_FP8E4M3 cannot be enabled together"
+#endif
+
+#if GGML_SIM_Q6Q6 && GGML_SIM_Q4Q6
+#error "GGML_SIM_Q6Q6 and GGML_SIM_Q4Q6 cannot be enabled together"
+#endif
+
+// ---------------------------------------------------------------------------
 // Standalone Q8/Q8 symmetric uniform replay with int8 power-of-2 block scale.
 //
 //   - src0 uses symmetric Q8 in [-127, 127]
@@ -277,6 +334,10 @@ typedef double ggml_float;
 
 #if GGML_SIM_Q8Q8 && GGML_SIM_Q4Q6
 #error "GGML_SIM_Q8Q8 and GGML_SIM_Q4Q6 cannot be enabled together"
+#endif
+
+#if GGML_SIM_Q8Q8 && GGML_SIM_Q6Q6
+#error "GGML_SIM_Q8Q8 and GGML_SIM_Q6Q6 cannot be enabled together"
 #endif
 
 // Output simulation mode for GEMM/GEMV results before storing F32:
@@ -388,6 +449,24 @@ void ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(
         const char      * layer_name);
 
     void ggml_sim_q6_block_quant_dequant_f32_to_bf16(
+        const float     * in,
+        ggml_bf16_t     * out,
+        int               n,
+        int               block,
+        void            * scales_out,
+        int               src_id,
+        const char      * layer_name);
+
+    void ggml_sim_q6q6_block_quant_dequant_f32(
+        const float * in,
+        float       * out,
+        int           n,
+        int           block,
+        void        * scales_out,
+        int           src_id,
+        const char  * layer_name);
+
+    void ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(
         const float     * in,
         ggml_bf16_t     * out,
         int               n,

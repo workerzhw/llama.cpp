@@ -727,7 +727,7 @@ static size_t ggml_backend_cpu_kleidiai_buffer_type_get_alloc_size(ggml_backend_
 namespace ggml::cpu::kleidiai {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
-#if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) || GGML_SIM_Q4Q6 || GGML_SIM_Q8Q8
+#if (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) || GGML_SIM_Q4Q6 || GGML_SIM_Q6Q6 || GGML_SIM_Q8Q8
     // KleidiAI fast paths do not apply src0 FP8 replay or standalone low-bit replay.
     // Reject this fast path to avoid semantic mismatch with the generic CPU path.
         GGML_UNUSED(op);

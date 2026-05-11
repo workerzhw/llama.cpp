@@ -35,6 +35,9 @@ High-value environment variables:
   SIM_Q8Q8                    Enable symmetric Q8/Q8 replay with int8 power-of-2 block scale.
   SIM_Q8Q8_SRC0_BLOCK         src0 block size for Q8/Q8 replay.
   SIM_Q8Q8_SRC1_BLOCK         src1 block size for Q8/Q8 replay.
+  SIM_Q6Q6                    Enable symmetric Q6/Q6 replay with int8 power-of-2 block scale.
+  SIM_Q6Q6_SRC0_BLOCK         src0 block size for Q6/Q6 replay.
+  SIM_Q6Q6_SRC1_BLOCK         src1 block size for Q6/Q6 replay.
   SIM_Q4Q6_SRC1_QMODE         src1 replay mode: 0=symmetric Q6, 1=asymmetric Q6+zp, 2=logarithmic Q6-exp.
   SIM_Q4Q6_SRC1_LOG_STEP      Logarithmic src1 exponent divisor for Q6-exp replay: exponent uses q/step.
   SWIGLU_THRESHOLD_KIND       Activation target: swiglu, silu, silu_input, or swiglu+silu.
@@ -98,6 +101,11 @@ DEFAULT_SIM_Q4Q6_SRC0_BLOCK="${SIM_Q4Q6_SRC0_BLOCK:-16}"
 DEFAULT_SIM_Q4Q6_SRC1_BLOCK="${SIM_Q4Q6_SRC1_BLOCK:-16}"
 DEFAULT_SIM_Q4Q6_SRC1_QMODE="${SIM_Q4Q6_SRC1_QMODE:-0}"
 DEFAULT_SIM_Q4Q6_SRC1_LOG_STEP="${SIM_Q4Q6_SRC1_LOG_STEP:-1}"
+DEFAULT_SIM_Q6Q6="${SIM_Q6Q6:-0}"
+DEFAULT_SIM_Q6Q6_APPLY_SRC0="${SIM_Q6Q6_APPLY_SRC0:-1}"
+DEFAULT_SIM_Q6Q6_APPLY_SRC1="${SIM_Q6Q6_APPLY_SRC1:-1}"
+DEFAULT_SIM_Q6Q6_SRC0_BLOCK="${SIM_Q6Q6_SRC0_BLOCK:-16}"
+DEFAULT_SIM_Q6Q6_SRC1_BLOCK="${SIM_Q6Q6_SRC1_BLOCK:-16}"
 DEFAULT_SIM_Q8Q8="${SIM_Q8Q8:-0}"
 DEFAULT_SIM_Q8Q8_APPLY_SRC0="${SIM_Q8Q8_APPLY_SRC0:-1}"
 DEFAULT_SIM_Q8Q8_APPLY_SRC1="${SIM_Q8Q8_APPLY_SRC1:-1}"
@@ -196,6 +204,11 @@ ${case_name}
 |SIM_Q4Q6_SRC1_BLOCK=16
 |SIM_Q4Q6_SRC1_QMODE=0
 |SIM_Q4Q6_SRC1_LOG_STEP=1
+|SIM_Q6Q6=0
+|SIM_Q6Q6_APPLY_SRC0=1
+|SIM_Q6Q6_APPLY_SRC1=1
+|SIM_Q6Q6_SRC0_BLOCK=16
+|SIM_Q6Q6_SRC1_BLOCK=16
 |SIM_Q8Q8=0
 |SIM_Q8Q8_APPLY_SRC0=1
 |SIM_Q8Q8_APPLY_SRC1=1
@@ -526,6 +539,7 @@ remember_user_env_overrides() {
     SIM_FP8 SIM_FP_FORMAT SIM_FP8_LAYOUT SIM_FP8_APPLY_SRC0 SIM_FP8_APPLY_SRC1
     SIM_FP8_SCALE_TYPE SIM_FP8_SCALE_TYPE_IN SIM_FP8_SCALE_TYPE_OUT SIM_FP8_BLOCK
     SIM_Q4Q6 SIM_Q4Q6_APPLY_SRC0 SIM_Q4Q6_APPLY_SRC1 SIM_Q4Q6_SRC0_BLOCK SIM_Q4Q6_SRC1_BLOCK SIM_Q4Q6_SRC1_QMODE SIM_Q4Q6_SRC1_LOG_STEP
+    SIM_Q6Q6 SIM_Q6Q6_APPLY_SRC0 SIM_Q6Q6_APPLY_SRC1 SIM_Q6Q6_SRC0_BLOCK SIM_Q6Q6_SRC1_BLOCK
     SIM_Q8Q8 SIM_Q8Q8_APPLY_SRC0 SIM_Q8Q8_APPLY_SRC1 SIM_Q8Q8_SRC0_BLOCK SIM_Q8Q8_SRC1_BLOCK
     SIM_MATMUL_OUT_MODE
     SIM_FP8_E3M4_NO_SUBNORM_ZERO_ENABLE SIM_FP8_E3M4_NO_SUBNORM_ZERO_MIN_EXP SIM_FP8_E3M4_NO_SUBNORM_ZERO_MAX_EXP
@@ -586,6 +600,11 @@ reset_case_defaults() {
   SIM_Q4Q6_SRC1_BLOCK="${DEFAULT_SIM_Q4Q6_SRC1_BLOCK}"
   SIM_Q4Q6_SRC1_QMODE="${DEFAULT_SIM_Q4Q6_SRC1_QMODE}"
   SIM_Q4Q6_SRC1_LOG_STEP="${DEFAULT_SIM_Q4Q6_SRC1_LOG_STEP}"
+  SIM_Q6Q6="${DEFAULT_SIM_Q6Q6}"
+  SIM_Q6Q6_APPLY_SRC0="${DEFAULT_SIM_Q6Q6_APPLY_SRC0}"
+  SIM_Q6Q6_APPLY_SRC1="${DEFAULT_SIM_Q6Q6_APPLY_SRC1}"
+  SIM_Q6Q6_SRC0_BLOCK="${DEFAULT_SIM_Q6Q6_SRC0_BLOCK}"
+  SIM_Q6Q6_SRC1_BLOCK="${DEFAULT_SIM_Q6Q6_SRC1_BLOCK}"
   SIM_Q8Q8="${DEFAULT_SIM_Q8Q8}"
   SIM_Q8Q8_APPLY_SRC0="${DEFAULT_SIM_Q8Q8_APPLY_SRC0}"
   SIM_Q8Q8_APPLY_SRC1="${DEFAULT_SIM_Q8Q8_APPLY_SRC1}"
@@ -693,6 +712,9 @@ validate_case() {
   expect_one_of "SIM_Q4Q6_APPLY_SRC0" "${SIM_Q4Q6_APPLY_SRC0}" 0 1
   expect_one_of "SIM_Q4Q6_APPLY_SRC1" "${SIM_Q4Q6_APPLY_SRC1}" 0 1
   expect_one_of "SIM_Q4Q6_SRC1_QMODE" "${SIM_Q4Q6_SRC1_QMODE}" 0 1 2
+  expect_one_of "SIM_Q6Q6" "${SIM_Q6Q6}" 0 1
+  expect_one_of "SIM_Q6Q6_APPLY_SRC0" "${SIM_Q6Q6_APPLY_SRC0}" 0 1
+  expect_one_of "SIM_Q6Q6_APPLY_SRC1" "${SIM_Q6Q6_APPLY_SRC1}" 0 1
   expect_one_of "SIM_Q8Q8" "${SIM_Q8Q8}" 0 1
   expect_one_of "SIM_Q8Q8_APPLY_SRC0" "${SIM_Q8Q8_APPLY_SRC0}" 0 1
   expect_one_of "SIM_Q8Q8_APPLY_SRC1" "${SIM_Q8Q8_APPLY_SRC1}" 0 1
@@ -712,6 +734,8 @@ validate_case() {
   expect_positive_integer "SIM_Q4Q6_SRC0_BLOCK" "${SIM_Q4Q6_SRC0_BLOCK}"
   expect_positive_integer "SIM_Q4Q6_SRC1_BLOCK" "${SIM_Q4Q6_SRC1_BLOCK}"
   expect_positive_integer "SIM_Q4Q6_SRC1_LOG_STEP" "${SIM_Q4Q6_SRC1_LOG_STEP}"
+  expect_positive_integer "SIM_Q6Q6_SRC0_BLOCK" "${SIM_Q6Q6_SRC0_BLOCK}"
+  expect_positive_integer "SIM_Q6Q6_SRC1_BLOCK" "${SIM_Q6Q6_SRC1_BLOCK}"
   expect_positive_integer "SIM_Q8Q8_SRC0_BLOCK" "${SIM_Q8Q8_SRC0_BLOCK}"
   expect_positive_integer "SIM_Q8Q8_SRC1_BLOCK" "${SIM_Q8Q8_SRC1_BLOCK}"
   expect_positive_integer "REDUCTION_PROD_PROFILE_BINS" "${REDUCTION_PROD_PROFILE_BINS}"
@@ -732,12 +756,28 @@ validate_case() {
     die "SIM_Q8Q8 and SIM_FP8 cannot be enabled together"
   fi
 
+  if [[ "${SIM_Q6Q6}" == "1" && "${SIM_FP8}" == "1" ]]; then
+    die "SIM_Q6Q6 and SIM_FP8 cannot be enabled together"
+  fi
+
   if [[ "${SIM_Q8Q8}" == "1" && "${SIM_Q4Q6}" == "1" ]]; then
     die "SIM_Q8Q8 and SIM_Q4Q6 cannot be enabled together"
   fi
 
+  if [[ "${SIM_Q6Q6}" == "1" && "${SIM_Q4Q6}" == "1" ]]; then
+    die "SIM_Q6Q6 and SIM_Q4Q6 cannot be enabled together"
+  fi
+
+  if [[ "${SIM_Q6Q6}" == "1" && "${SIM_Q8Q8}" == "1" ]]; then
+    die "SIM_Q6Q6 and SIM_Q8Q8 cannot be enabled together"
+  fi
+
   if [[ "${SIM_Q4Q6}" == "1" && "${SIM_MATMUL_OUT_MODE}" != "1" ]]; then
     die "SIM_Q4Q6 requires SIM_MATMUL_OUT_MODE=1 (BF16 output round-trip)"
+  fi
+
+  if [[ "${SIM_Q6Q6}" == "1" && "${SIM_MATMUL_OUT_MODE}" != "1" ]]; then
+    die "SIM_Q6Q6 requires SIM_MATMUL_OUT_MODE=1 (BF16 output round-trip)"
   fi
 
   if [[ "${SIM_Q8Q8}" == "1" && "${SIM_MATMUL_OUT_MODE}" != "1" ]]; then
@@ -785,6 +825,11 @@ build_case_flags() {
   -DGGML_SIM_Q4Q6_SRC1_BLOCK=${SIM_Q4Q6_SRC1_BLOCK} \
   -DGGML_SIM_Q4Q6_SRC1_QMODE=${SIM_Q4Q6_SRC1_QMODE} \
   -DGGML_SIM_Q4Q6_SRC1_LOG_STEP=${SIM_Q4Q6_SRC1_LOG_STEP} \
+  -DGGML_SIM_Q6Q6=${SIM_Q6Q6} \
+  -DGGML_SIM_Q6Q6_APPLY_SRC0=${SIM_Q6Q6_APPLY_SRC0} \
+  -DGGML_SIM_Q6Q6_APPLY_SRC1=${SIM_Q6Q6_APPLY_SRC1} \
+  -DGGML_SIM_Q6Q6_SRC0_BLOCK=${SIM_Q6Q6_SRC0_BLOCK} \
+  -DGGML_SIM_Q6Q6_SRC1_BLOCK=${SIM_Q6Q6_SRC1_BLOCK} \
   -DGGML_SIM_Q8Q8=${SIM_Q8Q8} \
   -DGGML_SIM_Q8Q8_APPLY_SRC0=${SIM_Q8Q8_APPLY_SRC0} \
   -DGGML_SIM_Q8Q8_APPLY_SRC1=${SIM_Q8Q8_APPLY_SRC1} \

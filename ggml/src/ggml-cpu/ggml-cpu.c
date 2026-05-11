@@ -1878,11 +1878,14 @@ static enum ggml_type ggml_mul_mat_select_dot_type(
         bool use_fp8sim_src1,
         bool use_q4q6sim_src0,
         bool use_q4q6sim_src1,
+        bool use_q6q6sim_src0,
+        bool use_q6q6sim_src1,
         bool use_q8q8sim_src0,
         bool use_q8q8sim_src1) {
     const bool use_bf16_replay_dot =
             use_fp8sim_src0 || use_fp8sim_src1 ||
             use_q4q6sim_src0 || use_q4q6sim_src1 ||
+            use_q6q6sim_src0 || use_q6q6sim_src1 ||
             use_q8q8sim_src0 || use_q8q8sim_src1;
 
     return use_bf16_replay_dot ? GGML_TYPE_BF16 : src0_type;
@@ -1916,12 +1919,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     bool used_fp8sim_src1 = false;
     const bool use_q4q6sim_src0 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC0);
     const bool use_q4q6sim_src1 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC1);
+    const bool use_q6q6sim_src0 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC0);
+    const bool use_q6q6sim_src1 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC1);
     const bool use_q8q8sim_src0 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC0);
     const bool use_q8q8sim_src1 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC1);
 
     // 如果 BF16 dot，且启用了 trunc4，则替换 vec_dot
     if (type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_BF16) {
-#if GGML_SIM_FP8E4M3 || GGML_SIM_Q4Q6 || GGML_SIM_Q8Q8
+#if GGML_SIM_FP8E4M3 || GGML_SIM_Q4Q6 || GGML_SIM_Q6Q6 || GGML_SIM_Q8Q8
         // trunc4 and input simulation are mutually exclusive experiments; replay should be applied
         // in the input-prep stage (outer function), not here.
         (void)used_trunc4;
@@ -1945,7 +1950,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // Workspace layout (outer function):
     //   [optional] src1 converted to vec_dot_type (contiguous)
     //   [optional] src0 converted to dot_type (contiguous)
-    const void * wdata = (src1->type == vec_dot_type && ggml_is_contiguous(src1) && !(GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1) && !use_q4q6sim_src1 && !use_q8q8sim_src1)
+    const void * wdata = (src1->type == vec_dot_type && ggml_is_contiguous(src1) && !(GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1) && !use_q4q6sim_src1 && !use_q6q6sim_src1 && !use_q8q8sim_src1)
         ? src1->data
         : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -1962,7 +1967,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 
     // src0 base pointer: if outer stage casted it, it lives in wdata after src1 segment.
-    const bool  src0_casted_for_dot = (src0->type != type) || (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) || use_q4q6sim_src0 || use_q8q8sim_src0;
+    const bool  src0_casted_for_dot = (src0->type != type) || (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) || use_q4q6sim_src0 || use_q6q6sim_src0 || use_q8q8sim_src0;
     const char * src0_base = src0_casted_for_dot ? (const char *) params->wdata + wsize_src1 : (const char *) src0->data;
 
     // When casted, src0 is stored as contiguous dot_type with these computed strides.
@@ -1987,8 +1992,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const bool src1_converted_for_dot = (src1->type != vec_dot_type);
     const bool src1_is_wdata = (wdata == params->wdata);
     const char * src1_storage = src1_is_wdata ? "wdata" : "src1->data";
-    used_fp8sim_src0 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) || use_q4q6sim_src0 || use_q8q8sim_src0;
-    used_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1) || use_q4q6sim_src1 || use_q8q8sim_src1;
+    used_fp8sim_src0 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC0) || use_q4q6sim_src0 || use_q6q6sim_src0 || use_q8q8sim_src0;
+    used_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1) || use_q4q6sim_src1 || use_q6q6sim_src1 || use_q8q8sim_src1;
     // 限制打印次数，防刷屏
     static int g_mm_log_budget = 200;
     if (g_mm_log_budget-- > 0) {
@@ -2030,9 +2035,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // blck_0(=16) * 2, accounting for mmla kernels
     float tmp[32];
     const bool use_fp8sim_out =
-        !GGML_SIM_Q4Q6 && !GGML_SIM_Q8Q8 && (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
+        !GGML_SIM_Q4Q6 && !GGML_SIM_Q6Q6 && !GGML_SIM_Q8Q8 && (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
     const bool use_bf16sim_out =
-        GGML_SIM_Q4Q6 || GGML_SIM_Q8Q8 || (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_BF16);
+        GGML_SIM_Q4Q6 || GGML_SIM_Q6Q6 || GGML_SIM_Q8Q8 || (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_BF16);
     enum { FP8_QDQ_TMP_CAP = (GGML_SIM_FP8E4M3_BLOCK > 16 ? GGML_SIM_FP8E4M3_BLOCK : 16) };
 
     const bool dist_enabled = ggml_mm_dist_get_enabled();
@@ -2133,6 +2138,8 @@ void ggml_compute_forward_mul_mat(
     const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
     const bool use_q4q6sim_src0 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC0);
     const bool use_q4q6sim_src1 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC1);
+    const bool use_q6q6sim_src0 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC0);
+    const bool use_q6q6sim_src1 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC1);
     const bool use_q8q8sim_src0 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC0);
     const bool use_q8q8sim_src1 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC1);
 
@@ -2142,6 +2149,8 @@ void ggml_compute_forward_mul_mat(
             use_fp8sim_src1,
             use_q4q6sim_src0,
             use_q4q6sim_src1,
+            use_q6q6sim_src0,
+            use_q6q6sim_src1,
             use_q8q8sim_src0,
             use_q8q8sim_src1);
 
@@ -2210,6 +2219,7 @@ void ggml_compute_forward_mul_mat(
             (!ggml_is_contiguous(src1))  ||
             use_fp8sim_src1 ||
             use_q4q6sim_src1 ||
+            use_q6q6sim_src1 ||
             use_q8q8sim_src1;
 
     size_t wsize_src1 = 0;
@@ -2224,7 +2234,7 @@ void ggml_compute_forward_mul_mat(
 
         GGML_ASSERT(params->wsize >= ne13 * (int64_t) nbw3);
 
-        const bool use_src1_replay = use_fp8sim_src1 || use_q4q6sim_src1 || use_q8q8sim_src1;
+        const bool use_src1_replay = use_fp8sim_src1 || use_q4q6sim_src1 || use_q6q6sim_src1 || use_q8q8sim_src1;
 
         if (!use_src1_replay) {
             const int64_t nrows_total = ne11 * ne12 * ne13;
@@ -2266,7 +2276,7 @@ void ggml_compute_forward_mul_mat(
             }
         } else {
             // Replay path preserves the configured block semantics on src1 and stages into BF16.
-            const int block = use_fp8sim_src1 ? GGML_SIM_FP8E4M3_BLOCK : (use_q4q6sim_src1 ? GGML_SIM_Q4Q6_SRC1_BLOCK : GGML_SIM_Q8Q8_SRC1_BLOCK);
+            const int block = use_fp8sim_src1 ? GGML_SIM_FP8E4M3_BLOCK : (use_q4q6sim_src1 ? GGML_SIM_Q4Q6_SRC1_BLOCK : (use_q6q6sim_src1 ? GGML_SIM_Q6Q6_SRC1_BLOCK : GGML_SIM_Q8Q8_SRC1_BLOCK));
             const int64_t nblocks = (ne10 + block - 1) / block;
 
             for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -2288,13 +2298,16 @@ void ggml_compute_forward_mul_mat(
                                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 } else if (use_q4q6sim_src1) {
                                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
+                                } else if (use_q6q6sim_src1) {
+                                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 } else {
                                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 }
                             }
                         } else {
                             enum {
-                                SRC1_QDQ_TMP_CAP_LOWBIT = GGML_SIM_Q4Q6_SRC1_BLOCK > GGML_SIM_Q8Q8_SRC1_BLOCK ? GGML_SIM_Q4Q6_SRC1_BLOCK : GGML_SIM_Q8Q8_SRC1_BLOCK,
+                                SRC1_QDQ_TMP_CAP_Q6 = GGML_SIM_Q4Q6_SRC1_BLOCK > GGML_SIM_Q6Q6_SRC1_BLOCK ? GGML_SIM_Q4Q6_SRC1_BLOCK : GGML_SIM_Q6Q6_SRC1_BLOCK,
+                                SRC1_QDQ_TMP_CAP_LOWBIT = SRC1_QDQ_TMP_CAP_Q6 > GGML_SIM_Q8Q8_SRC1_BLOCK ? SRC1_QDQ_TMP_CAP_Q6 : GGML_SIM_Q8Q8_SRC1_BLOCK,
                                 SRC1_QDQ_TMP_CAP_FUSED = GGML_SIM_FP8E4M3_BLOCK > SRC1_QDQ_TMP_CAP_LOWBIT ? GGML_SIM_FP8E4M3_BLOCK : SRC1_QDQ_TMP_CAP_LOWBIT,
                                 SRC1_QDQ_TMP_CAP = SRC1_QDQ_TMP_CAP_FUSED > 16 ? SRC1_QDQ_TMP_CAP_FUSED : 16,
                             };
@@ -2327,6 +2340,8 @@ void ggml_compute_forward_mul_mat(
                                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 } else if (use_q4q6sim_src1) {
                                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
+                                } else if (use_q6q6sim_src1) {
+                                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 } else {
                                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 }
@@ -2345,7 +2360,7 @@ void ggml_compute_forward_mul_mat(
     // On the replay path, dot_type == BF16 and src0 is converted into contiguous BF16.
     // ---------------------------------------------------------------------
     size_t wsize_src0 = 0;
-    const bool need_src0_wdata = (src0->type != dot_type) || use_fp8sim_src0 || use_q4q6sim_src0 || use_q8q8sim_src0;
+    const bool need_src0_wdata = (src0->type != dot_type) || use_fp8sim_src0 || use_q4q6sim_src0 || use_q6q6sim_src0 || use_q8q8sim_src0;
     if (need_src0_wdata) {
         wsize_src0 = ggml_row_size(dot_type, ne00) * (size_t) ne01 * (size_t) ne02 * (size_t) ne03;
         wsize_src0 = GGML_PAD(wsize_src0, GGML_CACHE_LINE);
@@ -2383,6 +2398,8 @@ void ggml_compute_forward_mul_mat(
                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q4q6sim_src0) {
                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q4Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else if (use_q6q6sim_src0) {
+                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q6Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q8q8sim_src0) {
                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q8Q8_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
@@ -2396,6 +2413,8 @@ void ggml_compute_forward_mul_mat(
                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q4q6sim_src0) {
                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q4Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else if (use_q6q6sim_src0) {
+                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q6Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q8q8sim_src0) {
                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q8Q8_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
@@ -2408,6 +2427,8 @@ void ggml_compute_forward_mul_mat(
                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q4q6sim_src0) {
                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q4Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else if (use_q6q6sim_src0) {
+                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q6Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q8q8sim_src0) {
                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q8Q8_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
@@ -2419,6 +2440,8 @@ void ggml_compute_forward_mul_mat(
                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q4q6sim_src0) {
                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q4Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else if (use_q6q6sim_src0) {
+                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q6Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q8q8sim_src0) {
                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q8Q8_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
@@ -2559,6 +2582,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
             (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1),
             (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC0),
             (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC1),
+            (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC0),
+            (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC1),
             (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC0),
             (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC1));
 
@@ -2569,9 +2594,9 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
     const bool use_fp8sim_out =
-        !GGML_SIM_Q4Q6 && (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
+        !GGML_SIM_Q4Q6 && !GGML_SIM_Q6Q6 && !GGML_SIM_Q8Q8 && (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_FP8E4M3) && GGML_SIM_FP8E4M3;
     const bool use_bf16sim_out =
-        GGML_SIM_Q4Q6 || (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_BF16);
+        GGML_SIM_Q4Q6 || GGML_SIM_Q6Q6 || GGML_SIM_Q8Q8 || (GGML_SIM_MATMUL_OUT_MODE == GGML_SIM_MATMUL_OUT_MODE_BF16);
 
     float tmp[16];
 
@@ -2683,6 +2708,8 @@ static void ggml_compute_forward_mul_mat_id(
     const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
     const bool use_q4q6sim_src0 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC0);
     const bool use_q4q6sim_src1 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC1);
+    const bool use_q6q6sim_src0 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC0);
+    const bool use_q6q6sim_src1 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC1);
     const bool use_q8q8sim_src0 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC0);
     const bool use_q8q8sim_src1 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC1);
 
@@ -2692,6 +2719,8 @@ static void ggml_compute_forward_mul_mat_id(
             use_fp8sim_src1,
             use_q4q6sim_src0,
             use_q4q6sim_src1,
+            use_q6q6sim_src0,
+            use_q6q6sim_src1,
             use_q8q8sim_src0,
             use_q8q8sim_src1);
 
@@ -2722,6 +2751,7 @@ static void ggml_compute_forward_mul_mat_id(
             (!ggml_is_contiguous(src1))  ||
             use_fp8sim_src1 ||
             use_q4q6sim_src1 ||
+            use_q6q6sim_src1 ||
             use_q8q8sim_src1;
 
     if (need_src1_wdata) {
@@ -2735,7 +2765,7 @@ static void ggml_compute_forward_mul_mat_id(
 
         GGML_ASSERT(params->wsize >= ne13 * (int64_t) nbw3);
 
-        const bool use_src1_replay = use_fp8sim_src1 || use_q4q6sim_src1 || use_q8q8sim_src1;
+        const bool use_src1_replay = use_fp8sim_src1 || use_q4q6sim_src1 || use_q6q6sim_src1 || use_q8q8sim_src1;
 
         if (!use_src1_replay) {
             const int64_t nrows_total = ne11 * ne12 * ne13;
@@ -2776,7 +2806,7 @@ static void ggml_compute_forward_mul_mat_id(
                 }
             }
         } else {
-            const int block = use_fp8sim_src1 ? GGML_SIM_FP8E4M3_BLOCK : (use_q4q6sim_src1 ? GGML_SIM_Q4Q6_SRC1_BLOCK : GGML_SIM_Q8Q8_SRC1_BLOCK);
+            const int block = use_fp8sim_src1 ? GGML_SIM_FP8E4M3_BLOCK : (use_q4q6sim_src1 ? GGML_SIM_Q4Q6_SRC1_BLOCK : (use_q6q6sim_src1 ? GGML_SIM_Q6Q6_SRC1_BLOCK : GGML_SIM_Q8Q8_SRC1_BLOCK));
             const int64_t nblocks = (ne10 + block - 1) / block;
 
             for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -2798,13 +2828,16 @@ static void ggml_compute_forward_mul_mat_id(
                                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 } else if (use_q4q6sim_src1) {
                                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
+                                } else if (use_q6q6sim_src1) {
+                                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 } else {
                                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(in + off, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 }
                             }
                         } else {
                             enum {
-                                SRC1_QDQ_TMP_CAP_LOWBIT = GGML_SIM_Q4Q6_SRC1_BLOCK > GGML_SIM_Q8Q8_SRC1_BLOCK ? GGML_SIM_Q4Q6_SRC1_BLOCK : GGML_SIM_Q8Q8_SRC1_BLOCK,
+                                SRC1_QDQ_TMP_CAP_Q6 = GGML_SIM_Q4Q6_SRC1_BLOCK > GGML_SIM_Q6Q6_SRC1_BLOCK ? GGML_SIM_Q4Q6_SRC1_BLOCK : GGML_SIM_Q6Q6_SRC1_BLOCK,
+                                SRC1_QDQ_TMP_CAP_LOWBIT = SRC1_QDQ_TMP_CAP_Q6 > GGML_SIM_Q8Q8_SRC1_BLOCK ? SRC1_QDQ_TMP_CAP_Q6 : GGML_SIM_Q8Q8_SRC1_BLOCK,
                                 SRC1_QDQ_TMP_CAP_FUSED = GGML_SIM_FP8E4M3_BLOCK > SRC1_QDQ_TMP_CAP_LOWBIT ? GGML_SIM_FP8E4M3_BLOCK : SRC1_QDQ_TMP_CAP_LOWBIT,
                                 SRC1_QDQ_TMP_CAP = SRC1_QDQ_TMP_CAP_FUSED > 16 ? SRC1_QDQ_TMP_CAP_FUSED : 16,
                             };
@@ -2837,6 +2870,8 @@ static void ggml_compute_forward_mul_mat_id(
                                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 } else if (use_q4q6sim_src1) {
                                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
+                                } else if (use_q6q6sim_src1) {
+                                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 } else {
                                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(tmp_f32, out + off, len, len, NULL, /*src_id=*/1, src1->name);
                                 }
@@ -2851,7 +2886,7 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     size_t wsize_src0 = 0;
-    const bool need_src0_wdata = (src0->type != dot_type) || use_fp8sim_src0 || use_q4q6sim_src0 || use_q8q8sim_src0;
+    const bool need_src0_wdata = (src0->type != dot_type) || use_fp8sim_src0 || use_q4q6sim_src0 || use_q6q6sim_src0 || use_q8q8sim_src0;
     if (need_src0_wdata) {
         wsize_src0 = ggml_row_size(dot_type, ne00) * (size_t) ne01 * (size_t) ne02 * (size_t) ne03;
         wsize_src0 = GGML_PAD(wsize_src0, GGML_CACHE_LINE);
@@ -2887,6 +2922,8 @@ static void ggml_compute_forward_mul_mat_id(
                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q4q6sim_src0) {
                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q4Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else if (use_q6q6sim_src0) {
+                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q6Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q8q8sim_src0) {
                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(in, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q8Q8_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
@@ -2899,6 +2936,8 @@ static void ggml_compute_forward_mul_mat_id(
                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q4q6sim_src0) {
                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q4Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else if (use_q6q6sim_src0) {
+                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q6Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q8q8sim_src0) {
                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q8Q8_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
@@ -2911,6 +2950,8 @@ static void ggml_compute_forward_mul_mat_id(
                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q4q6sim_src0) {
                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q4Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else if (use_q6q6sim_src0) {
+                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q6Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q8q8sim_src0) {
                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q8Q8_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
@@ -2922,6 +2963,8 @@ static void ggml_compute_forward_mul_mat_id(
                     ggml_sim_fp8e4m3_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_FP8E4M3_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q4q6sim_src0) {
                     ggml_sim_q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q4Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
+                } else if (use_q6q6sim_src0) {
+                    ggml_sim_q6q6_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q6Q6_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else if (use_q8q8sim_src0) {
                     ggml_sim_q8_block_quant_dequant_f32_to_bf16(tmp_f32, (ggml_bf16_t *) src0_row_out, (int)ne00, GGML_SIM_Q8Q8_SRC0_BLOCK, NULL, /*src_id=*/0, src0->name);
                 } else {
@@ -4127,6 +4170,8 @@ struct ggml_cplan ggml_graph_plan(
                         const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
                         const bool use_q4q6sim_src0 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC0);
                         const bool use_q4q6sim_src1 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC1);
+                        const bool use_q6q6sim_src0 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC0);
+                        const bool use_q6q6sim_src1 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC1);
                         const bool use_q8q8sim_src0 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC0);
                         const bool use_q8q8sim_src1 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC1);
 
@@ -4136,6 +4181,8 @@ struct ggml_cplan ggml_graph_plan(
                                 use_fp8sim_src1,
                                 use_q4q6sim_src0,
                                 use_q4q6sim_src1,
+                                use_q6q6sim_src0,
+                                use_q6q6sim_src1,
                                 use_q8q8sim_src0,
                                 use_q8q8sim_src1);
                         const enum ggml_type vec_dot_type = type_traits_cpu[dot_type].vec_dot_type;
@@ -4145,12 +4192,14 @@ struct ggml_cplan ggml_graph_plan(
                                 (!ggml_is_contiguous(src1))  ||
                                 use_fp8sim_src1 ||
                                 use_q4q6sim_src1 ||
+                                use_q6q6sim_src1 ||
                                 use_q8q8sim_src1;
 
                         const bool need_src0_wdata =
                                 (src0->type != dot_type) ||
                                 use_fp8sim_src0 ||
                                 use_q4q6sim_src0 ||
+                                use_q6q6sim_src0 ||
                                 use_q8q8sim_src0;
 
                         size_t wsize_src1 = 0;
@@ -4178,6 +4227,8 @@ struct ggml_cplan ggml_graph_plan(
                         const bool use_fp8sim_src1 = (GGML_SIM_FP8E4M3 && GGML_SIM_FP8E4M3_APPLY_SRC1);
                         const bool use_q4q6sim_src0 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC0);
                         const bool use_q4q6sim_src1 = (GGML_SIM_Q4Q6 && GGML_SIM_Q4Q6_APPLY_SRC1);
+                        const bool use_q6q6sim_src0 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC0);
+                        const bool use_q6q6sim_src1 = (GGML_SIM_Q6Q6 && GGML_SIM_Q6Q6_APPLY_SRC1);
                         const bool use_q8q8sim_src0 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC0);
                         const bool use_q8q8sim_src1 = (GGML_SIM_Q8Q8 && GGML_SIM_Q8Q8_APPLY_SRC1);
                         const enum ggml_type dot_type = ggml_mul_mat_select_dot_type(
@@ -4186,6 +4237,8 @@ struct ggml_cplan ggml_graph_plan(
                                 use_fp8sim_src1,
                                 use_q4q6sim_src0,
                                 use_q4q6sim_src1,
+                                use_q6q6sim_src0,
+                                use_q6q6sim_src1,
                                 use_q8q8sim_src0,
                                 use_q8q8sim_src1);
                         const enum ggml_type vec_dot_type = type_traits_cpu[dot_type].vec_dot_type;
@@ -4198,6 +4251,7 @@ struct ggml_cplan ggml_graph_plan(
                                 (!ggml_is_contiguous(src1))  ||
                                 use_fp8sim_src1 ||
                                 use_q4q6sim_src1 ||
+                                use_q6q6sim_src1 ||
                                 use_q8q8sim_src1;
 
                         if (need_src1_wdata) {
@@ -4211,6 +4265,7 @@ struct ggml_cplan ggml_graph_plan(
                                 (src0->type != dot_type) ||
                                 use_fp8sim_src0 ||
                                 use_q4q6sim_src0 ||
+                                use_q6q6sim_src0 ||
                                 use_q8q8sim_src0;
 
                         if (need_src0_wdata) {

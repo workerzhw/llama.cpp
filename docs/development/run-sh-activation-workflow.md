@@ -1,62 +1,104 @@
 # run.sh Activation Workflow
 
-This document describes the local experiment driver at `run.sh`.
+本文档说明仓库根目录下的本地实验驱动脚本 `run.sh`。
 
-The script is intended for local activation-threshold experiments, decode statistics,
-and reduction-product profiler runs. It is not a general project launcher.
+`run.sh` 主要用于本地 activation threshold 实验、decode 统计观察、
+低精度 replay 实验，以及 reduction-product profiler 运行。它不是通用的
+项目启动器。
 
-## 1. What the script does
+## 1. 先看这里
 
-`run.sh` wraps five related activities:
+大多数任务可以先按下面这张表选路径：
 
-- running `llama-cli`
-- running `llama-perplexity`
-- running `llama-decode-stats`
-- collecting activation distributions for threshold calibration
-- generating threshold tables from collected distributions
+| 目标 | 推荐命令形态 |
+| --- | --- |
+| 用 `llama-cli` 快速跑一个 case | `CASE_FILTER=... RUN_KIND=cli bash run.sh` |
+| 跑普通 perplexity 基线 | `RUN_KIND=perplexity`，并显式关闭 simulation 和 threshold |
+| 跑纯 `SIM_Q4Q6`、`SIM_Q6Q6` 或 `SIM_Q8Q8` replay | `RUN_KIND=perplexity`，开启 replay，设置 `SWIGLU_THRESHOLD_ENABLE=0` |
+| 一条命令跑完整 activation threshold 流程 | `RUN_KIND=activation-flow` |
+| 先生成 threshold，检查报告后再跑 `ppl` | 先跑 `RUN_KIND=activation-flow FLOW_STEPS=collect,generate`，再跑 `RUN_KIND=perplexity` |
+| 分步调试 threshold 流程 | 依次跑 `swiglu-collect`、`swiglu-generate`，最后用 `perplexity` 或 `cli` apply |
+| 复用已有 generated artifacts | `RUN_KIND=activation-flow FLOW_REUSE_ARTIFACTS=1` |
+| 查看 decode-time tensor 统计 | `RUN_KIND=decode-stats` |
 
-It also handles:
-
-- case selection
-- per-case build flags
-- build reuse vs rebuild
-- artifact path resolution
-- postprocessing of profiler outputs
-- optional one-command activation experiment pipelines
-
-## 2. Quick start
-
-Show built-in help:
+查看脚本内置帮助：
 
 ```bash
 bash run.sh --help
 ```
 
-All command snippets below are literal shell commands.
-You can paste them exactly as shown from the repository root.
-Lines ending with `\` are just Bash line continuations, so you can either:
+下面所有命令都默认从仓库根目录运行。以 `\` 结尾的行是 Bash 续行，可以
+整块粘贴执行，也可以去掉 `\` 后合并成一行执行。
 
-- paste the multi-line block as-is
-- or remove the trailing `\` characters and run it as one long line
+构建行为要特别注意：
 
-If you use `SKIP_BUILD=1`, the required binaries must already exist under `BUILD_DIR`.
-If this is the first run for a mode or the build tree is stale, switch to `SKIP_BUILD=0` once.
+- `SKIP_BUILD=0` 会重建 `BUILD_DIR`，并构建当前 mode 所需的二进制。
+- `SKIP_BUILD=1` 会复用 `BUILD_DIR`，只检查所需二进制是否已经存在。
+- 第一次跑某个 mode，或者 build tree 可能已经过期时，先用 `SKIP_BUILD=0`。
 
-Run one case in `cli` mode using the current defaults:
+## 2. 心智模型
+
+`run.sh` 主要协调四件事：
+
+1. 选择 case：从 `RUN_CASES` 中选择模型和运行参数。
+2. 选择构建：把 simulation flags 传给 CMake，并构建所需工具。
+3. 执行工具：运行 `llama-cli`、`llama-perplexity`、`llama-decode-stats`，或运行 threshold generator。
+4. 归档产物：把日志、收集到的分布、生成的 threshold、报告和 profiler 输出放到对应 case 目录。
+
+Activation threshold 流程可以理解成三步：
+
+```text
+collect activation distributions
+  -> generate threshold CSV files
+  -> apply thresholds in llama-perplexity and/or llama-cli
+```
+
+`RUN_KIND=activation-flow` 是这个流程的一键模式，默认 step list 是：
+
+```text
+collect,generate,perplexity,cli
+```
+
+可以用 `FLOW_STEPS` 改写这个列表。
+
+在 `activation-flow` 中，`collect` 和 `generate` 会关闭 threshold apply；
+`perplexity` 和 `cli` 会开启 threshold apply。如果某个 case 里
+`N_PREDICT=-1`，flow 会用 `FLOW_DECODE_N_PREDICT` 作为 `collect` 和
+`cli` 的有限 token 预算。
+
+## 3. 常用工作流
+
+### 3.1 快速跑一个 case
 
 ```bash
+CASE_FILTER=Llama-3.2-1B \
+RUN_KIND=cli \
+SKIP_BUILD=0 \
 bash run.sh
 ```
 
-Run a native perplexity measurement with all replay modes disabled.
-Set `SIM_MATMUL_OUT_MODE=0` as well, otherwise the output path still does a BF16 round-trip even when `SIM_Q4Q6`, `SIM_Q8Q8`, and `SIM_FP8` are all off:
-the command also pins `MODEL` explicitly, so you can replace it with the exact `gguf` you want to test.
+第一次成功构建后，可以复用同一个 build tree：
+
+```bash
+CASE_FILTER=Llama-3.2-1B \
+RUN_KIND=cli \
+SKIP_BUILD=1 \
+BUILD_DIR=build \
+bash run.sh
+```
+
+### 3.2 普通 native perplexity 基线
+
+这个命令用于没有低精度 replay、没有 activation threshold truncation 的基线。
+这里显式设置 `SIM_MATMUL_OUT_MODE=0` 很重要；否则默认 case 配置仍然会让
+matmul output 路径走 BF16 round-trip。
 
 ```bash
 CASE_FILTER=Qwen-3-8B \
 MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
 RUN_KIND=perplexity \
 SIM_Q4Q6=0 \
+SIM_Q6Q6=0 \
 SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=0 \
@@ -65,16 +107,18 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-Run a pure `SIM_Q4Q6` perplexity measurement without mixing in activation-threshold
-truncation from the FFN sparsity experiments.
-The key switch is `SWIGLU_THRESHOLD_ENABLE=0`; otherwise `perplexity` and `cli`
-will also load/apply the threshold config path resolved by the script.
-In the current CPU canonical wiring, `SIM_Q4Q6` replays `src0` with symmetric Q6 blocks.
-`src1` also uses Q6 blocks, and can optionally switch to asymmetric Q6+zero-point with
-`SIM_Q4Q6_SRC1_QMODE=1`, or to logarithmic `Q6-exp + BF16 scale` replay with
-`SIM_Q4Q6_SRC1_QMODE=2`.
-For the logarithmic mode, `SIM_Q4Q6_SRC1_LOG_STEP` controls the exponent divisor so the replay uses
-`2^(q/step)` spacing; the default is `1`:
+### 3.3 纯 `SIM_Q4Q6` perplexity
+
+`SIM_Q4Q6` 不能和 `SIM_Q6Q6`、`SIM_Q8Q8` 或 `SIM_FP8` 同时开启。
+
+当前 CPU 路径中，`src0` 使用 symmetric Q6 blocks。`src1` 默认也是
+symmetric Q6，也可以通过 `SIM_Q4Q6_SRC1_QMODE=1` 切换到 asymmetric
+Q6+zero-point，或通过 `SIM_Q4Q6_SRC1_QMODE=2` 切换到 logarithmic
+Q6-exp plus BF16 block scale。
+
+保持 `SWIGLU_THRESHOLD_ENABLE=0`，避免 FFN threshold truncation 混进 replay
+测量结果。保持 `SIM_MATMUL_OUT_MODE=1`，因为 Q4Q6 replay 依赖 BF16 output
+round-trip。
 
 ```bash
 CASE_FILTER=Llama-2-7B \
@@ -83,6 +127,8 @@ RUN_KIND=perplexity \
 SIM_Q4Q6=1 \
 SIM_Q4Q6_SRC1_QMODE=2 \
 SIM_Q4Q6_SRC1_LOG_STEP=4 \
+SIM_Q6Q6=0 \
+SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=1 \
 SWIGLU_THRESHOLD_ENABLE=0 \
@@ -90,14 +136,33 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-Run the same style of replay experiment with symmetric `Q8/Q8` blocks on both
-weights and activations.
-`SIM_Q8Q8` is a standalone mode and cannot be combined with `SIM_Q4Q6` or `SIM_FP8`.
-Both `src0` and `src1` use symmetric uniform `Q8` replay, with one `int8` power-of-2
-block scale per block (`scale = 2^k`).
-As with `SIM_Q4Q6`, keep `SWIGLU_THRESHOLD_ENABLE=0` to avoid mixing threshold experiments
-into the perplexity result, and keep `SIM_MATMUL_OUT_MODE=1` so the output path still
-uses the BF16 round-trip:
+### 3.4 纯 `SIM_Q6Q6` perplexity
+
+`SIM_Q6Q6` 是 `SIM_Q8Q8` 的 Q6 版本：两个 source 都使用 symmetric uniform
+Q6 replay，每个 block 使用一个 int8 power-of-2 block scale。除量化范围
+`[-31, 31]` 外，其余结构和 `SIM_Q8Q8` 一致。
+
+```bash
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
+RUN_KIND=perplexity \
+SIM_Q6Q6=1 \
+SIM_Q6Q6_SRC0_BLOCK=32 \
+SIM_Q6Q6_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_Q8Q8=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
+SWIGLU_THRESHOLD_ENABLE=0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+### 3.5 纯 `SIM_Q8Q8` perplexity
+
+`SIM_Q8Q8` 是独立 replay mode，不能和 `SIM_Q4Q6`、`SIM_Q6Q6` 或 `SIM_FP8` 同时开启。
+两个 source 都使用 symmetric uniform Q8 replay，每个 block 使用一个 int8
+power-of-2 block scale。
 
 ```bash
 CASE_FILTER=Qwen-3-8B \
@@ -107,6 +172,7 @@ SIM_Q8Q8=1 \
 SIM_Q8Q8_SRC0_BLOCK=32 \
 SIM_Q8Q8_SRC1_BLOCK=32 \
 SIM_Q4Q6=0 \
+SIM_Q6Q6=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=1 \
 SWIGLU_THRESHOLD_ENABLE=0 \
@@ -114,78 +180,23 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-Split `Q8/Q8` replay + FFN sparsity into two commands when you only care about `ppl`.
-Use the first command to do `collect -> generate` only, so you can inspect the generated
-threshold reports and decide whether the selected thresholds already achieve the sparsity
-you want before paying for the final `perplexity` run.
-Keep `MODEL` on the `f16` GGUF here: `SIM_Q8Q8=1` injects the runtime `Q8/Q8` replay,
-and the generated `silu/swiglu` thresholds are then applied back onto that same runtime path.
+### 3.6 一键 threshold pipeline
 
-Start with this first command:
+第一次跑时用 `SKIP_BUILD=0`，让脚本构建默认 flow 所需的全部二进制。
+
+SwiGLU output threshold：
 
 ```bash
-CASE_FILTER=Qwen-3-8B \
-MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
+CASE_FILTER=Qwen-3-1.7B \
 RUN_KIND=activation-flow \
-FLOW_STEPS=collect,generate \
-SIM_Q8Q8=1 \
-SIM_Q8Q8_SRC0_BLOCK=32 \
-SIM_Q8Q8_SRC1_BLOCK=32 \
-SIM_Q4Q6=0 \
-SIM_FP8=0 \
-SIM_MATMUL_OUT_MODE=1 \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
+SWIGLU_THRESHOLD_KIND=swiglu \
 SWIGLU_TARGET_PROFILE_KIND=minimal \
-SWIGLU_TARGET_SCALE=50.0 \
+SWIGLU_TARGET_SCALE=1.0 \
 SKIP_BUILD=0 \
 bash run.sh
 ```
 
-This first command writes both generated threshold files:
-
-- `kv_dump_logs/<case>/<case>_silu_threshold_generated.csv`
-- `kv_dump_logs/<case>/<case>_swiglu_threshold_generated.csv`
-
-and both generated summary reports:
-
-- `kv_dump_logs/<case>/<case>_silu_threshold_generated_summary.csv`
-- `kv_dump_logs/<case>/<case>_swiglu_threshold_generated_summary.csv`
-
-Use those `*_threshold_generated_summary.csv` files to judge whether the chosen thresholds
-already hit your target sparsity. The key columns are:
-
-- `final_threshold`: the threshold that will actually be written into the generated config
-- `prefill_final_estimated_added_zero_ratio`: estimated added-zero ratio on `prefill`
-- `decode_final_estimated_added_zero_ratio`: estimated added-zero ratio on `decode`
-
-If the estimated sparsity is still too low or too high, adjust `SWIGLU_TARGET_SCALE`
-and rerun this first command until the generated report reaches the range you want.
-
-Once you are satisfied with the generated thresholds, run the final `perplexity` step as a
-second command:
-
-```bash
-CASE_FILTER=Qwen-3-8B \
-MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
-RUN_KIND=perplexity \
-SIM_Q8Q8=1 \
-SIM_Q8Q8_SRC0_BLOCK=32 \
-SIM_Q8Q8_SRC1_BLOCK=32 \
-SIM_Q4Q6=0 \
-SIM_FP8=0 \
-SIM_MATMUL_OUT_MODE=1 \
-SWIGLU_THRESHOLD_ENABLE=1 \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SWIGLU_THRESHOLD_PROFILE=generated \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-If those generated dual-threshold files already exist and you only want to rerun the final
-`ppl` apply step later, reuse the same second command.
-
-Run a full SiLU threshold pipeline in one command.
-For a first run, use `SKIP_BUILD=0` so the script can build every required binary:
+SiLU output threshold：
 
 ```bash
 CASE_FILTER=Llama-3.2-1B \
@@ -195,11 +206,30 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-After that first successful build, you can switch back to `SKIP_BUILD=1` for reruns.
+SiLU input threshold。这个路径在 SiLU activation 之前，对 raw gate input 做
+one-sided negative-tail truncation：
 
-Run a full per-channel SiLU threshold pipeline.
-This variant first collects the maximum absolute SiLU output magnitude for every layer/channel,
-then generates one runtime threshold per channel with `threshold = abs_channel_max * SWIGLU_CHANNEL_THRESHOLD_RATIO`:
+```bash
+CASE_FILTER=Llama-3.2-1B \
+RUN_KIND=activation-flow \
+SWIGLU_THRESHOLD_KIND=silu_input \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+Dual SiLU output plus SwiGLU output threshold：
+
+```bash
+CASE_FILTER=Qwen-3-1.7B \
+RUN_KIND=activation-flow \
+SWIGLU_THRESHOLD_KIND=swiglu+silu \
+SWIGLU_TARGET_PROFILE_KIND=minimal \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+Per-channel SiLU output threshold。这个 mode 不使用 target-profile CSV，而是使用
+`threshold = abs_channel_max * SWIGLU_CHANNEL_THRESHOLD_RATIO`：
 
 ```bash
 CASE_FILTER=Qwen-3-1.7B \
@@ -211,112 +241,77 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-Run the same pipeline at the raw gate input before SiLU.
-This `silu_input` path applies one-sided negative-tail truncation before activation:
+### 3.7 先选 threshold，再跑 `ppl`
+
+当最终 `perplexity` 很贵时，可以先只做 collect/generate，检查生成的
+summary report，再决定是否跑最终 apply。
+
+对于 Q8/Q8 replay plus dual FFN sparsity，这里保持 `MODEL` 指向 f16 GGUF。
+`SIM_Q8Q8=1` 会在运行时注入 Q8/Q8 replay，生成的 `silu/swiglu` thresholds
+也会 apply 到同一条 runtime path 上。
+
+第一条命令只做 collect 和 generate：
 
 ```bash
-CASE_FILTER=Llama-3.2-1B \
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-f16.gguf \
 RUN_KIND=activation-flow \
-SWIGLU_THRESHOLD_KIND=silu_input \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-Run the same pipeline with both SiLU-output and SwiGLU-output truncation enabled.
-This combined mode collects, generates, and applies both threshold families in one flow:
-
-```bash
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=activation-flow \
+FLOW_STEPS=collect,generate \
+SIM_Q8Q8=1 \
+SIM_Q8Q8_SRC0_BLOCK=32 \
+SIM_Q8Q8_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_Q6Q6=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
 SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-Run the same workflow manually, step by step.
-This path is mainly useful for debugging or inspecting intermediate artifacts.
-Because single-step modes build only the target needed by that step, a safe first-run
-manual workflow uses `SKIP_BUILD=0` on the binary-using steps:
-
-```bash
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=swiglu-collect \
-SWIGLU_THRESHOLD_KIND=swiglu \
-SWIGLU_THRESHOLD_ENABLE=0 \
-SKIP_BUILD=0 \
-N_PREDICT=128 \
-bash run.sh
-
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=swiglu-generate \
-SWIGLU_THRESHOLD_KIND=swiglu \
 SWIGLU_TARGET_PROFILE_KIND=minimal \
 SWIGLU_TARGET_SCALE=1.0 \
-bash run.sh
-
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=perplexity \
-SWIGLU_THRESHOLD_KIND=swiglu \
-SWIGLU_THRESHOLD_ENABLE=1 \
-SWIGLU_THRESHOLD_PROFILE=generated \
 SKIP_BUILD=0 \
-bash run.sh
-
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=cli \
-SWIGLU_THRESHOLD_KIND=swiglu \
-SWIGLU_THRESHOLD_ENABLE=1 \
-SWIGLU_THRESHOLD_PROFILE=generated \
-SKIP_BUILD=0 \
-N_PREDICT=128 \
 bash run.sh
 ```
 
-Run the same SiLU workflow with per-channel thresholds, step by step.
-This mode does not use a target profile. `swiglu-collect` writes a per-stage
-`_channel_max.csv`, and `swiglu-generate` turns it into a `layer,channel,threshold` table:
+检查生成的 summary files：
 
-```bash
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=swiglu-collect \
-SWIGLU_THRESHOLD_KIND=silu \
-SWIGLU_GENERATE_MODE=channel-max \
-SWIGLU_THRESHOLD_ENABLE=0 \
-SKIP_BUILD=0 \
-N_PREDICT=128 \
-bash run.sh
-
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=swiglu-generate \
-SWIGLU_THRESHOLD_KIND=silu \
-SWIGLU_GENERATE_MODE=channel-max \
-SWIGLU_CHANNEL_THRESHOLD_RATIO=0.10 \
-bash run.sh
-
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=perplexity \
-SWIGLU_THRESHOLD_KIND=silu \
-SWIGLU_THRESHOLD_ENABLE=1 \
-SWIGLU_THRESHOLD_PROFILE=generated \
-SKIP_BUILD=0 \
-bash run.sh
-
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=cli \
-SWIGLU_THRESHOLD_KIND=silu \
-SWIGLU_THRESHOLD_ENABLE=1 \
-SWIGLU_THRESHOLD_PROFILE=generated \
-SKIP_BUILD=0 \
-N_PREDICT=128 \
-bash run.sh
+```text
+kv_dump_logs/<case>/<case>_silu_threshold_generated_summary.csv
+kv_dump_logs/<case>/<case>_swiglu_threshold_generated_summary.csv
 ```
 
-Run the same dual-output workflow manually, step by step.
-This is the explicit `swiglu+silu` version of the same process and writes both
-the `silu` and `swiglu` artifact families under the same case directory:
+最有用的列：
+
+- `final_threshold`：最终写入 generated config 的 threshold。
+- `prefill_final_estimated_added_zero_ratio`：prefill 上估计的 added-zero ratio。
+- `decode_final_estimated_added_zero_ratio`：decode 上估计的 added-zero ratio。
+
+如果估计 sparsity 太低或太高，调整 `SWIGLU_TARGET_SCALE` 后重新跑第一条命令。
+
+满意后再跑最终 perplexity apply：
 
 ```bash
 CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-f16.gguf \
+RUN_KIND=perplexity \
+SIM_Q8Q8=1 \
+SIM_Q8Q8_SRC0_BLOCK=32 \
+SIM_Q8Q8_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_Q6Q6=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
+SWIGLU_THRESHOLD_ENABLE=1 \
+SWIGLU_THRESHOLD_KIND=swiglu+silu \
+SWIGLU_THRESHOLD_PROFILE=generated \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+### 3.8 手动分步 threshold pipeline
+
+当你要调试中间 artifacts，或者只想复现某个阶段时，用手动分步模式。
+
+```bash
+CASE_FILTER=Qwen-3-1.7B \
 RUN_KIND=swiglu-collect \
 SWIGLU_THRESHOLD_KIND=swiglu+silu \
 SWIGLU_THRESHOLD_ENABLE=0 \
@@ -324,14 +319,14 @@ SKIP_BUILD=0 \
 N_PREDICT=128 \
 bash run.sh
 
-CASE_FILTER=Qwen-3-8B \
+CASE_FILTER=Qwen-3-1.7B \
 RUN_KIND=swiglu-generate \
 SWIGLU_THRESHOLD_KIND=swiglu+silu \
 SWIGLU_TARGET_PROFILE_KIND=minimal \
 SWIGLU_TARGET_SCALE=1.0 \
 bash run.sh
 
-CASE_FILTER=Qwen-3-8B \
+CASE_FILTER=Qwen-3-1.7B \
 RUN_KIND=perplexity \
 SWIGLU_THRESHOLD_KIND=swiglu+silu \
 SWIGLU_THRESHOLD_ENABLE=1 \
@@ -339,7 +334,7 @@ SWIGLU_THRESHOLD_PROFILE=generated \
 SKIP_BUILD=0 \
 bash run.sh
 
-CASE_FILTER=Qwen-3-8B \
+CASE_FILTER=Qwen-3-1.7B \
 RUN_KIND=cli \
 SWIGLU_THRESHOLD_KIND=swiglu+silu \
 SWIGLU_THRESHOLD_ENABLE=1 \
@@ -349,10 +344,15 @@ N_PREDICT=128 \
 bash run.sh
 ```
 
-Reuse existing dual artifacts and rerun only the apply steps:
+单步模式下，`SKIP_BUILD=0` 只构建当前 mode 所需的二进制。如果后续用同一个
+build tree 加 `SKIP_BUILD=1` 跑另一个 step，需要确认对应二进制已经存在。
+
+### 3.9 复用 generated artifacts
+
+当 collect/generate 输出已经存在，只想补跑或重跑 apply steps 时，使用 artifact reuse。
 
 ```bash
-CASE_FILTER=Llama-2-7B \
+CASE_FILTER=Qwen-3-1.7B \
 RUN_KIND=activation-flow \
 SWIGLU_THRESHOLD_KIND=swiglu+silu \
 FLOW_REUSE_ARTIFACTS=1 \
@@ -361,32 +361,302 @@ BUILD_DIR=build \
 bash run.sh
 ```
 
-This reuse form assumes that `BUILD_DIR/bin` already contains every binary needed
-by the remaining flow steps. With the default `collect,generate,perplexity,cli`
-sequence, that means the same build tree must contain both `llama-perplexity`
-and `llama-cli`.
+`FLOW_REUSE_ARTIFACTS=1` 会跳过已经完成的 artifact-producing steps，但不会放宽
+剩余 steps 对二进制的检查。
 
-### Prepare Q4_K_M models for local runs
+### 3.10 只跑 decode stats
 
-Many `run.sh` examples pin `MODEL` explicitly.
-If your local tree currently contains only `f16` GGUF files and you want a smaller
-model for repeated `perplexity` or `cli` runs, build `llama-quantize` once and
-quantize directly from the repository root.
+```bash
+CASE_FILTER=Llama-3.2-1B \
+RUN_KIND=decode-stats \
+SKIP_BUILD=1 \
+N_PREDICT=128 \
+bash run.sh
+```
 
-This section intentionally documents the direct non-`imatrix` path.
-It is the fastest local workflow when you want smaller test models and do not want
-to spend additional time generating an importance matrix first.
+## 4. Run modes
 
-Build the quantizer once:
+主要 `RUN_KIND`：
+
+| Mode | 运行内容 | Build target |
+| --- | --- | --- |
+| `cli` | `llama-cli` | `llama-cli` |
+| `perplexity` | `llama-perplexity` | `llama-perplexity` |
+| `decode-stats` | `llama-decode-stats` | `llama-decode-stats` |
+| `swiglu-collect` | 带 collection 参数的 `llama-cli` | `llama-cli` |
+| `swiglu-generate` | `tools/swiglu-threshold-configs/generate.py` | 无 |
+| `activation-flow` | 多步骤 pipeline | 所有 step targets 的并集 |
+
+可用 aliases：
+
+| Alias | Normalized mode |
+| --- | --- |
+| `collect`, `activation-collect` | `swiglu-collect` |
+| `generate`, `activation-generate` | `swiglu-generate` |
+| `flow` | `activation-flow` |
+
+脚本保留了历史上的 `swiglu-*` 名字，以兼容已有本地习惯。实际 pipeline 现在也支持
+`silu`、`silu_input` 和 `swiglu+silu`。
+
+## 5. Case selection
+
+Cases 直接定义在 `run.sh` 中。大部分 case 通过 `make_standard_case_spec` 创建，
+然后放进 `RUN_CASES`。
+
+当前标准 cases：
+
+| Case filter fragment | 默认 model |
+| --- | --- |
+| `Llama-3.2-1B` | `models/hf/Llama-3.2-1B-Instruct-f16.gguf` |
+| `Qwen-3-1.7B` | `models/Qwen/Qwen3-1.7B-Base-f16.gguf` |
+| `Llama-3.2-3B` | `models/hf/Llama-3___2-3B-Instruct-f16.gguf` |
+| `Llama-2-7B` | `models/hf/llama-2-7B-F16.gguf` |
+| `Qwen-3-8B` | `models/Qwen/Qwen3-8B-f16.gguf` |
+
+`CASE_FILTER` 会同时对子 case name 和 sanitized case slug 做 substring matching。
+
+```bash
+CASE_FILTER=Llama-3.2-1B bash run.sh
+CASE_FILTER=Qwen-3-1.7B bash run.sh
+CASE_FILTER=f8e3m4-normal bash run.sh
+```
+
+如果某个变量同时在 case 和命令行中设置，命令行优先。例如：
+`N_PREDICT=128 bash run.sh` 会覆盖 case 内的 `N_PREDICT`。
+
+添加一个新的标准 case：
+
+```bash
+CASE_MY_MODEL="$(make_standard_case_spec "My-Case-Name" "models/path/to/model.gguf")"
+```
+
+然后把它加入 `RUN_CASES`。
+
+## 6. Build behavior
+
+`BUILD_DIR` 默认是 `build`。
+
+单步 mode 在 `SKIP_BUILD=0` 时只构建自己需要的 target。`activation-flow`
+会一次性构建全部 steps 所需 targets 的并集。默认 flow 下，这通常意味着同时需要
+`llama-cli` 和 `llama-perplexity`。
+
+示例：
+
+```bash
+SKIP_BUILD=0 BUILD_DIR=build bash run.sh
+SKIP_BUILD=1 BUILD_DIR=build-baseline bash run.sh
+```
+
+低精度 simulation knobs 是 compile-time flags。如果修改了这些 knobs，请使用
+`SKIP_BUILD=0`，或者指向一个使用相同 flags 构建出来的 `BUILD_DIR`。
+
+## 7. Activation threshold 参考
+
+主要 knobs：
+
+| Variable | 含义 |
+| --- | --- |
+| `SWIGLU_THRESHOLD_KIND` | `swiglu`、`silu`、`silu_input` 或 `swiglu+silu` |
+| `SWIGLU_THRESHOLD_ENABLE` | 在 `cli` 和 `perplexity` 中启用 threshold runtime |
+| `SWIGLU_THRESHOLD_PROFILE` | profile 名字，或 `generated` |
+| `SWIGLU_THRESHOLD_CONFIG` | 显式 threshold CSV 路径，或 `auto` |
+| `SWIGLU_GENERATE_MODE` | `target-profile` 或 `channel-max` |
+| `SWIGLU_CHANNEL_THRESHOLD_RATIO` | `channel-max` 使用的 per-channel ratio |
+
+Activation kind 语义：
+
+| Kind | Runtime 行为 |
+| --- | --- |
+| `swiglu` | 截断 post-gating SwiGLU output |
+| `silu` | 在最终 multiply 之前截断 SiLU branch output |
+| `silu_input` | 在 SiLU 之前对 raw gate input 做 one-sided negative-tail truncation |
+| `swiglu+silu` | 先 apply SiLU-output truncation，再 apply SwiGLU-output truncation |
+
+Dual mode 细节：
+
+- `SWIGLU_THRESHOLD_KIND=swiglu+silu` 会自动解析两套 threshold family。
+- `SWIGLU_THRESHOLD_CONFIG`、`SWIGLU_COLLECT_PREFIX`、`SWIGLU_TARGET_PROFILE`、
+  `SWIGLU_GENERATED_CONFIG`、`SWIGLU_GENERATED_REPORT` 必须保持 `auto`。
+- primary runtime channel 是 `silu`，secondary runtime channel 是 `swiglu`。
+- dual mode 不会求一个共享 threshold，而是分别校准、分别 apply 两套 family。
+- runtime sparsity accounting 是有顺序的：`silu` report 看到的是后续 `swiglu`
+  truncation 之前的 tensor；`swiglu` report 看到的是已经被 SiLU 置零过的 tensor。
+
+Auto-resolution 规则：
+
+| Artifact | 默认路径 |
+| --- | --- |
+| collection prefix | `kv_dump_logs/<case>/<case>_<kind>_collect` |
+| target profile | `tools/<kind>-threshold-targets/<profile-kind>/<case>.csv` |
+| generated config | `kv_dump_logs/<case>/<case>_<kind>_threshold_generated.csv` |
+| generated report | `kv_dump_logs/<case>/<case>_<kind>_threshold_generated_summary.csv` |
+| `SWIGLU_THRESHOLD_PROFILE=generated` 时的 apply config | generated config path |
+| named profile 的 apply config | `tools/<kind>-threshold-configs/<profile>/<case>.csv` |
+
+命名说明：环境变量继续使用历史上的 `SWIGLU_*` 前缀，但实际 activation family
+由 `SWIGLU_THRESHOLD_KIND` 决定。
+
+## 8. Collection 和 generation 参考
+
+Collection knobs：
+
+| Variable | 含义 |
+| --- | --- |
+| `SWIGLU_COLLECT_PREFIX` | artifact prefix，或 `auto` |
+| `SWIGLU_COLLECT_BINS` | histogram bin count |
+| `SWIGLU_COLLECT_LOG10_MIN` | histogram 下界 |
+| `SWIGLU_COLLECT_LOG10_MAX` | histogram 上界 |
+
+Generation knobs：
+
+| Variable | 含义 |
+| --- | --- |
+| `SWIGLU_TARGET_PROFILE_KIND` | target profile 子目录，例如 `minimal` |
+| `SWIGLU_TARGET_PROFILE` | 显式 target-profile CSV，或 `auto` |
+| `SWIGLU_TARGET_SCALE` | 对 target added-zero ratios 施加的 multiplier |
+| `SWIGLU_GENERATED_CONFIG` | generated threshold 输出路径，或 `auto` |
+| `SWIGLU_GENERATED_REPORT` | generated summary 输出路径，或 `auto` |
+
+Collection 语义：
+
+| Kind | 收集内容 |
+| --- | --- |
+| `swiglu` | SwiGLU output 的 absolute-value histogram |
+| `silu` | SiLU output branch 的 absolute-value histogram |
+| `silu_input` | raw gate input 在 SiLU 之前的 negative-tail magnitudes |
+| `silu` plus `channel-max` | histogram，以及 per-stage per-layer per-channel absolute maxima |
+| `swiglu+silu` | 同时写出 `silu` 和 `swiglu` 两套 artifact family |
+
+Generation 语义：
+
+| Mode | 行为 |
+| --- | --- |
+| `swiglu` target-profile | 使用 prefill layer 1 作为 reference slice，选择一个 global threshold，并写到所有 layer |
+| `silu` target-profile | 和 `swiglu` 相同的 global-threshold 策略 |
+| `silu_input` target-profile | 从 one-sided negative-tail histograms 中为每层生成 threshold |
+| `silu` channel-max | 输出 `layer,channel,threshold`，其中 `threshold = abs_channel_max * ratio` |
+| `swiglu+silu` | 对 `silu` 和 `swiglu` 各运行一次 generation |
+
+在 target-profile mode 中，non-reference layers 和 decode targets 仍会写入
+generated summary report，用于估计和对比。它们不会改变 `swiglu` 或 `silu`
+最终选出的 threshold。
+
+## 9. Low-precision 和 runtime knobs
+
+通用 runtime 输入：
+
+```text
+MODEL DATA PROMPT OUT_DIR
+CTX THREADS N_PREDICT SEQ_ID BATCH UBATCH STRIDE
+```
+
+Low-precision simulation controls：
+
+| Variable group | 含义 |
+| --- | --- |
+| `SIM_FP8`, `SIM_FP_FORMAT`, `SIM_FP8_LAYOUT`, `SIM_FP8_*` | fp8-sim controls |
+| `SIM_Q4Q6`, `SIM_Q4Q6_APPLY_SRC0`, `SIM_Q4Q6_APPLY_SRC1` | 启用并选择 Q4/Q6 replay inputs |
+| `SIM_Q4Q6_SRC0_BLOCK`, `SIM_Q4Q6_SRC1_BLOCK` | Q4/Q6 replay block sizes |
+| `SIM_Q4Q6_SRC1_QMODE` | `0=symmetric Q6`，`1=asymmetric Q6+zp`，`2=logarithmic Q6-exp + BF16 scale` |
+| `SIM_Q4Q6_SRC1_LOG_STEP` | logarithmic Q6-exp replay 的 exponent divisor |
+| `SIM_Q6Q6`, `SIM_Q6Q6_APPLY_SRC0`, `SIM_Q6Q6_APPLY_SRC1` | 启用并选择 Q6/Q6 power-of-two replay inputs |
+| `SIM_Q6Q6_SRC0_BLOCK`, `SIM_Q6Q6_SRC1_BLOCK` | Q6/Q6 replay block sizes |
+| `SIM_Q8Q8`, `SIM_Q8Q8_APPLY_SRC0`, `SIM_Q8Q8_APPLY_SRC1` | 启用并选择 Q8/Q8 replay inputs |
+| `SIM_Q8Q8_SRC0_BLOCK`, `SIM_Q8Q8_SRC1_BLOCK` | Q8/Q8 replay block sizes |
+| `SIM_MATMUL_OUT_MODE` | `0=fp8-sim 开启时执行 FP8 output QDQ`，`1=BF16 output round-trip` |
+
+重要交互：
+
+- `SIM_Q4Q6`、`SIM_Q6Q6`、`SIM_Q8Q8` 和 `SIM_FP8` 互斥。
+- `SIM_Q4Q6=1` 要求 `SIM_MATMUL_OUT_MODE=1`。
+- `SIM_Q6Q6=1` 要求 `SIM_MATMUL_OUT_MODE=1`。
+- `SIM_Q8Q8=1` 要求 `SIM_MATMUL_OUT_MODE=1`。
+- `SWIGLU_THRESHOLD_ENABLE=1` 会独立影响 `perplexity` 和 `cli`，不依赖低精度 simulation flags。
+- 做纯低精度 replay 测量时，显式设置 `SWIGLU_THRESHOLD_ENABLE=0`。
+
+Profiler 和 graph extras：
+
+```text
+DUMP_DOT
+REDUCTION_PROD_PROFILE
+REDUCTION_PROD_PROFILE_BINS
+REDUCTION_PROD_PROFILE_HIST_MIN_LOG2
+REDUCTION_PROD_PROFILE_HIST_MAX_LOG2
+REDUCTION_PROD_PROFILE_SAMPLE_RATE
+REDUCTION_PROD_BLOCK_DROP_LOG2_N
+REDUCTION_PROD_PROFILE_MAX_SAMPLES
+```
+
+## 10. Output layout
+
+Case 输出会写到：
+
+```text
+<OUT_DIR>/<case-slug>/
+```
+
+常见日志：
+
+```text
+<case>_cli.log
+<case>_perplexity.log
+<case>_decode-stats.log
+<case>_swiglu-collect.log
+<case>_swiglu-generate.log
+```
+
+Activation artifacts：
+
+```text
+<case>_<kind>_collect_summary.csv
+<case>_<kind>_collect_hist.csv
+<case>_silu_collect_channel_max.csv
+<case>_<kind>_threshold_generated.csv
+<case>_<kind>_threshold_generated_summary.csv
+<case>_<kind>_threshold_cli.csv
+<case>_<kind>_threshold_perplexity.csv
+```
+
+在 `SWIGLU_THRESHOLD_KIND=swiglu+silu` mode 中，同一次运行会同时写出
+`<kind>=silu` 和 `<kind>=swiglu` 两套 variants。
+
+在 `SWIGLU_GENERATE_MODE=channel-max` 中，`<case>_silu_threshold_generated.csv`
+存储的是 `layer,channel,threshold`，不是 `layer,threshold`。
+
+Profiler 和 postprocessing artifacts：
+
+```text
+<case>_fp8_sim_analysis.log
+<case>_fp8_interval_hist.csv
+<case>_fp8_interval_hist.png
+<case>_block_psum_relation.csv
+<case>_block_psum_relation.md
+block_over_psum_hist.png
+block_over_psum_percent.png
+block_over_psum_cdf.png
+```
+
+在 output root 层级，脚本还可能写出：
+
+```text
+reduction_block_drop_compare.csv
+reduction_block_drop_compare.md
+```
+
+## 11. Model preparation
+
+本节是可选内容。只有当本地 `models/` tree 里还没有 workflow 需要的模型文件时，
+才需要参考这里。
+
+### 11.1 构建 quantizer
 
 ```bash
 cmake --build build --target llama-quantize -j$(nproc)
 ```
 
-If the model is still stored as a local Hugging Face directory with `safetensors`
-weights, convert it to an `f16` GGUF file first.
-The current workspace includes `./models/Qwen/Qwen3-1___7B/`, so the direct local
-conversion flow is:
+### 11.2 把本地 Hugging Face 目录转换成 GGUF
+
+如果模型仍然是包含 `safetensors` weights 的 Hugging Face 目录，需要先转换成 GGUF：
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -395,18 +665,11 @@ python3 convert_hf_to_gguf.py \
   ./models/Qwen/Qwen3-1___7B \
   --outfile ./models/Qwen/Qwen3-1___7B-f16.gguf \
   --outtype f16
-
-./build/bin/llama-quantize \
-  ./models/Qwen/Qwen3-1___7B-f16.gguf \
-  ./models/Qwen/Qwen3-1___7B-Q6_K.gguf \
-  Q6_K \
-  $(nproc)
 ```
 
-Important detail: run `convert_hf_to_gguf.py` against the unpacked directory
-`./models/Qwen/Qwen3-1___7B/`, not the archive file `./models/Qwen/Qwen3-1___7B.tar`.
+`convert_hf_to_gguf.py` 的输入应该是解包后的目录，不是 archive 文件。
 
-Current direct `Q4_K_M` conversions for the `models/` tree in this workspace:
+### 11.3 直接本地 quantization 示例
 
 ```bash
 ./build/bin/llama-quantize \
@@ -428,51 +691,20 @@ Current direct `Q4_K_M` conversions for the `models/` tree in this workspace:
   $(nproc)
 
 ./build/bin/llama-quantize \
-  ./models/hf/Llama-3.2-1B-Instruct-f16.gguf \
-  ./models/hf/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-  Q4_K_M \
-  $(nproc)
-
-./build/bin/llama-quantize \
-  ./models/hf/Llama-3___2-3B-Instruct-f16.gguf \
-  ./models/hf/Llama-3___2-3B-Instruct-Q5_K_M.gguf \
-  Q5_K_M \
-  $(nproc)
-
-./build/bin/llama-quantize \
   ./models/hf/llama-2-7B-F16.gguf \
   ./models/hf/llama-2-7B-Q5_K_M.gguf \
   Q5_K_M \
   $(nproc)
 ```
 
-If you want to quantize the whole current set in one pass, use the same inputs in
-this loop:
-
-```bash
-for f in \
-  ./models/Llama-3.2-1B-Instruct-f16.gguf \
-  ./models/Qwen/Qwen3-1.7B-Base-f16.gguf \
-  ./models/Qwen/Qwen3-8B-f16.gguf \
-  ./models/hf/Llama-3.2-1B-Instruct-f16.gguf \
-  ./models/hf/Llama-3___2-3B-Instruct-f16.gguf \
-  ./models/hf/llama-2-7B-F16.gguf
-do
-  out="${f%.gguf}-Q4_K_M.gguf"
-  out="${out/-f16-Q4_K_M/-Q4_K_M}"
-  out="${out/-F16-Q4_K_M/-Q4_K_M}"
-  ./build/bin/llama-quantize "$f" "$out" Q4_K_M $(nproc)
-done
-```
-
-After quantization, point any `run.sh` experiment at the new file by overriding
-`MODEL`, for example:
+通过覆盖 `MODEL`，让实验使用新生成的文件：
 
 ```bash
 CASE_FILTER=Llama-3.2-1B \
 MODEL=models/hf/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
 RUN_KIND=perplexity \
 SIM_Q4Q6=0 \
+SIM_Q6Q6=0 \
 SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=0 \
@@ -481,38 +713,22 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-If you want a different quantization level, keep the same input/output pattern and
-replace both the output suffix and the quant type argument, for example `Q5_K_M`
-or `Q6_K`.
+### 11.4 选择性把 FFN gate/up 量化成 `IQ2_S`
 
-### Prepare models with FFN gate/up in IQ2_S and FFN down left native
+当你只希望部分 FFN gate/up matrices 使用 `IQ2_S`，而其他 tensor 继续使用
+base quantization type 的 native assignment 时，使用
+`llama-quantize --tensor-type`。
 
-Use `llama-quantize --tensor-type` when you want only selected FFN parameter
-matrices to use `IQ2_S` while every other tensor keeps the native assignment of
-the base quantization type.
+这个 workflow 不要使用 `--pure`。例如 base type 是 `Q4_K_M` 时，未被
+`--tensor-type` 匹配到的 tensor 仍然使用 `Q4_K_M` 的 native mixed-quantization
+策略。
 
-Do not use `--pure` for this workflow. The base quantization type, such as
-`Q4_K_M`, is still the native mixed-quantization policy for all tensors that are
-not matched by `--tensor-type`. The override below matches only `ffn_gate` and
-`ffn_up`; `ffn_down` is intentionally not matched, so it keeps the base policy.
-
-`IQ2_S` is a very low-bit type, so an importance matrix is required. Generate it
-with `llama-imatrix` from the original `f16`/`bf16` GGUF model and a representative
-calibration text file before running `llama-quantize`. You can use the same text
-file that you normally pass to `run.sh` as `DATA`; the local default is
-`models/hf/wiki.test.raw`, but replace it with any calibration corpus that exists
-in your workspace and is representative of the target workload.
-
-Build both tools once:
+`IQ2_S` 需要 importance matrix。请从原始 f16/bf16 GGUF 模型和有代表性的
+calibration text 生成：
 
 ```bash
 cmake --build build --target llama-imatrix llama-quantize -j$(nproc)
-```
 
-Generate the imatrix for the source model. The example below writes the current
-GGUF imatrix format, which `llama-quantize --imatrix` can read directly:
-
-```bash
 ./build/bin/llama-imatrix \
   --model ./models/Qwen/Qwen3-8B-f16.gguf \
   -f ./models/hf/wiki.test.raw \
@@ -522,11 +738,11 @@ GGUF imatrix format, which `llama-quantize --imatrix` can read directly:
   --chunks 16
 ```
 
-The imatrix file must contain entries for the matched FFN gate/up tensors. If you
-generated or filtered the imatrix with `--include-weights` or `--exclude-weights`,
-make sure those FFN tensors are still included.
+正式 quantization 运行时，建议使用更多 calibration chunks，例如 `64`、`128`，
+或者省略 `--chunks` 来使用整个 calibration 文件。如果有可用 GPU backend，可以
+添加常规 offload 选项，例如 `-ngl 99`。
 
-Dense Transformer FFN override:
+Dense Transformer FFN override：
 
 ```bash
 ./build/bin/llama-quantize \
@@ -538,8 +754,8 @@ Dense Transformer FFN override:
   $(nproc)
 ```
 
-MoE FFN override, including expert, shared-expert, and chunk-expert FFN gate/up
-matrices while still leaving `ffn_down*` native:
+MoE FFN override，覆盖 expert、shared-expert 和 chunk-expert FFN gate/up
+matrices，同时让 `ffn_down*` 保持 native：
 
 ```bash
 ./build/bin/llama-quantize \
@@ -551,18 +767,17 @@ matrices while still leaving `ffn_down*` native:
   $(nproc)
 ```
 
-Keep `ffn_gate_inp` out of the regex. It is the MoE router/gate-input tensor,
-not the ordinary FFN gate projection, and should normally remain under the base
-quantization policy.
+不要把 `ffn_gate_inp` 放进 regex。它是 MoE router/gate-input tensor，不是普通
+FFN gate projection。
 
-To use the generated model in a `run.sh` experiment, point `MODEL` at the new
-GGUF file as usual:
+通过覆盖 `MODEL`，在 `run.sh` 实验中使用新模型：
 
 ```bash
 CASE_FILTER=Qwen-3-8B \
 MODEL=models/Qwen/Qwen3-8B-Q4_K_M-ffn-gate-up-IQ2_S.gguf \
 RUN_KIND=perplexity \
 SIM_Q4Q6=0 \
+SIM_Q6Q6=0 \
 SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=0 \
@@ -571,535 +786,13 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-You can replace `Q4_K_M` with another base type, such as `Q5_K_M`, `IQ3_M`, or
-`IQ2_M`. For `IQ2_M`, this override is less useful because the base policy already
-uses `IQ2_S` for many ordinary matrices; the main purpose of this workflow is to
-start from a higher-quality native baseline and selectively compress only the FFN
-gate/up matrices.
+## 12. Compatibility notes
 
-After converting the local `Qwen3-1___7B` directory this way, you can point
-`run.sh` at the generated quantized model directly:
+脚本有意保留了这些兼容性选择：
 
-```bash
-CASE_FILTER=Qwen-3-1.7B \
-MODEL=models/Qwen/Qwen3-1___7B-Q4_K_M.gguf \
-RUN_KIND=perplexity \
-SIM_Q4Q6=0 \
-SIM_Q8Q8=0 \
-SIM_FP8=0 \
-SIM_MATMUL_OUT_MODE=0 \
-SWIGLU_THRESHOLD_ENABLE=0 \
-SKIP_BUILD=0 \
-bash run.sh
-```
+- Threshold 环境变量仍然使用 `SWIGLU_*` 前缀。
+- `swiglu-collect` 和 `swiglu-generate` 仍然是 canonical artifact names。
+- `collect`、`generate`、`flow` 这类 aliases 仍然可用。
 
-## 3. Supported run modes
-
-Primary `RUN_KIND` values:
-
-- `cli`: run `llama-cli`
-- `perplexity`: run `llama-perplexity`
-- `decode-stats`: run `llama-decode-stats`
-- `swiglu-collect`: collect activation distributions
-- `swiglu-generate`: generate threshold tables from collected distributions
-- `activation-flow`: run a multi-step activation experiment pipeline
-
-Accepted aliases:
-
-- `collect` and `activation-collect` map to `swiglu-collect`
-- `generate` and `activation-generate` map to `swiglu-generate`
-- `flow` maps to `activation-flow`
-
-The script keeps the historical `swiglu-*` names for compatibility, even though
-the same pipeline now also supports `SWIGLU_THRESHOLD_KIND=silu`,
-`SWIGLU_THRESHOLD_KIND=silu_input`, and `SWIGLU_THRESHOLD_KIND=swiglu+silu`.
-
-## 4. Case selection
-
-Cases are defined directly in `run.sh`.
-
-The current script uses a shared helper, `make_standard_case_spec`, because most
-cases differ only in case name and model path.
-
-If the same variable is set both in a case and on the shell command line,
-the shell command line wins. For example, `N_PREDICT=128 bash run.sh` overrides
-any `N_PREDICT` value embedded in the selected case.
-
-Case execution order is controlled by the `RUN_CASES` array near the top of the file.
-
-`CASE_FILTER` is substring matching against both:
-
-- the human-readable case name
-- the sanitized case slug used for paths
-
-Examples:
-
-```bash
-CASE_FILTER=Llama-3.2-1B bash run.sh
-CASE_FILTER=Qwen-3.1 bash run.sh
-CASE_FILTER=f8e3m4-normal bash run.sh
-```
-
-## 5. Build behavior
-
-The script builds only the targets required by the chosen run mode.
-
-Mode to build-target mapping:
-
-- `cli` and `swiglu-collect` build `llama-cli`
-- `perplexity` builds `llama-perplexity`
-- `decode-stats` builds `llama-decode-stats`
-- `swiglu-generate` is generator-only and does not build C++ targets
-- `activation-flow` builds the union of all targets needed by its steps once per case
-
-Main build knobs:
-
-- `BUILD_DIR`: build tree path, default `build`
-- `SKIP_BUILD=0`: rebuild the required targets for the case
-- `SKIP_BUILD=1`: reuse an existing build tree and only verify required binaries exist
-
-Examples:
-
-```bash
-SKIP_BUILD=0 BUILD_DIR=build bash run.sh
-SKIP_BUILD=1 BUILD_DIR=build-baseline bash run.sh
-```
-
-Important detail:
-
-- in a single-step mode, `SKIP_BUILD=0` recreates `BUILD_DIR` and builds only the target needed by that mode
-- in `activation-flow`, `SKIP_BUILD=0` builds the union of all required targets once, which is usually the least manual option
-- `SKIP_BUILD=1` only works if `BUILD_DIR/bin` already contains every binary required by the selected mode or flow
-- with the default `activation-flow` step list, `SKIP_BUILD=1` therefore requires the same `BUILD_DIR/bin` to contain both `llama-cli` and `llama-perplexity`
-
-## 6. Activation threshold knobs
-
-These variables control the threshold experiment itself:
-
-- `SWIGLU_THRESHOLD_KIND`: `swiglu`, `silu`, `silu_input`, or `swiglu+silu`
-- `SWIGLU_THRESHOLD_ENABLE`: whether `cli` and `perplexity` should load/apply thresholds
-- `SWIGLU_THRESHOLD_PROFILE`: threshold profile name, or `generated`
-- `SWIGLU_THRESHOLD_CONFIG`: explicit threshold CSV path, or `auto`
-- `SWIGLU_GENERATE_MODE`: `target-profile` or `channel-max`
-- `SWIGLU_CHANNEL_THRESHOLD_RATIO`: only for `channel-max`; per-channel threshold = absolute channel max * ratio
-
-Activation kind semantics:
-
-- `swiglu`: truncate the post-gating SwiGLU output
-- `silu`: truncate the SiLU branch output before the final multiply
-- `silu_input`: truncate the raw gate input before SiLU using one-sided negative-tail thresholds
-- `swiglu+silu`: apply SiLU-output truncation first, then apply SwiGLU-output truncation in the same run
-
-In dual apply mode, runtime sparsity accounting is ordered, not independent:
-
-- the `silu` runtime/report sees the tensor before the later `swiglu` truncation step, so its `final_zero_ratio` reflects the effect of the SiLU step alone
-- the later `swiglu` runtime/report sees the tensor after SiLU has already zeroed some values, so its `original_zero_ratio` already includes zeros introduced by the earlier SiLU step
-- in that later `swiglu` report, `truncated_nonzero_ratio` is only the additional zeros introduced by the SwiGLU step itself, while `final_zero_ratio` is the cumulative zero ratio after both steps
-
-Auto-resolution rules:
-
-- if `SWIGLU_THRESHOLD_CONFIG=auto` and `SWIGLU_THRESHOLD_PROFILE=generated`, the script uses
-  `kv_dump_logs/<case>/<case>_<kind>_threshold_generated.csv`
-- otherwise it uses `tools/<kind>-threshold-configs/<profile>/<case>.csv`
-- in `SWIGLU_GENERATE_MODE=channel-max`, that generated config path keeps the same filename but the CSV format becomes `layer,channel,threshold`
-
-Combined-mode note:
-
-- when `SWIGLU_THRESHOLD_KIND=swiglu+silu`, the script resolves both families automatically
-- in that mode, `SWIGLU_THRESHOLD_CONFIG`, `SWIGLU_COLLECT_PREFIX`, `SWIGLU_TARGET_PROFILE`, `SWIGLU_GENERATED_CONFIG`, and `SWIGLU_GENERATED_REPORT` must stay `auto`
-- the primary runtime channel is `silu` and the secondary runtime channel is `swiglu`
-- dual mode does not solve one shared threshold across both families; it runs calibration twice, once for `silu` and once for `swiglu`
-- each family uses its own collected histogram pair and its own target-profile CSV; the default `minimal` profiles currently carry the same group ratios, but they are still resolved from separate `tools/silu-threshold-targets/...` and `tools/swiglu-threshold-targets/...` files
-
-Important naming note:
-
-- variable names keep the historical `SWIGLU_*` prefix
-- the actual activation family is selected by `SWIGLU_THRESHOLD_KIND`
-- `swiglu` generation is anchored at `prefill` `layer 1`: the generator finds one threshold that makes that reference slice hit its target added-zero ratio, then applies that same threshold to all layers and all stages
-- `silu` generation is anchored at `prefill` `layer 1`: the generator finds one threshold that makes that reference slice hit its target added-zero ratio, then applies that same threshold to all layers and all stages
-- `silu` with `SWIGLU_GENERATE_MODE=channel-max` bypasses target profiles: the collector writes per-stage per-layer per-channel absolute SiLU maxima, the generator takes `abs_channel_max = max(prefill_abs_max, decode_abs_max)`, and writes `channel_threshold = abs_channel_max * SWIGLU_CHANNEL_THRESHOLD_RATIO`
-- in that `channel-max` mode, runtime still performs the SiLU-output truncation test on the output value itself, now with per-channel thresholds, using `|value| <= channel_threshold`
-- `silu_input` stores positive threshold magnitudes in CSV, but runtime truncation is one-sided and triggers on `gate_value <= -threshold`
-
-## 7. Collection and generation knobs
-
-Collection controls:
-
-- `SWIGLU_COLLECT_PREFIX`: artifact prefix, or `auto`
-- `SWIGLU_COLLECT_BINS`: histogram bins
-- `SWIGLU_COLLECT_LOG10_MIN`: lower histogram bound
-- `SWIGLU_COLLECT_LOG10_MAX`: upper histogram bound
-
-Generation controls:
-
-- `SWIGLU_TARGET_PROFILE_KIND`: profile subdirectory, for example `minimal`
-- `SWIGLU_TARGET_PROFILE`: explicit target-profile CSV, or `auto`
-- `SWIGLU_TARGET_SCALE`: multiplier applied to target added-zero ratios before inversion
-- `SWIGLU_GENERATED_CONFIG`: explicit generated threshold output path, or `auto`
-- `SWIGLU_GENERATED_REPORT`: explicit generation report path, or `auto`
-- `SWIGLU_GENERATE_MODE`: `target-profile` or `channel-max`
-- `SWIGLU_CHANNEL_THRESHOLD_RATIO`: for `channel-max`, threshold = absolute channel max * ratio
-
-Auto-resolution rules:
-
-- collection prefix defaults to `kv_dump_logs/<case>/<case>_<kind>_collect`
-- target profile defaults to `tools/<kind>-threshold-targets/<profile-kind>/<case>.csv`
-- generated config defaults to `kv_dump_logs/<case>/<case>_<kind>_threshold_generated.csv`
-- generated report defaults to `kv_dump_logs/<case>/<case>_<kind>_threshold_generated_summary.csv`
-
-Collection semantics differ by activation kind:
-
-- `swiglu` and `silu` collect absolute-value histograms of the target output tensor
-- `silu` with `SWIGLU_GENERATE_MODE=channel-max` also records per-stage per-layer per-channel absolute maxima and writes `..._silu_collect_channel_max.csv`
-- `silu_input` collects negative-tail magnitudes from the raw gate input tensor before SiLU so the generator can invert one-sided truncation targets
-- `swiglu+silu` collects both the `silu` and `swiglu` families in one `swiglu-collect` run and writes two artifact pairs under the same case directory
-
-Generation semantics also differ by activation kind:
-
-- `swiglu`: use `prefill` `layer 1` as the anchor, invert that one target into a single global threshold, and write the same threshold to every layer
-- `silu` + `target-profile`: use `prefill` `layer 1` as the anchor, invert that one target into a single global threshold, and write the same threshold to every layer
-- `silu` + `channel-max`: ignore target profiles, read `..._silu_collect_channel_max.csv`, take the maximum absolute SiLU output magnitude per channel across prefill and decode, and emit `layer,channel,threshold` with `threshold = abs_channel_max * SWIGLU_CHANNEL_THRESHOLD_RATIO`
-- `silu_input`: generate one threshold per layer from one-sided negative-tail histograms
-- `swiglu+silu`: run the generator twice in one `swiglu-generate` step, producing both the `silu` and `swiglu` generated config/report pairs
-
-In the current dual-output setup, the two stage distributions are selected like this:
-
-- `silu`: read `..._silu_collect_summary.csv` and `..._silu_collect_hist.csv`, then look up the `prefill` target for `layer 1` from the SiLU target profile and invert that one reference slice into one global threshold
-- `swiglu`: read `..._swiglu_collect_summary.csv` and `..._swiglu_collect_hist.csv`, then look up the `prefill` target for `layer 1` from the SwiGLU target profile and invert that one reference slice into one global threshold
-- after that, each family applies its own global threshold to every layer and both stages
-- the per-layer `decode_target` values and non-reference layers are still written into the generated summary report, but they are only used for estimation and comparison; they do not change the chosen final threshold in `swiglu` or `silu` mode
-
-## 8. activation-flow
-
-`RUN_KIND=activation-flow` is the main change for reducing manual work.
-
-Default step sequence:
-
-- `collect`
-- `generate`
-- `perplexity`
-- `cli`
-
-Customize the sequence with `FLOW_STEPS`:
-
-```bash
-RUN_KIND=activation-flow \
-FLOW_STEPS=collect,generate,cli \
-bash run.sh
-```
-
-Behavior of `activation-flow`:
-
-- it builds the union of required targets once per case
-- it automatically turns threshold application on for the `perplexity` and `cli` steps
-- it keeps threshold application off for `collect` and `generate`
-- if a case defines `N_PREDICT=-1`, the flow uses `FLOW_DECODE_N_PREDICT` for `collect`
-- if a case defines `N_PREDICT=-1`, the flow also uses `FLOW_DECODE_N_PREDICT` for `cli`
-
-Reuse existing artifacts instead of rerunning completed steps:
-
-```bash
-RUN_KIND=activation-flow \
-FLOW_REUSE_ARTIFACTS=1 \
-bash run.sh
-```
-
-This is useful when collect/generate outputs already exist and you only want to
-finish the remaining steps.
-
-Important detail:
-
-- `FLOW_REUSE_ARTIFACTS=1` skips completed artifact-producing steps, but it does not relax the binary checks for the remaining flow steps
-- if the remaining flow still includes `perplexity` and `cli`, the same `BUILD_DIR/bin` must contain both `llama-perplexity` and `llama-cli`
-
-## 9. Other runtime knobs
-
-General runtime inputs:
-
-- `MODEL`
-- `DATA`
-- `PROMPT`
-- `CTX`
-- `THREADS`
-- `N_PREDICT`
-- `SEQ_ID`
-- `BATCH`
-- `UBATCH`
-- `STRIDE`
-
-Profiler and graph extras:
-
-- `DUMP_DOT`
-- `REDUCTION_PROD_PROFILE`
-- `REDUCTION_PROD_PROFILE_BINS`
-- `REDUCTION_PROD_PROFILE_HIST_MIN_LOG2`
-- `REDUCTION_PROD_PROFILE_HIST_MAX_LOG2`
-- `REDUCTION_PROD_PROFILE_SAMPLE_RATE`
-- `REDUCTION_PROD_BLOCK_DROP_LOG2_N`
-- `REDUCTION_PROD_PROFILE_MAX_SAMPLES`
-
-Low-precision simulation controls remain available and are passed into the build as CMake flags.
-
-- `SIM_FP8`, `SIM_FP_FORMAT`, `SIM_FP8_LAYOUT`, `SIM_FP8_*`: fp8-sim controls
-- `SIM_Q4Q6`, `SIM_Q4Q6_APPLY_SRC0`, `SIM_Q4Q6_APPLY_SRC1`, `SIM_Q4Q6_SRC0_BLOCK`, `SIM_Q4Q6_SRC1_BLOCK`: standalone low-bit replay controls for `SIM_Q4Q6` (current canonical CPU wiring: `src0=Q6`, `src1=Q6`)
-- `SIM_Q4Q6_SRC1_QMODE`: `0=symmetric Q6`, `1=asymmetric Q6+zp`, `2=logarithmic Q6-exp + BF16 block scale` for `src1` only
-- `SIM_Q4Q6_SRC1_LOG_STEP`: positive exponent divisor used by `SIM_Q4Q6_SRC1_QMODE=2`; replay spacing follows `2^(q/step)`
-
-Important interaction:
-
-- `SWIGLU_THRESHOLD_ENABLE=1` affects `perplexity` and `cli` runs independently of the low-precision simulation flags
-- for pure `SIM_Q4Q6` or pure fp8-sim measurements, set `SWIGLU_THRESHOLD_ENABLE=0` explicitly so FFN threshold truncation does not change the result
-
-## 10. Output layout
-
-Case outputs are written under:
-
-```text
-<OUT_DIR>/<case-slug>/
-```
-
-Common logs:
-
-- `<case>_cli.log`
-- `<case>_perplexity.log`
-- `<case>_decode-stats.log`
-- `<case>_swiglu-collect.log`
-- `<case>_swiglu-generate.log`
-
-Activation artifacts:
-
-- `<case>_<kind>_collect_summary.csv`
-- `<case>_<kind>_collect_hist.csv`
-- `<case>_silu_collect_channel_max.csv` when `SWIGLU_THRESHOLD_KIND=silu` and `SWIGLU_GENERATE_MODE=channel-max`
-- `<case>_<kind>_threshold_generated.csv`
-- `<case>_<kind>_threshold_generated_summary.csv`
-- `<case>_<kind>_threshold_cli.csv`
-- `<case>_<kind>_threshold_perplexity.csv`
-
-In `SWIGLU_THRESHOLD_KIND=swiglu+silu` mode, the same run writes both `<kind>=silu`
-and `<kind>=swiglu` variants for the activation artifacts above.
-
-In `SWIGLU_GENERATE_MODE=channel-max`, `<case>_silu_threshold_generated.csv` stores
-`layer,channel,threshold` instead of `layer,threshold`.
-
-Profiler / postprocessing artifacts:
-
-- `<case>_fp8_sim_analysis.log`
-- `<case>_fp8_interval_hist.csv`
-- `<case>_fp8_interval_hist.png`
-- `<case>_block_psum_relation.csv`
-- `<case>_block_psum_relation.md`
-- `block_over_psum_hist.png`
-- `block_over_psum_percent.png`
-- `block_over_psum_cdf.png`
-
-At the output-root level, the script also tries to write:
-
-- `reduction_block_drop_compare.csv`
-- `reduction_block_drop_compare.md`
-
-## 11. Typical workflows
-
-### 11.1 Reuse an existing build
-
-```bash
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=cli \
-SKIP_BUILD=1 \
-BUILD_DIR=build \
-bash run.sh
-```
-
-### 11.2 Run decode stats only
-
-```bash
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=decode-stats \
-SKIP_BUILD=1 \
-N_PREDICT=128 \
-bash run.sh
-```
-
-### 11.3 Run one-command SwiGLU threshold pipeline
-
-```bash
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=activation-flow \
-SWIGLU_THRESHOLD_KIND=swiglu \
-SWIGLU_TARGET_PROFILE_KIND=minimal \
-SWIGLU_TARGET_SCALE=1.0 \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-### 11.4 Run pure `SIM_Q4Q6` perplexity
-
-This is the recommended form when you want `ppl` for the standalone `SIM_Q4Q6` replay only,
-without any FFN threshold sparsity effect mixed in.
-
-```bash
-CASE_FILTER=Llama-3.2-1B \
-RUN_KIND=perplexity \
-SIM_Q4Q6=1 \
-SIM_FP8=0 \
-SIM_MATMUL_OUT_MODE=1 \
-SWIGLU_THRESHOLD_ENABLE=0 \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-### 11.5 Run one-command SiLU threshold pipeline with artifact reuse
-
-```bash
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=activation-flow \
-SWIGLU_THRESHOLD_KIND=silu \
-FLOW_REUSE_ARTIFACTS=1 \
-SKIP_BUILD=1 \
-bash run.sh
-```
-
-### 11.6 Run one-command per-channel SiLU threshold pipeline
-
-This mode bypasses target profiles and derives one runtime threshold per SiLU output channel.
-
-```bash
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=activation-flow \
-SWIGLU_THRESHOLD_KIND=silu \
-SWIGLU_GENERATE_MODE=channel-max \
-SWIGLU_CHANNEL_THRESHOLD_RATIO=0.10 \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-### 11.7 Run one-command dual SwiGLU + SiLU threshold pipeline
-
-Use `SKIP_BUILD=0` on the first dual run so the same build tree is populated with
-every binary required by the default flow.
-
-```bash
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=activation-flow \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SWIGLU_TARGET_PROFILE_KIND=minimal \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-### 11.8 Select thresholds first, then run ppl for `Q8/Q8` + FFN sparsity
-
-Use the first command to run `collect,generate` only.
-Inspect `*_threshold_generated_summary.csv` to see whether the estimated added-zero ratios
-already match the sparsity you want; if not, change `SWIGLU_TARGET_SCALE` and rerun only
-this first command.
-
-```bash
-CASE_FILTER=Qwen-3-8B \
-MODEL=models/Qwen/Qwen3-8B-f16.gguf \
-RUN_KIND=activation-flow \
-FLOW_STEPS=collect,generate \
-SIM_Q8Q8=1 \
-SIM_Q8Q8_SRC0_BLOCK=32 \
-SIM_Q8Q8_SRC1_BLOCK=32 \
-SIM_Q4Q6=0 \
-SIM_FP8=0 \
-SIM_MATMUL_OUT_MODE=1 \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SWIGLU_TARGET_PROFILE_KIND=minimal \
-SWIGLU_TARGET_SCALE=1.0 \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-Then run `ppl` only after you are happy with the generated thresholds:
-
-```bash
-CASE_FILTER=Qwen-3-8B \
-MODEL=models/Qwen/Qwen3-8B-f16.gguf \
-RUN_KIND=perplexity \
-SIM_Q8Q8=1 \
-SIM_Q8Q8_SRC0_BLOCK=32 \
-SIM_Q8Q8_SRC1_BLOCK=32 \
-SIM_Q4Q6=0 \
-SIM_FP8=0 \
-SIM_MATMUL_OUT_MODE=1 \
-SWIGLU_THRESHOLD_ENABLE=1 \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SWIGLU_THRESHOLD_PROFILE=generated \
-SKIP_BUILD=0 \
-bash run.sh
-```
-
-### 11.9 Reuse dual artifacts and rerun only apply steps
-
-```bash
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=activation-flow \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-FLOW_REUSE_ARTIFACTS=1 \
-SKIP_BUILD=1 \
-BUILD_DIR=build \
-bash run.sh
-```
-
-### 11.10 Run dual SwiGLU + SiLU workflow manually, step by step
-
-```bash
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=swiglu-collect \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SWIGLU_THRESHOLD_ENABLE=0 \
-SKIP_BUILD=0 \
-N_PREDICT=128 \
-bash run.sh
-
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=swiglu-generate \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SWIGLU_TARGET_PROFILE_KIND=minimal \
-SWIGLU_TARGET_SCALE=1.0 \
-bash run.sh
-
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=perplexity \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SWIGLU_THRESHOLD_ENABLE=1 \
-SWIGLU_THRESHOLD_PROFILE=generated \
-SKIP_BUILD=0 \
-bash run.sh
-
-CASE_FILTER=Qwen-3-1.7B \
-RUN_KIND=cli \
-SWIGLU_THRESHOLD_KIND=swiglu+silu \
-SWIGLU_THRESHOLD_ENABLE=1 \
-SWIGLU_THRESHOLD_PROFILE=generated \
-SKIP_BUILD=0 \
-N_PREDICT=128 \
-bash run.sh
-```
-
-## 12. Editing cases
-
-For a new case with the same common settings, add one line like this near the top of `run.sh`:
-
-```bash
-CASE_MY_MODEL="$(make_standard_case_spec "My-Case-Name" "models/path/to/model.gguf")"
-```
-
-Then add it into `RUN_CASES`.
-
-If a case needs different runtime or FP8 knobs, either:
-
-- add those overrides after generating the standard spec, or
-- replace that case with a custom here-doc block
-
-## 13. Notes on compatibility
-
-Compatibility choices intentionally preserved in the script:
-
-- the threshold env vars still use the `SWIGLU_*` prefix
-- `swiglu-collect` and `swiglu-generate` remain the canonical artifact names
-- aliases like `collect`, `generate`, and `flow` are accepted for convenience
-
-This keeps old local habits working while making the script structure clearer.
+这些选择能保留已有本地命令习惯，同时通过 `SWIGLU_THRESHOLD_KIND` 暴露新的
+SiLU、SiLU-input 和 dual-output 路径。
