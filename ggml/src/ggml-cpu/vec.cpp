@@ -1528,7 +1528,7 @@ extern "C" void ggml_fp8_sim_stats_report(const char * report_file) {
 #include <cassert>
 #include <cfloat>
 
-#if GGML_SIM_Q4Q6 || GGML_SIM_Q6Q6 || GGML_SIM_Q8Q8
+#if GGML_SIM_Q4Q6 || GGML_SIM_Q6Q6 || GGML_SIM_Q6Q8 || GGML_SIM_Q8Q8
 
 struct ggml_sim_q6_affine_params {
     float scale;
@@ -2056,7 +2056,7 @@ extern "C" void ggml_sim_q8_block_quant_dequant_f32_to_bf16(
     ggml_sim_qpow2_block_quant_dequant_f32_to_bf16_impl(in, out, n, block, scales_out, 127);
 }
 
-#endif // GGML_SIM_Q4Q6 || GGML_SIM_Q6Q6 || GGML_SIM_Q8Q8
+#endif // GGML_SIM_Q4Q6 || GGML_SIM_Q6Q6 || GGML_SIM_Q6Q8 || GGML_SIM_Q8Q8
 
 #if GGML_REDUCTION_PROD_PROFILE
 #include <atomic>

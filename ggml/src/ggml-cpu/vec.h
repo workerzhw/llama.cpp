@@ -280,6 +280,67 @@ typedef double ggml_float;
 #endif
 
 // ---------------------------------------------------------------------------
+// Q6/Q8 replay：权重(src0) 使用 Q6，激活(src1) 使用 Q8。
+//
+//   - src0 使用对称 Q6，范围为 [-31, 31]
+//   - src1 使用对称 Q8，范围为 [-127, 127]
+//   - 每个 block 保存一个 int8_t exponent k，scale = 2^k
+//   - 启用后，src2/output 在 ggml-cpu.c 里走 BF16 round-trip
+// ---------------------------------------------------------------------------
+
+#ifndef GGML_SIM_Q6Q8
+#define GGML_SIM_Q6Q8 0
+#endif
+
+#ifndef GGML_SIM_Q6Q8_APPLY_SRC0
+#define GGML_SIM_Q6Q8_APPLY_SRC0 1
+#endif
+
+#ifndef GGML_SIM_Q6Q8_APPLY_SRC1
+#define GGML_SIM_Q6Q8_APPLY_SRC1 1
+#endif
+
+#ifndef GGML_SIM_Q6Q8_SRC0_BLOCK
+#define GGML_SIM_Q6Q8_SRC0_BLOCK 16
+#endif
+
+#ifndef GGML_SIM_Q6Q8_SRC1_BLOCK
+#define GGML_SIM_Q6Q8_SRC1_BLOCK 16
+#endif
+
+#if GGML_SIM_Q6Q8 != 0 && GGML_SIM_Q6Q8 != 1
+#error "GGML_SIM_Q6Q8 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q6Q8_APPLY_SRC0 != 0 && GGML_SIM_Q6Q8_APPLY_SRC0 != 1
+#error "GGML_SIM_Q6Q8_APPLY_SRC0 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q6Q8_APPLY_SRC1 != 0 && GGML_SIM_Q6Q8_APPLY_SRC1 != 1
+#error "GGML_SIM_Q6Q8_APPLY_SRC1 must be 0 or 1"
+#endif
+
+#if GGML_SIM_Q6Q8_SRC0_BLOCK <= 0
+#error "GGML_SIM_Q6Q8_SRC0_BLOCK must be > 0"
+#endif
+
+#if GGML_SIM_Q6Q8_SRC1_BLOCK <= 0
+#error "GGML_SIM_Q6Q8_SRC1_BLOCK must be > 0"
+#endif
+
+#if GGML_SIM_Q6Q8 && GGML_SIM_FP8E4M3
+#error "GGML_SIM_Q6Q8 and GGML_SIM_FP8E4M3 cannot be enabled together"
+#endif
+
+#if GGML_SIM_Q6Q8 && GGML_SIM_Q4Q6
+#error "GGML_SIM_Q6Q8 and GGML_SIM_Q4Q6 cannot be enabled together"
+#endif
+
+#if GGML_SIM_Q6Q8 && GGML_SIM_Q6Q6
+#error "GGML_SIM_Q6Q8 and GGML_SIM_Q6Q6 cannot be enabled together"
+#endif
+
+// ---------------------------------------------------------------------------
 // Standalone Q8/Q8 symmetric uniform replay with int8 power-of-2 block scale.
 //
 //   - src0 uses symmetric Q8 in [-127, 127]
@@ -338,6 +399,10 @@ typedef double ggml_float;
 
 #if GGML_SIM_Q8Q8 && GGML_SIM_Q6Q6
 #error "GGML_SIM_Q8Q8 and GGML_SIM_Q6Q6 cannot be enabled together"
+#endif
+
+#if GGML_SIM_Q8Q8 && GGML_SIM_Q6Q8
+#error "GGML_SIM_Q8Q8 and GGML_SIM_Q6Q8 cannot be enabled together"
 #endif
 
 // Output simulation mode for GEMM/GEMV results before storing F32:

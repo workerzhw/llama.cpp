@@ -14,7 +14,7 @@
 | --- | --- |
 | 用 `llama-cli` 快速跑一个 case | `CASE_FILTER=... RUN_KIND=cli bash run.sh` |
 | 跑普通 perplexity 基线 | `RUN_KIND=perplexity`，并显式关闭 simulation 和 threshold |
-| 跑纯 `SIM_Q4Q6`、`SIM_Q6Q6` 或 `SIM_Q8Q8` replay | `RUN_KIND=perplexity`，开启 replay，设置 `SWIGLU_THRESHOLD_ENABLE=0` |
+| 跑纯 `SIM_Q4Q6`、`SIM_Q6Q6`、`SIM_Q6Q8` 或 `SIM_Q8Q8` replay | `RUN_KIND=perplexity`，开启 replay，设置 `SWIGLU_THRESHOLD_ENABLE=0` |
 | 一条命令跑完整 activation threshold 流程 | `RUN_KIND=activation-flow` |
 | 先生成 threshold，检查报告后再跑 `ppl` | 先跑 `RUN_KIND=activation-flow FLOW_STEPS=collect,generate`，再跑 `RUN_KIND=perplexity` |
 | 分步调试 threshold 流程 | 依次跑 `swiglu-collect`、`swiglu-generate`，最后用 `perplexity` 或 `cli` apply |
@@ -99,6 +99,7 @@ MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
 RUN_KIND=perplexity \
 SIM_Q4Q6=0 \
 SIM_Q6Q6=0 \
+SIM_Q6Q8=0 \
 SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=0 \
@@ -109,7 +110,7 @@ bash run.sh
 
 ### 3.3 纯 `SIM_Q4Q6` perplexity
 
-`SIM_Q4Q6` 不能和 `SIM_Q6Q6`、`SIM_Q8Q8` 或 `SIM_FP8` 同时开启。
+`SIM_Q4Q6` 不能和 `SIM_Q6Q6`、`SIM_Q6Q8`、`SIM_Q8Q8` 或 `SIM_FP8` 同时开启。
 
 当前 CPU 路径中，`src0` 使用 symmetric Q6 blocks。`src1` 默认也是
 symmetric Q6，也可以通过 `SIM_Q4Q6_SRC1_QMODE=1` 切换到 asymmetric
@@ -128,6 +129,7 @@ SIM_Q4Q6=1 \
 SIM_Q4Q6_SRC1_QMODE=2 \
 SIM_Q4Q6_SRC1_LOG_STEP=4 \
 SIM_Q6Q6=0 \
+SIM_Q6Q8=0 \
 SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=1 \
@@ -140,7 +142,8 @@ bash run.sh
 
 `SIM_Q6Q6` 是 `SIM_Q8Q8` 的 Q6 版本：两个 source 都使用 symmetric uniform
 Q6 replay，每个 block 使用一个 int8 power-of-2 block scale。除量化范围
-`[-31, 31]` 外，其余结构和 `SIM_Q8Q8` 一致。
+`[-31, 31]` 外，其余结构和 `SIM_Q8Q8` 一致。它不能和 `SIM_Q4Q6`、
+`SIM_Q6Q8`、`SIM_Q8Q8` 或 `SIM_FP8` 同时开启。
 
 ```bash
 CASE_FILTER=Qwen-3-8B \
@@ -150,6 +153,7 @@ SIM_Q6Q6=1 \
 SIM_Q6Q6_SRC0_BLOCK=32 \
 SIM_Q6Q6_SRC1_BLOCK=32 \
 SIM_Q4Q6=0 \
+SIM_Q6Q8=0 \
 SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=1 \
@@ -158,9 +162,34 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-### 3.5 纯 `SIM_Q8Q8` perplexity
+### 3.5 纯 `SIM_Q6Q8` perplexity
 
-`SIM_Q8Q8` 是独立 replay mode，不能和 `SIM_Q4Q6`、`SIM_Q6Q6` 或 `SIM_FP8` 同时开启。
+`SIM_Q6Q8` 用于“权重 Q6、激活 Q8”的 replay：`src0` 走 symmetric uniform
+Q6，范围 `[-31, 31]`；`src1` 走 symmetric uniform Q8，范围 `[-127, 127]`。
+两个 source 都使用 int8 power-of-2 block scale，输出仍走 BF16 round-trip。它
+不能和 `SIM_Q4Q6`、`SIM_Q6Q6`、`SIM_Q8Q8` 或 `SIM_FP8` 同时开启。
+
+```bash
+CASE_FILTER=Qwen-3-8B \
+MODEL=models/Qwen/Qwen3-8B-Q5_K_M.gguf \
+RUN_KIND=perplexity \
+SIM_Q6Q8=1 \
+SIM_Q6Q8_SRC0_BLOCK=32 \
+SIM_Q6Q8_SRC1_BLOCK=32 \
+SIM_Q4Q6=0 \
+SIM_Q6Q6=0 \
+SIM_Q8Q8=0 \
+SIM_FP8=0 \
+SIM_MATMUL_OUT_MODE=1 \
+SWIGLU_THRESHOLD_ENABLE=0 \
+SKIP_BUILD=0 \
+bash run.sh
+```
+
+### 3.6 纯 `SIM_Q8Q8` perplexity
+
+`SIM_Q8Q8` 是独立 replay mode，不能和 `SIM_Q4Q6`、`SIM_Q6Q6`、`SIM_Q6Q8`
+或 `SIM_FP8` 同时开启。
 两个 source 都使用 symmetric uniform Q8 replay，每个 block 使用一个 int8
 power-of-2 block scale。
 
@@ -173,6 +202,7 @@ SIM_Q8Q8_SRC0_BLOCK=32 \
 SIM_Q8Q8_SRC1_BLOCK=32 \
 SIM_Q4Q6=0 \
 SIM_Q6Q6=0 \
+SIM_Q6Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=1 \
 SWIGLU_THRESHOLD_ENABLE=0 \
@@ -180,7 +210,7 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-### 3.6 一键 threshold pipeline
+### 3.7 一键 threshold pipeline
 
 第一次跑时用 `SKIP_BUILD=0`，让脚本构建默认 flow 所需的全部二进制。
 
@@ -241,7 +271,7 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-### 3.7 先选 threshold，再跑 `ppl`
+### 3.8 先选 threshold，再跑 `ppl`
 
 当最终 `perplexity` 很贵时，可以先只做 collect/generate，检查生成的
 summary report，再决定是否跑最终 apply。
@@ -262,6 +292,7 @@ SIM_Q8Q8_SRC0_BLOCK=32 \
 SIM_Q8Q8_SRC1_BLOCK=32 \
 SIM_Q4Q6=0 \
 SIM_Q6Q6=0 \
+SIM_Q6Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=1 \
 SWIGLU_THRESHOLD_KIND=swiglu+silu \
@@ -297,6 +328,7 @@ SIM_Q8Q8_SRC0_BLOCK=32 \
 SIM_Q8Q8_SRC1_BLOCK=32 \
 SIM_Q4Q6=0 \
 SIM_Q6Q6=0 \
+SIM_Q6Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=1 \
 SWIGLU_THRESHOLD_ENABLE=1 \
@@ -306,7 +338,7 @@ SKIP_BUILD=0 \
 bash run.sh
 ```
 
-### 3.8 手动分步 threshold pipeline
+### 3.9 手动分步 threshold pipeline
 
 当你要调试中间 artifacts，或者只想复现某个阶段时，用手动分步模式。
 
@@ -347,7 +379,7 @@ bash run.sh
 单步模式下，`SKIP_BUILD=0` 只构建当前 mode 所需的二进制。如果后续用同一个
 build tree 加 `SKIP_BUILD=1` 跑另一个 step，需要确认对应二进制已经存在。
 
-### 3.9 复用 generated artifacts
+### 3.10 复用 generated artifacts
 
 当 collect/generate 输出已经存在，只想补跑或重跑 apply steps 时，使用 artifact reuse。
 
@@ -364,7 +396,7 @@ bash run.sh
 `FLOW_REUSE_ARTIFACTS=1` 会跳过已经完成的 artifact-producing steps，但不会放宽
 剩余 steps 对二进制的检查。
 
-### 3.10 只跑 decode stats
+### 3.11 只跑 decode stats
 
 ```bash
 CASE_FILTER=Llama-3.2-1B \
@@ -561,15 +593,18 @@ Low-precision simulation controls：
 | `SIM_Q4Q6_SRC1_LOG_STEP` | logarithmic Q6-exp replay 的 exponent divisor |
 | `SIM_Q6Q6`, `SIM_Q6Q6_APPLY_SRC0`, `SIM_Q6Q6_APPLY_SRC1` | 启用并选择 Q6/Q6 power-of-two replay inputs |
 | `SIM_Q6Q6_SRC0_BLOCK`, `SIM_Q6Q6_SRC1_BLOCK` | Q6/Q6 replay block sizes |
+| `SIM_Q6Q8`, `SIM_Q6Q8_APPLY_SRC0`, `SIM_Q6Q8_APPLY_SRC1` | 启用并选择 Q6/Q8 power-of-two replay inputs；src0=权重 Q6，src1=激活 Q8 |
+| `SIM_Q6Q8_SRC0_BLOCK`, `SIM_Q6Q8_SRC1_BLOCK` | Q6/Q8 replay block sizes |
 | `SIM_Q8Q8`, `SIM_Q8Q8_APPLY_SRC0`, `SIM_Q8Q8_APPLY_SRC1` | 启用并选择 Q8/Q8 replay inputs |
 | `SIM_Q8Q8_SRC0_BLOCK`, `SIM_Q8Q8_SRC1_BLOCK` | Q8/Q8 replay block sizes |
 | `SIM_MATMUL_OUT_MODE` | `0=fp8-sim 开启时执行 FP8 output QDQ`，`1=BF16 output round-trip` |
 
 重要交互：
 
-- `SIM_Q4Q6`、`SIM_Q6Q6`、`SIM_Q8Q8` 和 `SIM_FP8` 互斥。
+- `SIM_Q4Q6`、`SIM_Q6Q6`、`SIM_Q6Q8`、`SIM_Q8Q8` 和 `SIM_FP8` 互斥。
 - `SIM_Q4Q6=1` 要求 `SIM_MATMUL_OUT_MODE=1`。
 - `SIM_Q6Q6=1` 要求 `SIM_MATMUL_OUT_MODE=1`。
+- `SIM_Q6Q8=1` 要求 `SIM_MATMUL_OUT_MODE=1`。
 - `SIM_Q8Q8=1` 要求 `SIM_MATMUL_OUT_MODE=1`。
 - `SWIGLU_THRESHOLD_ENABLE=1` 会独立影响 `perplexity` 和 `cli`，不依赖低精度 simulation flags。
 - 做纯低精度 replay 测量时，显式设置 `SWIGLU_THRESHOLD_ENABLE=0`。
@@ -705,6 +740,7 @@ MODEL=models/hf/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
 RUN_KIND=perplexity \
 SIM_Q4Q6=0 \
 SIM_Q6Q6=0 \
+SIM_Q6Q8=0 \
 SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=0 \
@@ -778,6 +814,7 @@ MODEL=models/Qwen/Qwen3-8B-Q4_K_M-ffn-gate-up-IQ2_S.gguf \
 RUN_KIND=perplexity \
 SIM_Q4Q6=0 \
 SIM_Q6Q6=0 \
+SIM_Q6Q8=0 \
 SIM_Q8Q8=0 \
 SIM_FP8=0 \
 SIM_MATMUL_OUT_MODE=0 \
